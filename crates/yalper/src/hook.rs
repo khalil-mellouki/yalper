@@ -9,16 +9,16 @@ mod input;
 
 use std::any::Any;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::safe_fs;
+use crate::safe_fs::{Access, OwnedDir};
 
 pub use input::{HookEvent, HookInput, InputError};
 
@@ -70,12 +70,7 @@ pub fn run(stdin: &mut dyn Read) {
     };
     if let Some(dir) = &call.yalper_dir {
         // Nowhere is left to report a failure to write the error log, so it is ignored.
-        let _ = append_error(
-            &dir.join(ERRORS_LOG),
-            call.event.as_deref(),
-            &error,
-            ERRORS_LOG_MAX_BYTES,
-        );
+        let _ = append_error(dir, call.event.as_deref(), &error, ERRORS_LOG_MAX_BYTES);
     }
 }
 
@@ -90,7 +85,7 @@ fn panic_text(payload: &(dyn Any + Send)) -> &str {
 /// What is known about the current call, kept outside `catch_unwind` so errors can still be logged.
 #[derive(Default)]
 struct Call {
-    yalper_dir: Option<PathBuf>,
+    yalper_dir: Option<OwnedDir>,
     event: Option<String>,
 }
 
@@ -155,8 +150,8 @@ fn read_limited(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>, String> {
 /// From each start, the search walks up only as far as the nearest git root (the first directory that
 /// contains `.git`), so a `.yalper` in a parent folder or in another project is never used. Outside a git
 /// repository nothing is found. A `.yalper` that is a symlink, or (on Unix) owned by another user, is
-/// ignored.
-pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+/// ignored. The directory is returned open, see [`OwnedDir`].
+pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<OwnedDir> {
     starts.into_iter().find_map(|start| {
         let git_root = start
             .ancestors()
@@ -164,17 +159,17 @@ pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<Path
         start
             .ancestors()
             .take_while(|dir| dir.starts_with(git_root))
-            .map(|dir| dir.join(YALPER_DIR))
-            .find(|candidate| safe_fs::is_owned_dir(candidate))
+            .find_map(|dir| OwnedDir::open(&dir.join(YALPER_DIR)).ok())
     })
 }
 
-/// Appends one line to the error log, emptying the log first if the line would push it past `max_bytes`.
+/// Appends one line to [`ERRORS_LOG`] in `dir`, emptying the log first if the line would push it past
+/// `max_bytes`.
 ///
 /// `message` must never contain payload content (prompts, tool input or output): the log is not redacted.
 /// Only Yalper's own error texts and panic messages are passed here.
 pub fn append_error(
-    path: &Path,
+    dir: &OwnedDir,
     event: Option<&str>,
     message: &str,
     max_bytes: u64,
@@ -186,15 +181,13 @@ pub fn append_error(
     let message = one_line(message, MAX_MESSAGE_CHARS);
     let line = format!("{timestamp_ms} {event} {message}\n");
 
-    let current_len = fs::symlink_metadata(path).map_or(0, |metadata| metadata.len());
-    let mut options = OpenOptions::new();
-    options.create(true);
-    if current_len + line.len() as u64 > max_bytes {
-        options.write(true).truncate(true);
-    } else {
-        options.append(true);
+    let mut log = dir.open_file(ERRORS_LOG, Access::Append)?;
+    if log.metadata()?.len() + line.len() as u64 > max_bytes {
+        // An append-only handle cannot shorten the file on Windows, so a second handle empties it. Writes
+        // through `log` still go to the new end of the file.
+        dir.open_file(ERRORS_LOG, Access::ReadWrite)?.set_len(0)?;
     }
-    safe_fs::open_regular_file(path, &options)?.write_all(line.as_bytes())
+    log.write_all(line.as_bytes())
 }
 
 /// Keeps at most `max_chars` characters and turns line breaks into spaces, so one entry stays one line.
@@ -208,6 +201,7 @@ fn one_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// A temporary git project (it only needs a `.git` entry) with `.yalper/` in it.
     fn project() -> tempfile::TempDir {
@@ -217,12 +211,21 @@ mod tests {
         root
     }
 
+    /// The directory found, canonical so that it compares equal on macOS, where temporary directories are
+    /// reached through a symlink.
+    fn found(starts: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+        find_yalper_dir(starts).map(|dir| fs::canonicalize(dir.path()).unwrap())
+    }
+
     #[test]
     fn finds_yalper_dir_from_a_subdirectory() {
         let root = project();
         let deep = root.path().join("a").join("b");
         fs::create_dir_all(&deep).unwrap();
-        assert_eq!(find_yalper_dir([deep]), Some(root.path().join(YALPER_DIR)));
+        assert_eq!(
+            found([deep]),
+            Some(fs::canonicalize(root.path().join(YALPER_DIR)).unwrap())
+        );
     }
 
     #[test]
@@ -231,8 +234,8 @@ mod tests {
         fs::write(root.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
         fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
         assert_eq!(
-            find_yalper_dir([root.path().to_path_buf()]),
-            Some(root.path().join(YALPER_DIR))
+            found([root.path().to_path_buf()]),
+            Some(fs::canonicalize(root.path().join(YALPER_DIR)).unwrap())
         );
     }
 
@@ -243,8 +246,8 @@ mod tests {
         let third = project();
         let starts = [first.path(), second.path(), third.path()].map(Path::to_path_buf);
         assert_eq!(
-            find_yalper_dir(starts),
-            Some(second.path().join(YALPER_DIR))
+            found(starts),
+            Some(fs::canonicalize(second.path().join(YALPER_DIR)).unwrap())
         );
     }
 
@@ -256,14 +259,14 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         let deep = repo.join("src");
         fs::create_dir(&deep).unwrap();
-        assert_eq!(find_yalper_dir([repo, deep]), None);
+        assert_eq!(found([repo, deep]), None);
     }
 
     #[test]
     fn nothing_is_found_outside_a_git_repository() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
-        assert_eq!(find_yalper_dir([root.path().to_path_buf()]), None);
+        assert_eq!(found([root.path().to_path_buf()]), None);
     }
 
     #[test]
@@ -271,7 +274,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".git")).unwrap();
         fs::write(root.path().join(YALPER_DIR), "not a directory").unwrap();
-        assert_eq!(find_yalper_dir([root.path().to_path_buf()]), None);
+        assert_eq!(found([root.path().to_path_buf()]), None);
     }
 
     #[test]
@@ -289,9 +292,10 @@ mod tests {
     fn error_lines_are_single_lines_with_the_event_name() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join(ERRORS_LOG);
-        append_error(&log, Some("Stop"), "first\nsecond\r\nthird", 1024).unwrap();
-        append_error(&log, None, "again", 1024).unwrap();
-        append_error(&log, Some("Bad\nEvent"), "x", 1024).unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        append_error(&owned, Some("Stop"), "first\nsecond\r\nthird", 1024).unwrap();
+        append_error(&owned, None, "again", 1024).unwrap();
+        append_error(&owned, Some("Bad\nEvent"), "x", 1024).unwrap();
 
         let text = fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -305,7 +309,8 @@ mod tests {
     fn event_names_are_shortened() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join(ERRORS_LOG);
-        append_error(&log, Some(&"E".repeat(1000)), "x", u64::MAX).unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        append_error(&owned, Some(&"E".repeat(1000)), "x", u64::MAX).unwrap();
         let text = fs::read_to_string(&log).unwrap();
         assert!(text.contains(&format!(" {} x", "E".repeat(MAX_EVENT_CHARS))));
         assert!(!text.contains(&"E".repeat(MAX_EVENT_CHARS + 1)));
@@ -315,16 +320,17 @@ mod tests {
     fn error_log_is_emptied_when_it_would_exceed_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join(ERRORS_LOG);
+        let owned = OwnedDir::open(dir.path()).unwrap();
         fs::write(&log, "x".repeat(90)).unwrap();
 
-        append_error(&log, None, "fits under the cap", 200).unwrap();
+        append_error(&owned, None, "fits under the cap", 200).unwrap();
         assert!(
             fs::read_to_string(&log)
                 .unwrap()
                 .starts_with(&"x".repeat(90))
         );
 
-        append_error(&log, None, &"y".repeat(150), 200).unwrap();
+        append_error(&owned, None, &"y".repeat(150), 200).unwrap();
         let text = fs::read_to_string(&log).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(text.contains(&"y".repeat(150)));
@@ -334,7 +340,8 @@ mod tests {
     fn long_messages_are_shortened() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join(ERRORS_LOG);
-        append_error(&log, None, &"z".repeat(10 * MAX_MESSAGE_CHARS), u64::MAX).unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        append_error(&owned, None, &"z".repeat(10 * MAX_MESSAGE_CHARS), u64::MAX).unwrap();
         let text = fs::read_to_string(&log).unwrap();
         assert!(text.len() < MAX_MESSAGE_CHARS + 100);
     }

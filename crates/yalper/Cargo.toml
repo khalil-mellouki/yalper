@@ -13,9 +13,10 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 
-# Unix only: the current user id (to check who owns `.yalper`) and O_NOFOLLOW, without unsafe code.
+# Unix only: the current user id (to check who owns `.yalper`), O_NOFOLLOW and openat, without unsafe code.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
