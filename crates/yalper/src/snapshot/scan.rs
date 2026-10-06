@@ -137,8 +137,8 @@ impl fmt::Display for Skipped {
 /// Symlinks are stored as symlinks (their target is never read), and on Unix the executable bit is kept.
 ///
 /// The walk runs in its own threads while this thread stores what they found: new file contents go to the
-/// shadow store, which is only opened when something changed. The new tree and the stat cache are saved
-/// together in `store`, under `lock`.
+/// shadow store, which is only opened when something changed (with the init token of `store`). The new tree
+/// and the stat cache are saved together in `store`, under `lock`.
 ///
 /// One file that cannot be taken never fails the snapshot: it is listed in [`Snapshot::skipped`] instead.
 pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Result<Snapshot> {
@@ -207,7 +207,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
                     // Sent before the content, so it is already there.
                     let _ = taken_permits.recv();
                     snapshot.files_read += 1;
-                    let oid = open_once(&mut shadow, yalper_dir)?.write_blob(&bytes)?;
+                    let oid = open_once(&mut shadow, yalper_dir, store)?.write_blob(&bytes)?;
                     changes.push(Change::Upsert {
                         path: file.path.clone(),
                         kind: file.kind,
@@ -264,7 +264,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
     }
 
     if !changes.is_empty() {
-        snapshot.tree_id = open_once(&mut shadow, yalper_dir)?.edit_tree(base, &changes)?;
+        snapshot.tree_id = open_once(&mut shadow, yalper_dir, store)?.edit_tree(base, &changes)?;
     }
     if start_over || snapshot.tree_id != base || !updated_rows.is_empty() || !removed.is_empty() {
         store.save_snapshot(
@@ -285,10 +285,11 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
 fn open_once<'a>(
     shadow: &'a mut Option<ShadowStore>,
     yalper_dir: &OwnedDir,
+    store: &Store,
 ) -> Result<&'a ShadowStore> {
     match shadow {
         Some(shadow) => Ok(shadow),
-        None => Ok(shadow.insert(ShadowStore::open(yalper_dir)?)),
+        None => Ok(shadow.insert(ShadowStore::open(yalper_dir, store.token())?)),
     }
 }
 
@@ -660,6 +661,7 @@ fn link_bytes(target: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::Token;
     use crate::snapshot::excludes::{MAX_IGNORE_FILE_BYTES, MAX_IGNORE_WEIGHT, weight};
     use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
@@ -687,8 +689,9 @@ mod tests {
             fs::write(dir.path().join(".git/info/exclude"), ".yalper/\n").unwrap();
             fs::create_dir(dir.path().join(YALPER_DIR)).unwrap();
             let yalper = OwnedDir::open(&dir.path().join(YALPER_DIR)).unwrap();
-            ShadowStore::init(&yalper).unwrap();
-            let store = Store::open(&yalper).unwrap();
+            let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
+            ShadowStore::init(&yalper, &token).unwrap();
+            let store = Store::open(&yalper, &token).unwrap();
             Self { dir, yalper, store }
         }
 
@@ -722,7 +725,7 @@ mod tests {
 
         /// Every file of `tree`: kind and content.
         fn files(&self, tree: ObjectId) -> BTreeMap<String, (FileKind, Vec<u8>)> {
-            let shadow = ShadowStore::open(&self.yalper).unwrap();
+            let shadow = ShadowStore::open(&self.yalper, self.store.token()).unwrap();
             let mut files = BTreeMap::new();
             tree_files(&shadow, tree, "", &mut files);
             files

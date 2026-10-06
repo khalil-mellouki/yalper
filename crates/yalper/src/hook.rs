@@ -8,7 +8,6 @@
 mod input;
 
 use std::env;
-use std::fs;
 use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -17,8 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::record;
+use crate::repo::{self, YalperDir};
 use crate::safe_fs::{Access, OwnedDir};
-use crate::{record, repo};
 
 pub use input::{HookEvent, HookInput, InputError};
 
@@ -70,14 +70,14 @@ pub fn run(stdin: &mut dyn Read) {
     };
     if let Some(dir) = &call.yalper_dir {
         // Nowhere is left to report a failure to write the error log, so it is ignored.
-        let _ = append_error(dir, call.event, &error, ERRORS_LOG_MAX_BYTES);
+        let _ = append_error(&dir.dir, call.event, &error, ERRORS_LOG_MAX_BYTES);
     }
 }
 
 /// What is known about the current call, kept outside `catch_unwind` so errors can still be logged.
 #[derive(Default)]
 struct Call {
-    yalper_dir: Option<OwnedDir>,
+    yalper_dir: Option<YalperDir>,
     event: Option<&'static str>,
 }
 
@@ -145,23 +145,18 @@ fn read_limited(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>, String> {
 
 /// Returns the project's `.yalper` directory, trying each start directory in turn.
 ///
-/// From each start, the search walks up only as far as the nearest git root (the first directory that
-/// contains `.git`), so a `.yalper` in a parent folder or in another project is never used. Outside a git
-/// repository nothing is found. A `.yalper` that is a symlink, (on Unix) owned by another user, or not created
-/// by `yalper init` for this repository (see [`repo::is_initialized`]) is ignored. The directory is returned
-/// open, see [`OwnedDir`].
-pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<OwnedDir> {
+/// From each start, the search walks up only as far as the nearest git root (see [`repo::find_root`]), so a
+/// `.yalper` in a parent folder or in another project is never used. Outside a git repository nothing is
+/// found. A `.yalper` that fails the checks of [`repo::open_yalper_dir`] (a symlink, on Unix owned by another
+/// user or writable by others, or not created by `yalper init` for this repository) is ignored. The directory
+/// is returned open, see [`OwnedDir`].
+pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<YalperDir> {
     starts.into_iter().find_map(|start| {
-        let git_root = start
-            .ancestors()
-            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())?;
+        let git_root = repo::find_root(&start)?;
         start
             .ancestors()
             .take_while(|dir| dir.starts_with(git_root))
-            .find_map(|dir| {
-                let yalper_dir = OwnedDir::open(&dir.join(YALPER_DIR)).ok()?;
-                repo::is_initialized(git_root, &yalper_dir).then_some(yalper_dir)
-            })
+            .find_map(|dir| repo::open_yalper_dir(git_root, &dir.join(YALPER_DIR)).ok())
     })
 }
 
@@ -203,6 +198,7 @@ fn one_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -225,7 +221,7 @@ mod tests {
     /// The directory found, canonical so that it compares equal on macOS, where temporary directories are
     /// reached through a symlink.
     fn found(starts: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-        find_yalper_dir(starts).map(|dir| fs::canonicalize(dir.path()).unwrap())
+        find_yalper_dir(starts).map(|found| fs::canonicalize(found.dir.path()).unwrap())
     }
 
     #[test]

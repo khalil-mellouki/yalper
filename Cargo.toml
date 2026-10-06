@@ -14,6 +14,8 @@ rust-version = "1.89"
 # Finds which secret rules can match a string: one pass over it for all rule keywords.
 aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
+# The operating system's secure random number generator, for the init token. Already built for gix.
+getrandom = "0.4"
 # Only SHA-1 object hashing: Yalper writes blobs and trees and diffs trees, and needs none of the other
 # features (network, index, worktree, blob diff, parallelism).
 gix = { version = "0.88", default-features = false, features = ["sha1"] }
@@ -24,7 +26,9 @@ rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
 # The engine behind the `regex` crate, used directly to tune how secret rules compile. Unicode is off for
 # them, like in Go RE2, so the Unicode tables are not needed.
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "perf-inline", "perf-literal"] }
-serde_json = "1"
+# `preserve_order` keeps the keys of a JSON object in their order, so `yalper init` leaves the user's settings
+# file as it was apart from the hooks it adds.
+serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 # Build time only: reads the vendored gitleaks rules into a Rust table.
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }

@@ -93,6 +93,16 @@ impl OwnedDir {
         &self.path
     }
 
+    /// Whether users other than the owner can create, rename or delete entries in this directory: on Unix,
+    /// its group or world write bit is set. Windows: always false (access is governed by ACLs, which a
+    /// cloned repository cannot set).
+    pub fn is_writable_by_others(&self) -> io::Result<bool> {
+        #[cfg(unix)]
+        return Ok(rustix::fs::fstat(&self.handle)?.st_mode & 0o022 != 0);
+        #[cfg(windows)]
+        Ok(false)
+    }
+
     /// Opens the file `name` inside this directory, creating it if it is missing. Anything other than a
     /// regular file (a symlink, a directory, a FIFO) is refused before a single byte is read or written, and
     /// so is, on Unix, a file with a second hard link (writing to it would change the other file too).
