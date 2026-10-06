@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn a_registration_with_another_binary_path_is_removed() {
         let settings = json!({"hooks": {"Stop": [{"hooks": [
-            {"type": "command", "command": "C:\\old\\Yalper.exe", "args": ["hook"], "async": false}
+            {"type": "command", "command": "/old/place/Yalper", "args": ["hook"], "async": false}
         ]}]}});
         assert_eq!(unregistered(&settings), Settings::Emptied);
     }
