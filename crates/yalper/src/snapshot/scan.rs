@@ -220,6 +220,10 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
         Ok(())
     })?;
 
+    // Fails before anything is saved: the previous snapshot and the stat cache stay as they were.
+    if let Some(why) = excludes.budget_error() {
+        return Err(super::Error::IgnoreRulesOverBudget(why));
+    }
     for (path, reason) in excludes.refused() {
         snapshot.skipped.push(Skipped {
             path: relative_path(root, &path).unwrap_or_else(|lossy| lossy),
@@ -386,6 +390,10 @@ fn walk(
         .run(|| {
             let (sender, permits, excludes) = (sender.clone(), permits.clone(), &excludes);
             Box::new(move |entry| {
+                if excludes.exceeded() {
+                    // The snapshot fails: no need to go on.
+                    return WalkState::Quit;
+                }
                 let (walked, state) = visit(root, cache, excludes, entry);
                 let Some(walked) = walked else {
                     return state;
@@ -635,7 +643,7 @@ fn link_bytes(target: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::excludes::MAX_IGNORE_BYTES;
+    use crate::snapshot::excludes::{MAX_IGNORE_FILE_BYTES, MAX_IGNORE_WEIGHT, weight};
     use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
 
@@ -685,6 +693,10 @@ mod tests {
 
         fn snapshot(&self) -> Snapshot {
             snapshot(&self.yalper, &self.store, &self.lock()).unwrap()
+        }
+
+        fn snapshot_result(&self) -> Result<Snapshot> {
+            snapshot(&self.yalper, &self.store, &self.lock())
         }
 
         fn lock(&self) -> WriterLock {
@@ -1263,7 +1275,7 @@ mod tests {
     fn an_oversized_gitignore_is_not_used() {
         let project = Project::new();
         let mut huge = "*.txt\n".to_owned();
-        while huge.len() as u64 <= MAX_IGNORE_BYTES {
+        while huge.len() as u64 <= MAX_IGNORE_FILE_BYTES {
             huge.push_str("# padding to make the file larger than the limit\n");
         }
         project.write(".gitignore", &huge);
@@ -1280,28 +1292,55 @@ mod tests {
     }
 
     #[test]
-    fn ignore_files_share_a_pattern_budget() {
+    fn ignore_rules_over_the_budget_fail_the_snapshot_and_keep_the_previous_one() {
         let project = Project::new();
-        // Each file weighs 600 (300 patterns of weight 2): the root's fits, then the subdirectory's does not.
+        // Rules worth just over half of the budget each: one file fits, two do not.
         let rules = |extra: &str| -> String {
-            let mut rules: String = (0..299).map(|i| format!("x{i}*\n")).collect();
-            rules.push_str(extra);
+            let mut rules = extra.to_owned();
+            let mut total = weight(extra.trim());
+            for i in 0.. {
+                if total > MAX_IGNORE_WEIGHT / 2 {
+                    break;
+                }
+                let pattern = format!("x{i}*");
+                total += weight(&pattern);
+                rules.push_str(&pattern);
+                rules.push('\n');
+            }
             rules
         };
         project.write(".gitignore", &rules("*.log\n"));
-        project.write("sub/.gitignore", &rules("*.tmp\n"));
         project.write("a.log", "x");
-        project.write("sub/b.log", "x");
         project.write("sub/c.tmp", "x");
-        let snapshot = project.snapshot();
-        assert_eq!(
-            paths(&project, &snapshot),
-            [".gitignore", "sub/.gitignore", "sub/c.tmp"]
+        let first = project.snapshot();
+        assert_eq!(paths(&project, &first), [".gitignore", "sub/c.tmp"]);
+        let before = project.store.file_cache().unwrap();
+
+        project.write("sub/.gitignore", &rules("*.tmp\n"));
+        project.write("new.txt", "x");
+        let lock = project.lock();
+        let error = snapshot(&project.yalper, &project.store, &lock).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, super::super::Error::IgnoreRulesOverBudget(_)),
+            "{message}"
         );
-        assert_eq!(snapshot.skipped.len(), 1, "{:?}", snapshot.skipped);
-        assert_eq!(snapshot.skipped[0].path, "sub/.gitignore");
-        let problems = snapshot.problems().unwrap();
-        assert!(problems.contains("pattern weight"), "{problems}");
+        assert!(
+            message.starts_with("ignore rules exceed the budget: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("sub") && message.contains("pattern weight"),
+            "{message}"
+        );
+        assert_eq!(project.store.file_cache().unwrap(), before);
+        drop(lock);
+
+        // Every step fails the same way until the rules fit again.
+        assert!(project.snapshot_result().is_err());
+        fs::remove_file(project.root().join("sub/.gitignore")).unwrap();
+        let fitting = project.snapshot();
+        assert_eq!(fitting.changed, ["new.txt"]);
     }
 
     #[test]

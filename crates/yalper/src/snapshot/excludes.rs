@@ -5,11 +5,14 @@
 //! commit a `.gitignore` that is a link to `/dev/zero` (endless memory), to a FIFO or terminal (a hang), to a
 //! file outside the project, or to a UNC path on Windows (a network login). So the walker's own ignore
 //! handling is off and Yalper reads `.gitignore` and `info/exclude` itself: only regular files, never through
-//! a link. A refused `.gitignore` counts as absent, as git does for a symlinked one.
+//! a link, of at most [`MAX_IGNORE_FILE_BYTES`]. A refused file counts as absent, as git does for a symlinked
+//! `.gitignore`, and is reported, because the files it would ignore then end up in the snapshot.
 //!
-//! Compiling patterns costs time on every step (measured: 2 to 26 µs per pattern, most for `**` and
-//! brackets), so the files of one snapshot share a [`Budget`]. A file that does not fit counts as absent.
-//! Every refused file is reported, because its files then end up in the snapshot.
+//! Compiling patterns costs time on every step, so the files of one snapshot share a budget
+//! ([`MAX_IGNORE_BYTES`], [`MAX_IGNORE_WEIGHT`]). Going over it fails the whole snapshot instead of leaving
+//! one file out: which file would be left out depends on the order of the parallel walk, so the tree could
+//! change from one step to the next with no file changed. Whether the budget is exceeded does not depend on
+//! that order: if all the rules a full walk reads fit, every walk reads exactly those.
 //!
 //! The global excludes file (`core.excludesFile`, or `git/ignore` in the user's config directory) belongs to
 //! the user, not to a repository. It is read by the `ignore` crate, which follows links (dotfiles are often
@@ -25,6 +28,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use ignore::Match;
@@ -32,14 +36,18 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::safe_fs;
 
+/// The most bytes one ignore file may have. A larger one is refused (it counts as absent).
+pub const MAX_IGNORE_FILE_BYTES: u64 = 256 * 1024;
+
 /// The most bytes of `.gitignore` and `info/exclude` files one snapshot reads, all files together.
 pub const MAX_IGNORE_BYTES: u64 = 1024 * 1024;
 
-/// The most pattern weight one snapshot compiles, all files together. A pattern weighs 1 plus 1 per `*`, `?`
-/// or `[`. Measured on the user's machine: the Visual Studio `.gitignore` of github/gitignore weighs 465 and
-/// compiles in 4 ms; the costliest patterns take about 26 µs per unit, so the budget costs at most about
-/// 26 ms there.
-pub const MAX_IGNORE_WEIGHT: u64 = 1000;
+/// The most pattern weight one snapshot compiles, all files together (see [`weight`]). Room for realistic
+/// monorepos: the Visual Studio `.gitignore` of github/gitignore, one of the largest templates, weighs 605
+/// (1,167 on Windows and macOS, where patterns ignore case). Measured worst case at this budget on the user's
+/// Windows machine: about 66 ms to compile 1,000 case-insensitive literal patterns; with case-sensitive
+/// matching (Linux) at most about 38 ms, for 800 patterns like `a1*`.
+pub const MAX_IGNORE_WEIGHT: u64 = 4000;
 
 /// Patterns match without regard to case where git does by default (`core.ignoreCase`, set by `git init` on
 /// case-insensitive file systems).
@@ -54,6 +62,14 @@ struct Budget {
     weight: u64,
 }
 
+/// Why an existing ignore file is not used.
+enum Unused {
+    /// A link, not a regular file, unreadable, or larger than [`MAX_IGNORE_FILE_BYTES`]: counts as absent.
+    Refused(String),
+    /// Over the budget of the snapshot: the snapshot fails.
+    OverBudget(String),
+}
+
 pub(super) struct Excludes {
     root: PathBuf,
     /// The rules of each directory that has a usable `.gitignore`, by absolute path.
@@ -63,6 +79,9 @@ pub(super) struct Excludes {
     budget: Mutex<Budget>,
     /// Ignore files that exist but are not used, with the reason.
     refused: Mutex<Vec<(PathBuf, String)>>,
+    /// Ignore files that did not fit in the budget, with the reason.
+    over_budget: Mutex<Vec<(PathBuf, String)>>,
+    exceeded: AtomicBool,
 }
 
 impl Excludes {
@@ -81,6 +100,8 @@ impl Excludes {
                 weight: MAX_IGNORE_WEIGHT,
             }),
             refused: Mutex::new(Vec::new()),
+            over_budget: Mutex::new(Vec::new()),
+            exceeded: AtomicBool::new(false),
         };
         if let Some(dir) = git_common_dir(root) {
             excludes.info_exclude = excludes.rules(root, &dir.join("info").join("exclude"));
@@ -129,37 +150,61 @@ impl Excludes {
         refused
     }
 
-    /// The rules of the ignore file at `file`, relative to `dir`. Empty if the file is missing, and also if
-    /// it is refused, which is then recorded.
-    fn rules(&self, dir: &Path, file: &Path) -> Gitignore {
-        match self.load(dir, file) {
-            Ok(rules) => rules,
-            Err(reason) => {
-                if let Ok(mut refused) = self.refused.lock() {
-                    refused.push((file.to_owned(), reason));
-                }
-                Gitignore::empty()
-            }
-        }
+    /// Whether an ignore file went over the budget: the snapshot fails, so the walk can stop.
+    pub fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Relaxed)
     }
 
-    fn load(&self, dir: &Path, file: &Path) -> Result<Gitignore, String> {
+    /// If the budget was exceeded, why, naming the first offending file by path.
+    pub fn budget_error(&self) -> Option<String> {
+        let over_budget = self.over_budget.lock().ok()?;
+        let (file, reason) = over_budget.iter().min()?;
+        Some(format!("{}: {reason}", file.display()))
+    }
+
+    /// The rules of the ignore file at `file`, relative to `dir`. Empty if the file is missing, and also if
+    /// it is not used, which is then recorded.
+    fn rules(&self, dir: &Path, file: &Path) -> Gitignore {
+        let (list, reason) = match self.load(dir, file) {
+            Ok(rules) => return rules,
+            Err(Unused::Refused(reason)) => (&self.refused, reason),
+            Err(Unused::OverBudget(reason)) => {
+                self.exceeded.store(true, Ordering::Relaxed);
+                (&self.over_budget, reason)
+            }
+        };
+        if let Ok(mut list) = list.lock() {
+            list.push((file.to_owned(), reason));
+        }
+        Gitignore::empty()
+    }
+
+    fn load(&self, dir: &Path, file: &Path) -> Result<Gitignore, Unused> {
+        let refused = |reason: String| Unused::Refused(reason);
         let metadata = match fs::symlink_metadata(file) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Gitignore::empty()),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(refused(error.to_string())),
         };
         if metadata.file_type().is_symlink() {
-            return Err("it is a link, which git does not follow either".to_owned());
+            return Err(refused(
+                "it is a link, which git does not follow either".to_owned(),
+            ));
         }
         if !metadata.is_file() {
-            return Err("it is not a regular file".to_owned());
+            return Err(refused("it is not a regular file".to_owned()));
+        }
+        if metadata.len() > MAX_IGNORE_FILE_BYTES {
+            return Err(refused(format!(
+                "{} bytes, over the {MAX_IGNORE_FILE_BYTES} byte limit",
+                metadata.len()
+            )));
         }
         self.spend(metadata.len(), 0)?;
         let mut bytes = Vec::new();
         safe_fs::open_regular_file(file)
             .and_then(|opened| opened.take(metadata.len()).read_to_end(&mut bytes))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| refused(error.to_string()))?;
 
         let text = String::from_utf8_lossy(&bytes);
         // git skips a byte order mark at the start of the file.
@@ -181,20 +226,21 @@ impl Excludes {
     }
 
     /// Takes `bytes` and `weight` from the budget, or nothing if either does not fit.
-    fn spend(&self, bytes: u64, weight: u64) -> Result<(), String> {
+    fn spend(&self, bytes: u64, weight: u64) -> Result<(), Unused> {
+        let over = |what: String| Unused::OverBudget(format!("over the budget of {what}"));
         let mut budget = self
             .budget
             .lock()
-            .map_err(|_| "the ignore file budget is unavailable".to_owned())?;
+            .map_err(|_| over("ignore rules, which is unavailable".to_owned()))?;
         if bytes > budget.bytes {
-            return Err(format!(
-                "over the budget of {MAX_IGNORE_BYTES} bytes for all ignore files"
-            ));
+            return Err(over(format!(
+                "{MAX_IGNORE_BYTES} bytes for all ignore files"
+            )));
         }
         if weight > budget.weight {
-            return Err(format!(
-                "over the budget of {MAX_IGNORE_WEIGHT} pattern weight for all ignore files"
-            ));
+            return Err(over(format!(
+                "{MAX_IGNORE_WEIGHT} pattern weight for all ignore files"
+            )));
         }
         budget.bytes -= bytes;
         budget.weight -= weight;
@@ -202,9 +248,19 @@ impl Excludes {
     }
 }
 
-/// What a pattern costs to compile, roughly: 1, plus 1 per `*`, `?` or `[`.
-fn weight(pattern: &str) -> u64 {
-    1 + pattern.matches(['*', '?', '[']).count() as u64
+/// What a pattern costs to compile, in units of about 15 µs on the user's machine: 1 for a case-sensitive
+/// literal or `*.ext` (a few µs, matched without a regular expression), otherwise 4 plus 1 per `*`, `?` or
+/// `[` (about 50 to 100 µs).
+pub(super) fn weight(pattern: &str) -> u64 {
+    let wildcards = pattern.matches(['*', '?', '[']).count() as u64;
+    let simple_extension = pattern
+        .strip_prefix("*.")
+        .is_some_and(|extension| !extension.contains(['*', '?', '[', '/']));
+    if !CASE_INSENSITIVE && (wildcards == 0 || simple_extension) {
+        1
+    } else {
+        4 + wildcards
+    }
 }
 
 /// The content of `path` if it is a regular file (not a link, FIFO or device) of at most `max_bytes`.

@@ -141,6 +141,9 @@ pub enum Error {
     /// The store contains something Yalper does not create (a link, alternates, a `commondir` file), so it is
     /// not used.
     UnexpectedLayout(String),
+    /// The ignore files of the project go over the budget for one snapshot, so no snapshot is taken (see
+    /// `snapshot::excludes`).
+    IgnoreRulesOverBudget(String),
 }
 
 impl fmt::Display for Error {
@@ -153,6 +156,7 @@ impl fmt::Display for Error {
                 write!(f, "cannot store the path {path:?} in a snapshot: {reason}")
             }
             Self::MissingObject(id) => write!(f, "the snapshot store has no object {id}"),
+            Self::IgnoreRulesOverBudget(why) => write!(f, "ignore rules exceed the budget: {why}"),
             Self::UnexpectedLayout(what) => write!(
                 f,
                 "the snapshot store contains {what}, which Yalper does not create, so it is not used"
@@ -167,7 +171,10 @@ impl std::error::Error for Error {
             Self::Io(error) => Some(error),
             Self::Git(error) => Some(error),
             Self::Store(error) => Some(error),
-            Self::InvalidPath { .. } | Self::MissingObject(_) | Self::UnexpectedLayout(_) => None,
+            Self::InvalidPath { .. }
+            | Self::MissingObject(_)
+            | Self::UnexpectedLayout(_)
+            | Self::IgnoreRulesOverBudget(_) => None,
         }
     }
 }
