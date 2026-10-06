@@ -51,10 +51,13 @@ pub fn project() -> tempfile::TempDir {
 /// The `yalper` binary built for the integration tests.
 pub const EXE: &str = env!("CARGO_BIN_EXE_yalper");
 
-/// Runs `git` in `dir` with a fixed identity and checks that it succeeds.
+/// Runs `git` in `dir` with a fixed identity and checks that it succeeds. Automatic maintenance is off:
+/// after a commit, git can start it in the background, and its lock file in `.git/objects` would come and
+/// go while tests compare files.
 pub fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::null())
