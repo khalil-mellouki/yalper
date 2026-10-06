@@ -35,7 +35,7 @@ const WAL_TRUNCATE_BYTES: u64 = 256 * 1024;
 
 /// Schema migrations, oldest first. `PRAGMA user_version` holds how many have run. A released entry is
 /// never edited: changes go in a new entry at the end.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sessions (
@@ -74,6 +74,15 @@ CREATE TABLE file_cache (
     oid      TEXT NOT NULL,
     racy     INTEGER NOT NULL
 ) WITHOUT ROWID;
+";
+
+/// The tree of the latest snapshot. It is saved in the same transaction as the `file_cache` rows, which
+/// describe the files of exactly this tree, so the next snapshot can be built from it.
+const SCHEMA_V2: &str = "
+CREATE TABLE latest_snapshot (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    tree_id TEXT NOT NULL
+);
 ";
 
 /// One Claude Code session.
@@ -122,6 +131,32 @@ pub struct Event {
     pub files_changed: Option<u32>,
     /// The hook payload, already redacted.
     pub payload: Value,
+}
+
+/// What the stat cache knew about one file of the latest snapshot when the file was last read.
+///
+/// Rows come from a file on disk, so callers must check them before use (see `snapshot::snapshot`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedFile {
+    /// Relative to the project root, with `/` as separator.
+    pub path: String,
+    pub size: i64,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+    /// The git file mode: 0o100644, 0o100755 or 0o120000.
+    pub mode: i64,
+    /// The blob id, in hex.
+    pub oid: String,
+    /// The file was read so soon after its last change that a later change in the same timestamp tick could
+    /// go unnoticed, so it is read again next time whatever its size and mtime.
+    pub racy: bool,
+}
+
+/// The tree of the latest snapshot and the stat cache rows that describe its files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCache {
+    pub tree_id: String,
+    pub files: Vec<CachedFile>,
 }
 
 #[derive(Debug)]
@@ -340,6 +375,108 @@ impl Store {
             .optional()?;
         Ok(event)
     }
+
+    /// The latest snapshot and its stat cache, or `None` if there is no snapshot yet or a stored value has a
+    /// type Yalper never writes (a damaged or crafted database). Either way the next snapshot starts over.
+    pub fn file_cache(&self) -> Result<Option<FileCache>> {
+        // `as_str` fails on a value that is not valid UTF-8 text.
+        let tree_id = self
+            .conn
+            .prepare_cached("SELECT tree_id FROM latest_snapshot WHERE id = 1")?
+            .query_row([], |row| {
+                Ok(row.get_ref(0)?.as_str().ok().map(str::to_owned))
+            })
+            .optional()?;
+        let Some(Some(tree_id)) = tree_id else {
+            return Ok(None);
+        };
+        let files: Option<Vec<CachedFile>> = self
+            .conn
+            .prepare_cached("SELECT path, size, mtime_ns, mode, oid, racy FROM file_cache")?
+            .query_map([], cached_file_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(files.map(|files| FileCache { tree_id, files }))
+    }
+
+    /// Saves a new latest snapshot and brings the stat cache in line with it, in one transaction: `changed`
+    /// rows are added or replaced and `removed` paths deleted. With `replace_all`, every other row is deleted
+    /// first. Taking the [`WriterLock`] makes sure no other process saves a snapshot at the same time.
+    pub fn save_snapshot(
+        &self,
+        _lock: &WriterLock,
+        tree_id: &str,
+        changed: &[CachedFile],
+        removed: &[String],
+        replace_all: bool,
+    ) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        if replace_all {
+            transaction.execute("DELETE FROM file_cache", [])?;
+        }
+        {
+            let mut upsert = transaction.prepare_cached(
+                "INSERT OR REPLACE INTO file_cache (path, size, mtime_ns, mode, oid, racy)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for file in changed {
+                upsert.execute(params![
+                    file.path,
+                    file.size,
+                    file.mtime_ns,
+                    file.mode,
+                    file.oid,
+                    file.racy
+                ])?;
+            }
+            let mut delete =
+                transaction.prepare_cached("DELETE FROM file_cache WHERE path = ?1")?;
+            for path in removed {
+                delete.execute([path])?;
+            }
+            transaction
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO latest_snapshot (id, tree_id) VALUES (1, ?1)",
+                )?
+                .execute([tree_id])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+/// A stat cache row, or `None` if a value has an unexpected type.
+fn cached_file_from_row(row: &Row<'_>) -> rusqlite::Result<Option<CachedFile>> {
+    use rusqlite::types::ValueRef::{Integer, Text};
+    let values = (
+        row.get_ref(0)?,
+        row.get_ref(1)?,
+        row.get_ref(2)?,
+        row.get_ref(3)?,
+        row.get_ref(4)?,
+        row.get_ref(5)?,
+    );
+    let (
+        Text(path),
+        Integer(size),
+        Integer(mtime_ns),
+        Integer(mode),
+        Text(oid),
+        Integer(racy @ (0 | 1)),
+    ) = values
+    else {
+        return Ok(None);
+    };
+    let (Ok(path), Ok(oid)) = (std::str::from_utf8(path), std::str::from_utf8(oid)) else {
+        return Ok(None);
+    };
+    Ok(Some(CachedFile {
+        path: path.to_owned(),
+        size,
+        mtime_ns,
+        mode,
+        oid: oid.to_owned(),
+        racy: racy == 1,
+    }))
 }
 
 impl Drop for Store {
@@ -472,7 +609,7 @@ mod tests {
         let owned = OwnedDir::open(dir.path()).unwrap();
         let store = Store::open(&owned).unwrap();
 
-        assert_eq!(user_version(&store.conn).unwrap(), 1);
+        assert_eq!(user_version(&store.conn).unwrap(), 2);
         let names: Vec<String> = schema(&store.conn)
             .unwrap()
             .into_iter()
@@ -481,7 +618,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["events_session_step", "events", "file_cache", "sessions"]
+            [
+                "events_session_step",
+                "events",
+                "file_cache",
+                "latest_snapshot",
+                "sessions"
+            ]
         );
         let mode: String = store
             .conn
@@ -583,7 +726,7 @@ mod tests {
 
         let store = Store::open(&owned).unwrap();
         assert_eq!(schema(&store.conn).unwrap(), before);
-        assert_eq!(user_version(&store.conn).unwrap(), 1);
+        assert_eq!(user_version(&store.conn).unwrap(), 2);
         assert_eq!(store.events("s1").unwrap(), [event("s1", 1)]);
     }
 
@@ -641,7 +784,7 @@ mod tests {
                 error,
                 Error::NewerSchema {
                     found: 99,
-                    known: 1
+                    known: 2
                 }
             ),
             "{error}"
@@ -951,5 +1094,92 @@ mod tests {
 
         let store = Store::open(&owned).unwrap();
         assert_eq!(store.events("s1").unwrap(), [event("s1", 1), large]);
+    }
+
+    fn cached(path: &str, oid: &str) -> CachedFile {
+        CachedFile {
+            path: path.to_owned(),
+            size: 12,
+            mtime_ns: 1_700_000_000_123_456_789,
+            mode: 0o100644,
+            oid: oid.to_owned(),
+            racy: false,
+        }
+    }
+
+    fn sorted(cache: Option<FileCache>) -> Option<FileCache> {
+        cache.map(|mut cache| {
+            cache.files.sort_by(|a, b| a.path.cmp(&b.path));
+            cache
+        })
+    }
+
+    #[test]
+    fn the_file_cache_is_saved_with_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned).unwrap();
+        assert_eq!(store.file_cache().unwrap(), None);
+        let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
+
+        let (a, b) = (cached("a.rs", "aa"), cached("dir/b.rs", "bb"));
+        store
+            .save_snapshot(&lock, "tree1", &[a.clone(), b.clone()], &[], false)
+            .unwrap();
+        let expected = FileCache {
+            tree_id: "tree1".to_owned(),
+            files: vec![a.clone(), b.clone()],
+        };
+        assert_eq!(sorted(store.file_cache().unwrap()), Some(expected));
+
+        let mut racy_a = cached("a.rs", "a2");
+        racy_a.racy = true;
+        let c = cached("c.rs", "cc");
+        store
+            .save_snapshot(
+                &lock,
+                "tree2",
+                &[racy_a.clone(), c.clone()],
+                &["dir/b.rs".to_owned()],
+                false,
+            )
+            .unwrap();
+        let expected = FileCache {
+            tree_id: "tree2".to_owned(),
+            files: vec![racy_a, c.clone()],
+        };
+        assert_eq!(sorted(store.file_cache().unwrap()), Some(expected));
+
+        store
+            .save_snapshot(&lock, "tree3", std::slice::from_ref(&b), &[], true)
+            .unwrap();
+        let expected = FileCache {
+            tree_id: "tree3".to_owned(),
+            files: vec![b],
+        };
+        assert_eq!(store.file_cache().unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn a_file_cache_with_unexpected_values_is_not_used() {
+        for sql in [
+            "UPDATE file_cache SET size = 'big'",
+            "UPDATE file_cache SET racy = 2",
+            "UPDATE file_cache SET oid = X'0102'",
+            "UPDATE file_cache SET mtime_ns = 1.5",
+            "UPDATE file_cache SET path = CAST(X'FF' AS TEXT)",
+            "UPDATE latest_snapshot SET tree_id = X'07'",
+            "DELETE FROM latest_snapshot",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let owned = OwnedDir::open(dir.path()).unwrap();
+            let store = Store::open(&owned).unwrap();
+            let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
+            store
+                .save_snapshot(&lock, "tree", &[cached("a.rs", "aa")], &[], false)
+                .unwrap();
+            store.conn.execute_batch(sql).unwrap();
+            assert_eq!(store.file_cache().unwrap(), None, "{sql}");
+        }
     }
 }

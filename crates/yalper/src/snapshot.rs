@@ -8,6 +8,11 @@
 //! The store is a separate repository opened by its explicit path with isolated options: no system, global
 //! or user git configuration and no `GIT_*` environment variables are read, and the user's own `.git` is
 //! never opened.
+//!
+//! [`snapshot`] walks the working tree and records it in the store.
+
+mod excludes;
+mod scan;
 
 use std::fmt;
 use std::fs;
@@ -21,6 +26,8 @@ use gix::validate::path::component;
 use gix::{ObjectId, oid};
 
 use crate::safe_fs::OwnedDir;
+
+pub use scan::{MAX_FILE_BYTES, SkipReason, Skipped, Snapshot, snapshot};
 
 /// The shadow repository inside `.yalper/`.
 pub const SNAPSHOTS_DIR: &str = "snapshots.git";
@@ -58,6 +65,20 @@ pub enum FileKind {
     Executable,
     /// The blob holds the link target.
     Symlink,
+}
+
+impl FileKind {
+    /// The git file mode, as kept in the stat cache.
+    pub fn mode(self) -> u32 {
+        EntryKind::from(self) as u32
+    }
+
+    /// The kind with git file mode `mode`, if it is one of the three file modes.
+    pub fn from_mode(mode: i64) -> Option<Self> {
+        [Self::Regular, Self::Executable, Self::Symlink]
+            .into_iter()
+            .find(|kind| i64::from(kind.mode()) == mode)
+    }
 }
 
 impl From<FileKind> for EntryKind {
@@ -108,6 +129,8 @@ impl ChangedPaths {
 pub enum Error {
     Io(io::Error),
     Git(gix::Error),
+    /// Reading or saving the stat cache failed.
+    Store(crate::store::Error),
     /// A path that cannot be stored in a tree, for example with an empty, `..` or `.git` component.
     InvalidPath {
         path: String,
@@ -118,6 +141,9 @@ pub enum Error {
     /// The store contains something Yalper does not create (a link, alternates, a `commondir` file), so it is
     /// not used.
     UnexpectedLayout(String),
+    /// The ignore files of the project go over the budget for one snapshot, so no snapshot is taken (see
+    /// `snapshot::excludes`).
+    IgnoreRulesOverBudget(String),
 }
 
 impl fmt::Display for Error {
@@ -125,10 +151,12 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Git(error) => write!(f, "snapshot store error: {error}"),
+            Self::Store(error) => write!(f, "{error}"),
             Self::InvalidPath { path, reason } => {
                 write!(f, "cannot store the path {path:?} in a snapshot: {reason}")
             }
             Self::MissingObject(id) => write!(f, "the snapshot store has no object {id}"),
+            Self::IgnoreRulesOverBudget(why) => write!(f, "ignore rules exceed the budget: {why}"),
             Self::UnexpectedLayout(what) => write!(
                 f,
                 "the snapshot store contains {what}, which Yalper does not create, so it is not used"
@@ -142,7 +170,11 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Git(error) => Some(error),
-            Self::InvalidPath { .. } | Self::MissingObject(_) | Self::UnexpectedLayout(_) => None,
+            Self::Store(error) => Some(error),
+            Self::InvalidPath { .. }
+            | Self::MissingObject(_)
+            | Self::UnexpectedLayout(_)
+            | Self::IgnoreRulesOverBudget(_) => None,
         }
     }
 }
@@ -150,6 +182,12 @@ impl std::error::Error for Error {
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<crate::store::Error> for Error {
+    fn from(error: crate::store::Error) -> Self {
+        Self::Store(error)
     }
 }
 

@@ -1,7 +1,9 @@
 //! Measures how long one `PostToolUse` hook call takes, process spawn included, the way Claude Code runs it.
 //!
 //! Builds a temporary git project with 1,000 files, then for each call changes 3 files and runs the real
-//! `yalper hook` binary with a `PostToolUse` payload on stdin. Prints the median and p90.
+//! `yalper hook` binary with a `PostToolUse` payload on stdin. Each call takes a real snapshot of the project
+//! (through the `YALPER_BENCH_SNAPSHOT` test entry point until the hook records steps). Prints the median and
+//! p90.
 //!
 //! Run with `cargo bench --bench hook_latency`. Set `YALPER_BENCH_CALLS` to change the number of calls.
 
@@ -11,6 +13,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use yalper::hook::BENCH_SNAPSHOT_ENV;
+use yalper::safe_fs::OwnedDir;
+use yalper::snapshot::ShadowStore;
+use yalper::store::Store;
 
 const FILES: usize = 1000;
 const CHANGED_PER_CALL: usize = 3;
@@ -32,6 +39,7 @@ fn build_project(root: &Path) {
     assert!(status.success(), "git init failed");
     fs::write(root.join(".gitignore"), "target/\n").unwrap();
     fs::create_dir(root.join(".yalper")).unwrap();
+    ShadowStore::init(&OwnedDir::open(&root.join(".yalper")).unwrap()).unwrap();
 
     for index in 0..FILES {
         let path = file_path(root, index);
@@ -55,6 +63,7 @@ fn run_hook(root: &Path, payload: &[u8]) -> Duration {
         .arg("hook")
         .current_dir(root)
         .env("CLAUDE_PROJECT_DIR", root)
+        .env(BENCH_SNAPSHOT_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -116,6 +125,10 @@ fn main() {
         !root.join(".yalper").join("errors.log").exists(),
         "the hook logged an error during the benchmark"
     );
+    // The last snapshot has the 1,000 files plus `.gitignore` in its stat cache.
+    let yalper = OwnedDir::open(&root.join(".yalper")).unwrap();
+    let cache = Store::open(&yalper).unwrap().file_cache().unwrap();
+    assert_eq!(cache.map(|cache| cache.files.len()), Some(FILES + 1));
 
     let median = if calls % 2 == 1 {
         millis(times[calls / 2])
