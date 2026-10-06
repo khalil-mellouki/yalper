@@ -55,6 +55,9 @@ pub const DEADLINE: Duration = Duration::from_millis(50);
 /// Debug builds run the rules many times slower: normal payloads of 100 to 256 KiB take 40 to 60 ms.
 pub const DEBUG_DEADLINE_FACTOR: u32 = 40;
 
+/// How long the caller waits for the worker thread at a time, before checking the deadline again.
+const WAIT_SLICE: Duration = Duration::from_millis(2);
+
 /// Values with at most this much text are redacted on the calling thread (see `redact_json_bounded`).
 const INLINE_TEXT_BYTES: usize = 4 * 1024;
 
@@ -149,12 +152,24 @@ fn redact_json_bounded(value: &mut Value, soft: Duration, hard: Duration) {
             // The receiver is gone if the call already returned the markers.
             let _ = sender.send(payload);
         });
-    *value = match worker {
-        Ok(_) => receiver
-            .recv_timeout(hard.saturating_sub(start.elapsed()))
-            .unwrap_or(markers),
+    if worker.is_err() {
         // The payload was dropped with the closure; nothing raw is kept.
-        Err(_) => markers,
+        *value = markers;
+        return;
+    }
+    // Short waits: a long timed wait was measured ending about 50 ms late on macOS CI (timer leeway).
+    let hard_deadline = start + hard;
+    *value = loop {
+        let left = hard_deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break markers;
+        }
+        match receiver.recv_timeout(left.min(WAIT_SLICE)) {
+            Ok(redacted) => break redacted,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // The worker panicked.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break markers,
+        }
     };
 }
 
