@@ -8,7 +8,12 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::json;
 use tempfile::TempDir;
-use yalper::hook::{ERRORS_LOG, HookEvent, HookInput, MAX_PAYLOAD_BYTES, YALPER_DIR};
+use yalper::hook::{
+    BENCH_SNAPSHOT_ENV, ERRORS_LOG, HookEvent, HookInput, MAX_PAYLOAD_BYTES, YALPER_DIR,
+};
+use yalper::safe_fs::OwnedDir;
+use yalper::snapshot::ShadowStore;
+use yalper::store::Store;
 
 fn fixtures() -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks");
@@ -43,6 +48,7 @@ impl Hook<'_> {
             .current_dir(self.current_dir)
             .env_remove("CLAUDE_PROJECT_DIR")
             .env_remove("YALPER_TEST_PANIC")
+            .env_remove(BENCH_SNAPSHOT_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -390,4 +396,50 @@ fn linked_error_log_is_not_written() {
     let output = run_in(project.path(), b"not json");
     assert_silent_success(&output);
     assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+}
+
+/// Runs the hook with the benchmark's snapshot entry point turned on.
+fn run_with_snapshot(dir: &Path, stdin: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yalper"))
+        .arg("hook")
+        .current_dir(dir)
+        .env("CLAUDE_PROJECT_DIR", dir)
+        .env(BENCH_SNAPSHOT_ENV, "1")
+        .env_remove("YALPER_TEST_PANIC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn the_snapshot_entry_point_records_the_project_silently() {
+    let project = project();
+    let yalper = OwnedDir::open(&project.path().join(YALPER_DIR)).unwrap();
+    ShadowStore::init(&yalper).unwrap();
+    fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let stdin = fs::read(&fixtures()[0]).unwrap();
+
+    let output = run_with_snapshot(project.path(), &stdin);
+    assert_silent_success(&output);
+    assert_eq!(error_lines(project.path()), Vec::<String>::new());
+    let cache = Store::open(&yalper).unwrap().file_cache().unwrap().unwrap();
+    let paths: Vec<&str> = cache.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(paths, ["main.rs"]);
+}
+
+#[test]
+fn a_failed_snapshot_is_logged_and_exits_zero() {
+    // No shadow store: the snapshot cannot store the new file.
+    let project = project();
+    fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let stdin = fs::read(&fixtures()[0]).unwrap();
+
+    let output = run_with_snapshot(project.path(), &stdin);
+    assert_silent_success(&output);
+    let lines = error_lines(project.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
 }

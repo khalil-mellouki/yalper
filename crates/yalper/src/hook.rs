@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::safe_fs::{Access, OwnedDir};
+use crate::snapshot::{self, SkipReason};
+use crate::store::{LOCK_TIMEOUT, Store, WriterLock};
 
 pub use input::{HookEvent, HookInput, InputError};
 
@@ -33,6 +35,10 @@ pub const ERRORS_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Payloads larger than this are not parsed (the rest of stdin is drained and discarded).
 pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// When set, every hook call takes a real snapshot. A test entry point for the latency benchmark until
+/// M1-T06 records every step (and checks that `yalper init` created the `.yalper/` it writes to).
+pub const BENCH_SNAPSHOT_ENV: &str = "YALPER_BENCH_SNAPSHOT";
 
 const MAX_MESSAGE_CHARS: usize = 2000;
 const MAX_EVENT_CHARS: usize = 64;
@@ -114,7 +120,7 @@ fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
     let Some(dir) = find_yalper_dir(starts) else {
         return Ok(());
     };
-    call.yalper_dir = Some(dir);
+    let dir = call.yalper_dir.insert(dir);
 
     let payload = payload?;
     call.event = payload
@@ -123,11 +129,31 @@ fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
         .map(str::to_owned);
     HookInput::from_value(payload).map_err(|error| error.to_string())?;
 
+    if env::var_os(BENCH_SNAPSHOT_ENV).is_some() {
+        take_snapshot(dir, call.event.as_deref())?;
+    }
+
     #[cfg(debug_assertions)]
     if env::var_os("YALPER_TEST_PANIC").is_some() {
         panic!("forced by YALPER_TEST_PANIC");
     }
 
+    Ok(())
+}
+
+/// Takes a snapshot of the project the way recording a step will: open the event log, take the writer lock,
+/// snapshot. Files that are skipped because they cannot be read or stored are logged; files over the size
+/// limit are expected and only noted in the snapshot.
+fn take_snapshot(dir: &OwnedDir, event: Option<&str>) -> Result<(), String> {
+    let store = Store::open(dir).map_err(|error| error.to_string())?;
+    let _lock = WriterLock::acquire(dir, LOCK_TIMEOUT).map_err(|error| error.to_string())?;
+    let snapshot = snapshot::snapshot(dir, &store).map_err(|error| error.to_string())?;
+    for skipped in &snapshot.skipped {
+        if !matches!(skipped.reason, SkipReason::TooLarge(_)) {
+            let message = format!("snapshot: {skipped}");
+            let _ = append_error(dir, event, &message, ERRORS_LOG_MAX_BYTES);
+        }
+    }
     Ok(())
 }
 

@@ -250,6 +250,30 @@ impl OwnedDir {
     }
 }
 
+/// Opens the file at `path` for reading, refusing anything that is not a regular file once open.
+///
+/// For files of the project that a directory walk found to be regular files. On Unix a symlink at `path` is
+/// refused without being followed, and a FIFO without waiting for a writer, in case the entry changed since
+/// the walk. Windows: the walk already told links apart, and the file is opened normally, because opening the
+/// reparse point itself would bypass OneDrive's handling of cloud files.
+pub fn open_regular_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        File::from(rustix::fs::open(path, flags, Mode::empty())?)
+    };
+    #[cfg(windows)]
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
 /// Device and inode, typed like `std::os::unix::fs::MetadataExt`.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // The field types differ between Linux and macOS.
@@ -522,6 +546,34 @@ mod tests {
         let owned = OwnedDir::open(dir.path()).unwrap();
         owned.check_regular_or_missing("file").unwrap();
         owned.check_regular_or_missing("missing").unwrap();
+    }
+
+    #[test]
+    fn only_regular_files_are_opened_for_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        fs::write(&file, "content").unwrap();
+        let mut text = String::new();
+        open_regular_file(&file)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "content");
+        assert!(open_regular_file(dir.path()).is_err());
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(open_regular_file(&link).is_err());
+            let fifo = dir.path().join("fifo");
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(open_regular_file(&fifo).is_err());
+        }
     }
 
     /// Creates a file symlink. Returns false on Windows when the user may not create symlinks.

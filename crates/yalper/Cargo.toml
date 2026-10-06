@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 gix.workspace = true
+ignore.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 
