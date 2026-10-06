@@ -494,6 +494,24 @@ impl Store {
         Ok(event)
     }
 
+    /// The snapshot taken just before step `step` of `session_id`: the tree of the last step recorded before
+    /// it, in any session, that has one. Steps are inserted while the [`WriterLock`] is held, right after
+    /// their snapshot, so insertion order is snapshot order, and this is the tree the step's snapshot was
+    /// built from (unless only `yalper init`'s baseline came before it, which is not a step: then `None`).
+    pub fn previous_tree_id(&self, session_id: &str, step: u32) -> Result<Option<String>> {
+        let tree_id = self
+            .conn
+            .prepare_cached(
+                "SELECT tree_id FROM events
+                 WHERE tree_id IS NOT NULL
+                   AND id < (SELECT id FROM events WHERE session_id = ?1 AND step = ?2)
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row(params![session_id, step], |row| row.get(0))
+            .optional()?;
+        Ok(tree_id)
+    }
+
     /// The latest snapshot and its stat cache, or `None` if there is no snapshot yet or a stored value has a
     /// type Yalper never writes (a damaged or crafted database). Either way the next snapshot starts over.
     pub fn file_cache(&self) -> Result<Option<FileCache>> {
@@ -1231,6 +1249,35 @@ mod tests {
         assert_eq!(store.events("a").unwrap(), [event("a", 1), event("a", 2)]);
         assert_eq!(store.event("b", 1).unwrap(), Some(sparse));
         assert_eq!(store.event("b", 2).unwrap(), None);
+    }
+
+    #[test]
+    fn the_previous_tree_is_the_last_one_recorded_before_the_step_in_any_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        store.upsert_session(&Session::new("a", 1)).unwrap();
+        store.upsert_session(&Session::new("b", 2)).unwrap();
+        // Inserted in this order, as the hooks of two sessions in one project would record them.
+        let steps = [
+            ("a", 1, Some("tree a1")),
+            ("b", 1, Some("tree b1")),
+            ("a", 2, None),
+            ("a", 3, Some("tree a3")),
+            ("b", 2, None),
+        ];
+        for (session, step, tree) in steps {
+            let mut event = event(session, step);
+            event.tree_id = tree.map(str::to_owned);
+            store.insert_event(&event).unwrap();
+        }
+        let previous = |session, step| store.previous_tree_id(session, step).unwrap();
+        assert_eq!(previous("a", 1), None);
+        assert_eq!(previous("b", 1).as_deref(), Some("tree a1"));
+        assert_eq!(previous("a", 2).as_deref(), Some("tree b1"));
+        assert_eq!(previous("a", 3).as_deref(), Some("tree b1"));
+        assert_eq!(previous("b", 2).as_deref(), Some("tree a3"));
+        assert_eq!(previous("a", 9), None);
     }
 
     #[test]

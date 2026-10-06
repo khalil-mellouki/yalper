@@ -16,9 +16,9 @@ aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
 # The operating system's secure random number generator, for the init token. Already built for gix.
 getrandom = "0.4"
-# Only SHA-1 object hashing: Yalper writes blobs and trees and diffs trees, and needs none of the other
-# features (network, index, worktree, blob diff, parallelism).
-gix = { version = "0.88", default-features = false, features = ["sha1"] }
+# SHA-1 object hashing, and the line diff of two blobs (`blob-diff`) for `yalper show`. Yalper writes blobs
+# and trees and diffs them, and needs none of the other features (network, parallelism, and so on).
+gix = { version = "0.88", default-features = false, features = ["sha1", "blob-diff"] }
 # ripgrep's directory walker: `.gitignore`, `.git/info/exclude` and global excludes, in parallel threads.
 ignore = "0.4"
 # Snapshot tests: compares command output with the expected text kept in the test.

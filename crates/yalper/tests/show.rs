@@ -1,0 +1,657 @@
+//! `yalper show`: its output for each kind of step of a session recorded from the hook fixtures, file changes
+//! made by a child process, binary files, cut diffs, missing snapshots, untrusted rows and file contents,
+//! and the errors.
+
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+use jiff::Timestamp;
+use jiff::tz::{self, TimeZone};
+use serde_json::{Value, json};
+use yalper::hook::{HookInput, YALPER_DIR, find_yalper_dir};
+use yalper::record::record;
+use yalper::repo::YalperDir;
+use yalper::show::{Options, show};
+use yalper::snapshot::{self, SNAPSHOTS_DIR};
+use yalper::store::{DATABASE_FILE, LOCK_TIMEOUT, Store, WriterLock};
+
+mod common;
+
+const SESSION: &str = "00893aaf-19fa-41d2-8238-13269b9b3ca0";
+
+fn fixture(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hooks")
+        .join(name);
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// A hook payload of `event` in [`SESSION`], with `fields` added.
+fn payload(event: &str, fields: Value) -> Value {
+    let mut payload =
+        json!({"session_id": SESSION, "hook_event_name": event, "cwd": "/home/dev/project"});
+    for (key, value) in fields.as_object().unwrap() {
+        payload[key] = value.clone();
+    }
+    payload
+}
+
+fn record_payload(dir: &YalperDir, payload: Value) {
+    record(dir, HookInput::from_value(payload).unwrap()).unwrap();
+}
+
+fn database(root: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(root.join(YALPER_DIR).join(DATABASE_FILE)).unwrap()
+}
+
+/// Gives the steps of [`SESSION`] fixed times, 20 seconds apart from `first` on.
+fn set_times(root: &Path, first: &str) {
+    let first = first.parse::<Timestamp>().unwrap().as_millisecond();
+    database(root)
+        .execute(
+            "UPDATE events SET ts_ms = ?1 + (step - 1) * 20000 WHERE session_id = ?2",
+            rusqlite::params![first, SESSION],
+        )
+        .unwrap();
+}
+
+/// Copies `from` over `to` in a separate process, the way a shell command run by the agent changes a file.
+fn copy_in_child_process(from: &Path, to: &Path) {
+    let status = if cfg!(windows) {
+        Command::new("cmd")
+            .arg("/C")
+            .arg("copy")
+            .arg("/Y")
+            .arg(from)
+            .arg(to)
+            .stdout(Stdio::null())
+            .status()
+    } else {
+        Command::new("cp").arg(from).arg(to).status()
+    }
+    .unwrap();
+    assert!(status.success());
+}
+
+/// A text file of `lines` numbered lines.
+fn numbered(lines: usize, prefix: &str) -> String {
+    (1..=lines).map(|n| format!("{prefix} {n}\n")).collect()
+}
+
+const LIB_BEFORE: &str = "pub fn old_name() {}\npub fn helper() -> u32 {\n\t1\n}\n";
+const LIB_AFTER: &str = "pub fn new_name() {}\npub fn helper() -> u32 {\n\t1\n}\n";
+
+/// A project with one recorded session of every kind of step, with file changes between the steps as the
+/// tools would make them:
+///
+/// 1 start, 2 prompt, 3 Edit of `src/lib.rs`, 4 Bash that changes `README.md` from a child process and adds
+/// `src/gen.rs`, 5 failed Bash, 6 Read, 7 Bash that changes a binary file, deletes a file and rewrites a
+/// long text file, 8 reply, 9 end.
+fn recorded_project() -> tempfile::TempDir {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("README.md"), "# Demo\n").unwrap();
+    fs::write(root.join("src/lib.rs"), LIB_BEFORE).unwrap();
+    fs::write(root.join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+    fs::write(root.join("big.txt"), numbered(400, "old line")).unwrap();
+    fs::write(root.join("obsolete.txt"), "gone soon\n").unwrap();
+    {
+        // What `yalper init` sets up, including its baseline snapshot.
+        let dir = common::init(root);
+        let store = Store::open(&dir.dir, &dir.token).unwrap();
+        let lock = WriterLock::acquire(&dir.dir, LOCK_TIMEOUT).unwrap();
+        snapshot::snapshot(&dir.dir, &store, &lock).unwrap();
+    }
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+
+    record_payload(&dir, fixture("session_start.json"));
+    let mut prompt = fixture("user_prompt_submit.json");
+    prompt["prompt"] = "Rename old_name to new_name\nand update the README".into();
+    record_payload(&dir, prompt);
+
+    fs::write(root.join("src/lib.rs"), LIB_AFTER).unwrap();
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": "/home/dev/project/src/lib.rs",
+                    "old_string": "old_name",
+                    "new_string": "new_name"
+                },
+                "tool_response": {"filePath": "/home/dev/project/src/lib.rs", "userModified": false},
+                "duration_ms": 12
+            }),
+        ),
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let new_readme = elsewhere.path().join("README.md");
+    fs::write(&new_readme, "# Demo\n\nRenamed `old_name` to `new_name`.\n").unwrap();
+    copy_in_child_process(&new_readme, &root.join("README.md"));
+    fs::write(root.join("src/gen.rs"), "// generated\n").unwrap();
+    let mut bash = fixture("post_tool_use_bash_subagent.json");
+    bash["tool_input"]["command"] = "./scripts/update.sh && echo done".into();
+    bash["tool_response"]["stdout"] = "updated README.md\ngenerated src/gen.rs\ndone\n".into();
+    record_payload(&dir, bash);
+
+    record_payload(&dir, fixture("post_tool_use_failure.json"));
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/home/dev/project/src/lib.rs"},
+                "tool_response": "pub fn new_name() {}\n",
+                "duration_ms": 3
+            }),
+        ),
+    );
+
+    fs::write(
+        root.join("logo.png"),
+        b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR changed",
+    )
+    .unwrap();
+    fs::remove_file(root.join("obsolete.txt")).unwrap();
+    fs::write(root.join("big.txt"), numbered(400, "new line")).unwrap();
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "./scripts/regenerate.sh"},
+                "tool_response": {"stdout": "", "stderr": "warning: slow\n", "interrupted": false},
+                "duration_ms": 2345
+            }),
+        ),
+    );
+    record_payload(&dir, fixture("stop.json"));
+    record_payload(&dir, fixture("session_end.json"));
+    set_times(root, "2026-10-06T21:59:00Z");
+    project
+}
+
+/// The output of `yalper show` in `root`, with times shown two hours ahead of UTC.
+fn show_output(root: &Path, step: u32, options: &Options) -> Result<String, String> {
+    let mut out = Vec::new();
+    show(
+        root,
+        step,
+        options,
+        &TimeZone::fixed(tz::offset(2)),
+        &mut out,
+    )?;
+    Ok(String::from_utf8(out).unwrap())
+}
+
+fn short(root: &Path, step: u32) -> String {
+    show_output(root, step, &Options::default()).unwrap()
+}
+
+#[test]
+fn a_session_start_and_a_prompt() {
+    let project = recorded_project();
+    insta::assert_snapshot!(short(project.path(), 1), @r"
+    Session 00893aaf, step 1 of 9, 2026-10-06 23:59:00
+    Session started (startup), model claude-opus-5
+
+    No files changed.
+    ");
+    insta::assert_snapshot!(short(project.path(), 2), @r"
+    Session 00893aaf, step 2 of 9, 2026-10-06 23:59:20
+
+    Prompt:
+      Rename old_name to new_name
+      and update the README
+
+    No files changed.
+    ");
+}
+
+#[test]
+fn an_edit_shows_its_input_output_and_diff() {
+    let project = recorded_project();
+    insta::assert_snapshot!(short(project.path(), 3), @r#"
+    Session 00893aaf, step 3 of 9, 2026-10-06 23:59:40
+    Edit, succeeded in 12 ms
+
+    Input:
+      {
+        "file_path": "/home/dev/project/src/lib.rs",
+        "old_string": "old_name",
+        "new_string": "new_name"
+      }
+
+    Output:
+      {
+        "filePath": "/home/dev/project/src/lib.rs",
+        "userModified": false
+      }
+
+    1 file changed:
+      modified  src/lib.rs
+
+    --- a/src/lib.rs
+    +++ b/src/lib.rs
+    @@ -1,4 +1,4 @@
+    -pub fn old_name() {}
+    +pub fn new_name() {}
+     pub fn helper() -> u32 {
+     	1
+     }
+    "#);
+}
+
+#[test]
+fn a_shell_command_shows_the_files_it_changed_including_from_a_child_process() {
+    let project = recorded_project();
+    insta::assert_snapshot!(short(project.path(), 4), @r"
+    Session 00893aaf, step 4 of 9, 2026-10-07 00:00:00
+    Bash, succeeded in 87 ms, subagent a1b2c3d4
+
+    Command:
+      ./scripts/update.sh && echo done
+
+    Output:
+      updated README.md
+      generated src/gen.rs
+      done
+
+    2 files changed:
+      modified  README.md
+      added     src/gen.rs
+
+    --- a/README.md
+    +++ b/README.md
+    @@ -1,1 +1,3 @@
+     # Demo
+    +
+    +Renamed `old_name` to `new_name`.
+    ");
+}
+
+#[test]
+fn a_failed_step_and_a_step_with_no_file_changes() {
+    let project = recorded_project();
+    insta::assert_snapshot!(short(project.path(), 5), @r"
+    Session 00893aaf, step 5 of 9, 2026-10-07 00:00:20
+    Bash, FAILED after 4.1 s
+
+    Command:
+      npm test
+
+    Error:
+      Exit code 1
+      Error: Cannot find module 'express'
+
+    No files changed.
+    ");
+    insta::assert_snapshot!(short(project.path(), 6), @r#"
+    Session 00893aaf, step 6 of 9, 2026-10-07 00:00:40
+    Read, succeeded in 3 ms
+
+    Input:
+      {
+        "file_path": "/home/dev/project/src/lib.rs"
+      }
+
+    Output:
+      pub fn new_name() {}
+
+    No files changed.
+    "#);
+}
+
+#[test]
+fn binary_deleted_and_large_changes() {
+    let project = recorded_project();
+    let output = short(project.path(), 7);
+    // The diff of `big.txt` (800 lines) is cut after 300 lines of diff output, the blank line and file
+    // header included: 296 lines of the hunk are shown.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 15 + 300 + 1, "{output}");
+    assert_eq!(lines[lines.len() - 2], "-old line 296");
+    let head_and_tail = [&lines[..24], &["[...]"], &lines[lines.len() - 3..]].concat();
+    insta::assert_snapshot!(head_and_tail.join("\n"), @r"
+    Session 00893aaf, step 7 of 9, 2026-10-07 00:01:00
+    Bash, succeeded in 2.3 s
+
+    Command:
+      ./scripts/regenerate.sh
+
+    Output: (none)
+
+    Error output:
+      warning: slow
+
+    3 files changed:
+      modified  big.txt
+      modified  logo.png (binary file changed)
+      deleted   obsolete.txt
+
+    --- a/big.txt
+    +++ b/big.txt
+    @@ -1,400 +1,400 @@
+    -old line 1
+    -old line 2
+    -old line 3
+    -old line 4
+    -old line 5
+    [...]
+    -old line 295
+    -old line 296
+    ... diff truncated (--full shows more)
+    ");
+
+    // `--full` shows the whole diff.
+    let full = show_output(
+        project.path(),
+        7,
+        &Options {
+            full: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(!full.contains("truncated"), "{full}");
+    for n in [1, 200, 400] {
+        assert!(full.contains(&format!("\n-old line {n}\n")), "{n}");
+        assert!(full.contains(&format!("\n+new line {n}\n")), "{n}");
+    }
+}
+
+#[test]
+fn a_reply_and_the_end_of_the_session_take_no_snapshot() {
+    let project = recorded_project();
+    insta::assert_snapshot!(short(project.path(), 8), @r"
+    Session 00893aaf, step 8 of 9, 2026-10-07 00:01:20
+
+    Reply:
+      I added `factorial` in src/factorial.rs. The test suite fails because `express` is not installed.
+    ");
+    insta::assert_snapshot!(short(project.path(), 9), @r"
+    Session 00893aaf, step 9 of 9, 2026-10-07 00:01:40
+    Session ended (prompt_input_exit)
+    ");
+}
+
+#[test]
+fn a_step_whose_snapshot_failed() {
+    let project = recorded_project();
+    database(project.path())
+        .execute(
+            "UPDATE events SET tree_id = NULL, files_changed = NULL WHERE step = 6",
+            [],
+        )
+        .unwrap();
+    insta::assert_snapshot!(short(project.path(), 6), @r#"
+    Session 00893aaf, step 6 of 9, 2026-10-07 00:00:40
+    Read, succeeded in 3 ms
+
+    Input:
+      {
+        "file_path": "/home/dev/project/src/lib.rs"
+      }
+
+    Output:
+      pub fn new_name() {}
+
+    No snapshot was recorded for this step (taking it failed, see .yalper/errors.log). Its file changes are in the next step that has a snapshot.
+    "#);
+    // The next step's changes are counted from the snapshot before the failed one.
+    assert!(short(project.path(), 7).contains("3 files changed:"));
+}
+
+#[test]
+fn a_snapshot_the_store_no_longer_has() {
+    let project = recorded_project();
+    // As after the store was lost and created again: the trees named in the event log are gone.
+    database(project.path())
+        .execute(
+            "UPDATE events SET tree_id = '0123456789abcdef0123456789abcdef01234567' WHERE step = 2",
+            [],
+        )
+        .unwrap();
+    for step in [2, 3] {
+        let output = short(project.path(), step);
+        assert!(output.contains("Snapshot not available"), "{output}");
+    }
+    // A missing store too.
+    fs::remove_dir_all(project.path().join(YALPER_DIR).join(SNAPSHOTS_DIR)).unwrap();
+    let output = short(project.path(), 4);
+    assert!(output.contains("Snapshot not available"), "{output}");
+    assert!(output.contains("Command:"), "{output}");
+}
+
+/// Whether `text` holds a control character other than a line break or a tab.
+fn has_control_characters(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+}
+
+#[test]
+fn control_characters_never_reach_the_terminal() {
+    let project = common::project();
+    let root = project.path();
+    fs::write(root.join("a.txt"), "first\n").unwrap();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let evil = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\r\u{202E}X";
+    record_payload(&dir, payload("UserPromptSubmit", json!({"prompt": evil})));
+    // File names and contents from the repository, and every value of the tool call.
+    fs::write(root.join("a.txt"), format!("first\n{evil}\tend\n")).unwrap();
+    fs::write(root.join(format!("{}b.txt", "\u{202E}")), evil).unwrap();
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({
+                "tool_name": format!("Bash{evil}"),
+                "agent_id": evil,
+                "tool_input": {"command": evil, evil: evil},
+                "tool_response": {"stdout": evil, "stderr": evil},
+            }),
+        ),
+    );
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": evil}, "tool_response": evil}),
+        ),
+    );
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUseFailure",
+            json!({"tool_name": "Bash", "error": evil}),
+        ),
+    );
+    record_payload(
+        &dir,
+        payload("Stop", json!({"last_assistant_message": evil})),
+    );
+    record_payload(&dir, payload("SessionEnd", json!({"reason": evil})));
+
+    for step in 1..=6 {
+        for full in [false, true] {
+            let options = Options {
+                full,
+                ..Options::default()
+            };
+            let output = show_output(root, step, &options).unwrap();
+            assert!(!has_control_characters(&output), "{step}: {output:?}");
+            assert!(!output.contains('\u{202E}'), "{step}: {output}");
+            assert!(output.contains("X"), "{step}: {output}");
+        }
+    }
+    let output = short(root, 2);
+    assert!(output.contains("<U+202E>b.txt"), "{output}");
+    // The tab of the file content is kept.
+    assert!(
+        output.contains("+ ]0;owned  [2J 31m <U+202E>X\tend"),
+        "{output}"
+    );
+
+    // Colors add escape sequences of Yalper's own, and only those.
+    let options = Options {
+        color: true,
+        ..Options::default()
+    };
+    let colored = show_output(root, 2, &options).unwrap();
+    assert!(colored.contains("\u{1b}[32m+ ]0;owned"), "{colored}");
+    let mut stripped = colored.clone();
+    for code in [
+        "\u{1b}[1m",
+        "\u{1b}[36m",
+        "\u{1b}[32m",
+        "\u{1b}[31m",
+        "\u{1b}[0m",
+    ] {
+        stripped = stripped.replace(code, "");
+    }
+    assert!(!has_control_characters(&stripped), "{stripped:?}");
+    assert_eq!(stripped, output);
+}
+
+#[test]
+fn many_changed_files_are_listed_up_to_a_limit() {
+    let project = common::project();
+    let root = project.path();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    record_payload(&dir, payload("SessionStart", json!({"source": "startup"})));
+    fs::create_dir(root.join("gen")).unwrap();
+    for n in 0..60 {
+        fs::write(root.join(format!("gen/file{n:02}.txt")), "x\n").unwrap();
+    }
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "make"}}),
+        ),
+    );
+    let output = short(root, 2);
+    assert!(output.contains("60 files changed:"), "{output}");
+    assert!(output.contains("  added     gen/file49.txt\n"), "{output}");
+    assert!(!output.contains("gen/file50.txt"), "{output}");
+    assert!(
+        output.contains("... 10 more files (--full lists all)"),
+        "{output}"
+    );
+    let full = show_output(
+        root,
+        2,
+        &Options {
+            full: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(full.contains("  added     gen/file59.txt\n"), "{full}");
+    assert!(!full.contains("more files"), "{full}");
+}
+
+#[test]
+fn the_first_step_after_init_has_no_recorded_snapshot_before_it() {
+    let project = common::project();
+    let root = project.path();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    {
+        let store = Store::open(&dir.dir, &dir.token).unwrap();
+        let lock = WriterLock::acquire(&dir.dir, LOCK_TIMEOUT).unwrap();
+        snapshot::snapshot(&dir.dir, &store, &lock).unwrap();
+    }
+    // The developer edits a file between `yalper init` and the first session.
+    fs::write(root.join("notes.txt"), "edited before the session\n").unwrap();
+    record_payload(&dir, payload("SessionStart", json!({"source": "startup"})));
+    let output = short(root, 1);
+    assert!(
+        output.ends_with(
+            "1 file changed since the snapshot `yalper init` took, which is not kept, so the changes \
+             cannot be shown.\n"
+        ),
+        "{output}"
+    );
+}
+
+/// The error a failed `yalper` run printed.
+fn error_of(output: &Output) -> String {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    String::from_utf8(output.stderr.clone()).unwrap()
+}
+
+#[test]
+fn an_unknown_step_or_session_is_a_clear_error() {
+    let project = recorded_project();
+    let root = project.path();
+    let error = error_of(&common::yalper(root, &["show", "10"]));
+    assert_eq!(
+        error,
+        "error: session 00893aaf has no step 10: its steps are 1 to 9. `yalper log` lists them.\n"
+    );
+    let error = error_of(&common::yalper(root, &["show", "1", "--session", "ff"]));
+    assert!(
+        error.contains("no recorded session id starts with ff"),
+        "{error}"
+    );
+    // Not a step number at all: refused by the argument parser.
+    let error = error_of(&common::yalper(root, &["show", "first"]));
+    assert!(error.contains("invalid value 'first'"), "{error}");
+
+    // The real binary, with a session chosen by its id prefix.
+    let output = common::yalper(root, &["show", "3", "--session", "0089"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("Session 00893aaf, step 3 of 9, "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("+pub fn new_name() {}"), "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn nothing_recorded_or_not_set_up() {
+    let project = common::project();
+    let database = project.path().join(YALPER_DIR).join(DATABASE_FILE);
+    let error = error_of(&common::yalper(project.path(), &["show", "1"]));
+    assert!(error.contains("run `yalper init` first"), "{error}");
+    assert!(!database.exists());
+
+    let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
+    drop(Store::open(&dir.dir, &dir.token).unwrap());
+    let error = error_of(&common::yalper(project.path(), &["show", "1"]));
+    assert!(error.contains("No sessions recorded yet."), "{error}");
+
+    let outside = tempfile::tempdir().unwrap();
+    let error = error_of(&common::yalper(outside.path(), &["show", "1"]));
+    assert!(
+        error.contains("Run `yalper show` inside a project"),
+        "{error}"
+    );
+}
+
+#[test]
+fn showing_writes_nothing_into_the_yalper_dir() {
+    let project = recorded_project();
+    let yalper_dir = project.path().join(YALPER_DIR);
+    // See `listing_writes_nothing_into_the_yalper_dir` in the log tests: a store open brings back the WAL.
+    let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
+    drop(Store::open(&dir.dir, &dir.token).unwrap());
+    drop(dir);
+    let before = common::files(&yalper_dir);
+    for step in ["1", "3", "4", "7", "9"] {
+        let output = common::yalper(project.path(), &["show", step, "--full"]);
+        assert!(output.status.success(), "{step}");
+    }
+    assert!(common::files(&yalper_dir) == before);
+}

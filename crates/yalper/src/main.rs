@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsStr;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -38,6 +38,18 @@ enum Command {
         #[arg(long, conflicts_with = "session")]
         all: bool,
     },
+    /// Show one step of the most recent session: its prompt or tool call, and the diff of the files it
+    /// changed.
+    Show {
+        /// The step number, as `yalper log` lists it.
+        step: u32,
+        /// Show a step of the session whose id starts with this.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        /// Show long texts and diffs whole instead of cut short.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -54,6 +66,11 @@ fn main() -> ExitCode {
         Command::Init { recreate } => init(recreate),
         Command::Uninstall { purge } => uninstall(purge),
         Command::Log { session, all } => log(session, all),
+        Command::Show {
+            step,
+            session,
+            full,
+        } => show(step, session, full),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -91,6 +108,27 @@ fn log(session: Option<String>, all: bool) -> Result<(), String> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     yalper::log::log(&start, &selection, &TimeZone::system(), &mut out)?;
     // A closed output (`yalper log | head`) is not an error.
+    let _ = out.flush();
+    Ok(())
+}
+
+fn show(step: u32, session: Option<String>, full: bool) -> Result<(), String> {
+    let start = env::current_dir()
+        .map_err(|error| format!("cannot read the current directory: {error}"))?;
+    let stdout = io::stdout();
+    // Colors only on a terminal, unless NO_COLOR (https://no-color.org) is set. Not on Windows, where an
+    // older console would print the escape sequences as text.
+    let color = cfg!(not(windows))
+        && stdout.is_terminal()
+        && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    let options = yalper::show::Options {
+        session,
+        full,
+        color,
+    };
+    let mut out = io::BufWriter::new(stdout.lock());
+    yalper::show::show(&start, step, &options, &TimeZone::system(), &mut out)?;
+    // A closed output (`yalper show 3 | head`) is not an error.
     let _ = out.flush();
     Ok(())
 }

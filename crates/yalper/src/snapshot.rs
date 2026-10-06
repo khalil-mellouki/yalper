@@ -405,14 +405,182 @@ impl ShadowStore {
         Ok(changed)
     }
 
+    /// Whether the store has the object `id`. The trees of an event log entry can be gone when the store was
+    /// created again after it was lost.
+    pub fn has_object(&self, id: ObjectId) -> bool {
+        self.repo.has_object(id)
+    }
+
+    /// The files that differ between the trees `old` and `new`, sorted by path, for showing a step.
+    /// The tree diff stops after `max_entries` entries (files and directories), so a crafted store whose
+    /// trees repeat a large subtree many times cannot make it run for long; [`FileChanges::complete`] then
+    /// says the list is cut. Paths are returned as stored: check them with [`validate_path`] before use.
+    pub fn file_changes(
+        &self,
+        old: ObjectId,
+        new: ObjectId,
+        max_entries: usize,
+    ) -> Result<FileChanges> {
+        let objects = self.verified();
+        let (mut old_buffer, mut new_buffer) = (Vec::new(), Vec::new());
+        let old = objects
+            .find_tree_iter(&old, &mut old_buffer)
+            .map_err(gix::Error::from)?;
+        let new = objects
+            .find_tree_iter(&new, &mut new_buffer)
+            .map_err(gix::Error::from)?;
+        let mut recorder = Capped {
+            inner: gix::diff::tree::Recorder::default(),
+            max_entries,
+        };
+        let complete = match gix::diff::tree(
+            old,
+            new,
+            gix::diff::tree::State::default(),
+            objects,
+            &mut recorder,
+        ) {
+            Ok(()) => true,
+            Err(gix::diff::tree::Error::Cancelled) => false,
+            Err(error) => return Err(Error::Git(gix::Error::from_error(error))),
+        };
+
+        let file = |mode: gix::objs::tree::EntryMode, blob: ObjectId| {
+            let kind = match mode.kind() {
+                EntryKind::Blob => FileKind::Regular,
+                EntryKind::BlobExecutable => FileKind::Executable,
+                EntryKind::Link => FileKind::Symlink,
+                EntryKind::Tree | EntryKind::Commit => return None,
+            };
+            Some(TreeFile { kind, blob })
+        };
+        let mut files = Vec::new();
+        for change in recorder.inner.records {
+            use gix::diff::tree::recorder::Change::{Addition, Deletion, Modification};
+            let (path, old, new) = match change {
+                Addition {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => (path, None, Some((entry_mode, oid))),
+                Deletion {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => (path, Some((entry_mode, oid)), None),
+                Modification {
+                    previous_entry_mode,
+                    previous_oid,
+                    entry_mode,
+                    oid,
+                    path,
+                } => (
+                    path,
+                    Some((previous_entry_mode, previous_oid)),
+                    Some((entry_mode, oid)),
+                ),
+            };
+            let (old, new) = (
+                old.and_then(|(mode, id)| file(mode, id)),
+                new.and_then(|(mode, id)| file(mode, id)),
+            );
+            // Directories only matter through the files in them. Yalper never stores submodule entries.
+            if old.is_some() || new.is_some() {
+                files.push(FileChange {
+                    path: path.into(),
+                    old,
+                    new,
+                });
+            }
+        }
+        // The diff goes through the trees level by level.
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        Ok(FileChanges { files, complete })
+    }
+
+    /// The content of the blob `id`, read through [`Verified`], or `None` if the store does not have it.
+    pub fn read_blob(&self, id: ObjectId) -> Result<Option<Vec<u8>>> {
+        let mut buffer = Vec::new();
+        let Some(data) = self
+            .verified()
+            .try_find(&id, &mut buffer)
+            .map_err(gix::Error::from)?
+        else {
+            return Ok(None);
+        };
+        if data.kind != gix::objs::Kind::Blob {
+            let error =
+                gix::error::corruption(format!("object {id} is a {}, not a blob", data.kind));
+            return Err(Error::Git(gix::Error::from(error.raise_erased())));
+        }
+        Ok(Some(buffer))
+    }
+
     fn verified(&self) -> Verified<'_> {
         Verified(&self.repo.objects)
     }
 }
 
+/// One file of a tree: how it is stored and its blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeFile {
+    pub kind: FileKind,
+    pub blob: ObjectId,
+}
+
+/// A file that differs between two trees: `old` is `None` for an added file, `new` for a deleted one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// As stored in the tree, `/`-separated, not checked: it may not be valid UTF-8 or a valid path.
+    pub path: Vec<u8>,
+    pub old: Option<TreeFile>,
+    pub new: Option<TreeFile>,
+}
+
+/// See [`ShadowStore::file_changes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChanges {
+    pub files: Vec<FileChange>,
+    /// `false` when the tree diff stopped at its limit, so more files changed than listed.
+    pub complete: bool,
+}
+
+/// A tree diff recorder that stops the diff once it holds `max_entries` changes.
+struct Capped {
+    inner: gix::diff::tree::Recorder,
+    max_entries: usize,
+}
+
+impl gix::diff::tree::Visit for Capped {
+    fn pop_front_tracked_path_and_set_current(&mut self) {
+        self.inner.pop_front_tracked_path_and_set_current();
+    }
+
+    fn push_back_tracked_path_component(&mut self, component: &BStr) {
+        self.inner.push_back_tracked_path_component(component);
+    }
+
+    fn push_path_component(&mut self, component: &BStr) {
+        self.inner.push_path_component(component);
+    }
+
+    fn pop_path_component(&mut self) {
+        self.inner.pop_path_component();
+    }
+
+    fn visit(&mut self, change: gix::diff::tree::visit::Change) -> gix::diff::tree::visit::Action {
+        if self.inner.records.len() >= self.max_entries {
+            return std::ops::ControlFlow::Break(());
+        }
+        self.inner.visit(change)
+    }
+}
+
 /// Object reads that recompute each object's hash and refuse one that does not match its id, so a corrupted
 /// or planted object cannot change what a snapshot contains. A tree cannot contain its own id, so this also
-/// rules out cycles. Used for every tree read; blobs are not read on the recording path.
+/// rules out cycles. Used for every tree read and every blob read (blobs are not read on the recording path).
 #[derive(Clone, Copy)]
 struct Verified<'a>(&'a gix::OdbHandle);
 
@@ -1180,6 +1348,115 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("reading a tree that contains itself did not finish");
         assert!(refused);
+    }
+
+    #[test]
+    fn file_changes_lists_each_file_with_its_old_and_new_entry() {
+        let (_dir, store) = new_store();
+        let old = from_scratch(
+            &store,
+            &[
+                ("same.txt", Regular, "same"),
+                ("edited.txt", Regular, "old"),
+                ("run.sh", Regular, "script"),
+                ("gone/deep/file.txt", Regular, "gone"),
+            ],
+        );
+        let mut changes = upserts(
+            &store,
+            &[
+                ("edited.txt", Regular, "new"),
+                ("run.sh", Executable, "script"),
+                ("new/link", Symlink, "../same.txt"),
+            ],
+        );
+        changes.push(remove("gone"));
+        let new = store.edit_tree(old, &changes).unwrap();
+        let blob = |content: &str| store.write_blob(content.as_bytes()).unwrap();
+        let file = |kind, content| {
+            Some(TreeFile {
+                kind,
+                blob: blob(content),
+            })
+        };
+
+        let changed = store.file_changes(old, new, 100).unwrap();
+        assert!(changed.complete);
+        let expected = [
+            ("edited.txt", file(Regular, "old"), file(Regular, "new")),
+            ("gone/deep/file.txt", file(Regular, "gone"), None),
+            ("new/link", None, file(Symlink, "../same.txt")),
+            (
+                "run.sh",
+                file(Regular, "script"),
+                file(Executable, "script"),
+            ),
+        ]
+        .map(|(path, old, new)| FileChange {
+            path: path.as_bytes().to_vec(),
+            old,
+            new,
+        });
+        assert_eq!(changed.files, expected);
+        assert_eq!(store.read_blob(blob("new")).unwrap().unwrap(), b"new");
+        let missing = ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(store.read_blob(missing).unwrap(), None);
+        assert!(!store.has_object(missing));
+        assert!(store.has_object(new) && store.has_object(store.empty_tree()));
+    }
+
+    #[test]
+    fn a_tree_bomb_is_cut_short() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (_dir, store) = new_store();
+            // Each level holds the level below twice: 2^40 files, all with valid hashes.
+            let mut tree = from_scratch(&store, &[("f", Regular, "x")]);
+            for _ in 0..40 {
+                let entries = ["a", "b"]
+                    .map(|name| gix::objs::tree::Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: name.into(),
+                        oid: tree,
+                    })
+                    .to_vec();
+                tree = store
+                    .repo
+                    .write_object(&gix::objs::Tree { entries })
+                    .unwrap()
+                    .detach();
+            }
+            let changed = store.file_changes(store.empty_tree(), tree, 1000).unwrap();
+            sender
+                .send((changed.complete, changed.files.len()))
+                .unwrap();
+        });
+        let (complete, files) = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("diffing a tree bomb did not finish");
+        assert!(!complete);
+        assert!(files <= 1000, "{files}");
+    }
+
+    #[test]
+    fn a_planted_blob_is_refused() {
+        let (dir, store) = new_store();
+        let honest = store.write_blob(b"honest").unwrap();
+        plant(
+            &dir.path().join(SNAPSHOTS_DIR),
+            &store,
+            gix::objs::Kind::Blob,
+            b"evil",
+            honest,
+        );
+        let error = store.read_blob(honest).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match its id"),
+            "{error}"
+        );
+        // A tree where a blob is expected.
+        let tree = from_scratch(&store, &[("a", Regular, "a")]);
+        assert!(store.read_blob(tree).is_err());
     }
 
     #[test]
