@@ -144,8 +144,15 @@ impl OwnedDir {
             Access::Append => OFlags::WRONLY | OFlags::APPEND,
             Access::ReadWrite => OFlags::RDWR,
         };
-        let fd = rustix::fs::openat(&self.handle, name, flags, Mode::RUSR | Mode::WUSR)?;
-        Ok(File::from(fd))
+        // macOS can fail with ENOENT when several processes create the same file at the same moment (seen
+        // in CI; the Zig compiler works around the same race). Trying again succeeds.
+        let mut retries = 0;
+        loop {
+            match rustix::fs::openat(&self.handle, name, flags, Mode::RUSR | Mode::WUSR) {
+                Err(rustix::io::Errno::NOENT) if retries < 10 => retries += 1,
+                result => return Ok(File::from(result?)),
+            }
+        }
     }
 
     #[cfg(windows)]
