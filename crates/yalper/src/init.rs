@@ -1141,7 +1141,7 @@ mod tests {
                 .any(|warning| warning.contains("temporary folder")),
             "{warnings:?}"
         );
-        let elsewhere = Path::new("/opt/no-such-folder/yalper");
+        let elsewhere = Path::new("/usr/no-such-folder/yalper");
         assert_eq!(exe_warnings(elsewhere), Vec::<String>::new());
     }
 
