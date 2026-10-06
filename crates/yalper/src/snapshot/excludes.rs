@@ -29,7 +29,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -40,13 +40,19 @@ use crate::safe_fs;
 pub const MAX_IGNORE_FILE_BYTES: u64 = 256 * 1024;
 
 /// The most bytes of `.gitignore` and `info/exclude` files one snapshot reads, all files together.
-pub const MAX_IGNORE_BYTES: u64 = 1024 * 1024;
+pub const MAX_IGNORE_BYTES: u64 = 256 * 1024;
 
 /// The most pattern weight one snapshot compiles, all files together (see [`weight`]). Room for realistic
-/// monorepos: the Visual Studio `.gitignore` of github/gitignore, one of the largest templates, weighs 605
-/// (1,167 on Windows and macOS, where patterns ignore case). Measured worst case at this budget on the user's
-/// Windows machine: about 66 ms to compile 1,000 case-insensitive literal patterns; with case-sensitive
-/// matching (Linux) at most about 38 ms, for 800 patterns like `a1*`.
+/// monorepos: the Visual Studio `.gitignore` of github/gitignore, one of the largest templates, weighs 839
+/// (1,401 on Windows and macOS, where patterns ignore case); Node, Python and Unity weigh 174 to 269 (340 to
+/// 475).
+///
+/// Measured on the user's Windows machine with the budget filled by one kind of pattern, whole snapshot of a
+/// tiny project (5 ms without rules), median: with case-insensitive matching (Windows, macOS) at most about
+/// 50 ms, for 113 literals of 250 bytes, 30 of 1,000 bytes, or 24 of 1,250 bytes with a `*`; 31 to 35 ms for
+/// 650 to 800 short patterns (literals, `*.ext`, `a1*`, `a1?`, `[Dd]ebug1/`); 21 to 25 ms for alternations
+/// (`x1.{js,ts}`, `{ab,cd}` repeated) and `**` patterns; 10 to 15 ms for nested braces and long bracket
+/// runs. With case-sensitive matching (Linux) at most about 30 ms (800 patterns like `a1*`).
 pub const MAX_IGNORE_WEIGHT: u64 = 4000;
 
 /// Patterns match without regard to case where git does by default (`core.ignoreCase`, set by `git init` on
@@ -55,6 +61,9 @@ const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 
 /// The `.git` file of a linked worktree or submodule holds one short line.
 const MAX_GIT_FILE_BYTES: u64 = 4096;
+
+/// Long patterns cost more to compile: one more unit of weight per this many bytes.
+const BYTES_PER_WEIGHT: u64 = 8;
 
 /// What is left for the ignore files of one snapshot.
 struct Budget {
@@ -67,20 +76,27 @@ enum Unused {
     /// A link, not a regular file, unreadable, or larger than [`MAX_IGNORE_FILE_BYTES`]: counts as absent.
     Refused(String),
     /// Over the budget of the snapshot: the snapshot fails.
-    OverBudget(String),
+    OverBudget,
+}
+
+/// The `.gitignore` rules that apply inside one directory: its own, if it has any, then those of the
+/// nearest directories above it that have some. Directories without rules share their parent's chain, so
+/// checking an entry costs one lookup of its parent plus one match per directory that has rules.
+struct Chain {
+    rules: Gitignore,
+    parent: Option<Arc<Chain>>,
 }
 
 pub(super) struct Excludes {
     root: PathBuf,
-    /// The rules of each directory that has a usable `.gitignore`, by absolute path.
-    gitignores: RwLock<HashMap<PathBuf, Gitignore>>,
+    /// The rule chain of each directory the walk entered, by absolute path. `None`: no `.gitignore` rules
+    /// apply inside it.
+    chains: RwLock<HashMap<PathBuf, Option<Arc<Chain>>>>,
     info_exclude: Gitignore,
     global: Gitignore,
     budget: Mutex<Budget>,
     /// Ignore files that exist but are not used, with the reason.
     refused: Mutex<Vec<(PathBuf, String)>>,
-    /// Ignore files that did not fit in the budget, with the reason.
-    over_budget: Mutex<Vec<(PathBuf, String)>>,
     exceeded: AtomicBool,
 }
 
@@ -92,7 +108,7 @@ impl Excludes {
         let (global, _) = builder.build_global();
         let mut excludes = Self {
             root: root.to_owned(),
-            gitignores: RwLock::new(HashMap::new()),
+            chains: RwLock::new(HashMap::new()),
             info_exclude: Gitignore::empty(),
             global,
             budget: Mutex::new(Budget {
@@ -100,7 +116,6 @@ impl Excludes {
                 weight: MAX_IGNORE_WEIGHT,
             }),
             refused: Mutex::new(Vec::new()),
-            over_budget: Mutex::new(Vec::new()),
             exceeded: AtomicBool::new(false),
         };
         if let Some(dir) = git_common_dir(root) {
@@ -109,30 +124,39 @@ impl Excludes {
         excludes
     }
 
-    /// Reads the `.gitignore` of `dir`. Called for each directory before any entry inside it is checked.
+    /// Reads the `.gitignore` of `dir`. Called for each directory the walk enters, after its parent and
+    /// before any entry inside it is checked.
     pub fn add_dir(&self, dir: &Path) {
-        let gitignore = self.rules(dir, &dir.join(".gitignore"));
-        if !gitignore.is_empty()
-            && let Ok(mut gitignores) = self.gitignores.write()
-        {
-            gitignores.insert(dir.to_owned(), gitignore);
+        let parent = if dir == self.root {
+            None
+        } else {
+            dir.parent().and_then(|parent| self.chain(parent))
+        };
+        let rules = self.rules(dir, &dir.join(".gitignore"));
+        let chain = if rules.is_empty() {
+            parent
+        } else {
+            Some(Arc::new(Chain { rules, parent }))
+        };
+        if let Ok(mut chains) = self.chains.write() {
+            chains.insert(dir.to_owned(), chain);
         }
+    }
+
+    fn chain(&self, dir: &Path) -> Option<Arc<Chain>> {
+        self.chains.read().ok()?.get(dir).cloned().flatten()
     }
 
     /// Whether git ignores `path`, an entry inside the project. A deeper `.gitignore` takes precedence over
     /// the ones above it, and all of them over `info/exclude`, then the global excludes file. Entries inside
     /// an ignored directory are never checked, because the walk does not enter it.
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        if let Ok(gitignores) = self.gitignores.read() {
-            for dir in path.ancestors().skip(1) {
-                let found = gitignores.get(dir).map(|rules| rules.matched(path, is_dir));
-                if let Some(ignored) = found.and_then(decided) {
-                    return ignored;
-                }
-                if dir == self.root {
-                    break;
-                }
+        let mut chain = path.parent().and_then(|parent| self.chain(parent));
+        while let Some(link) = chain {
+            if let Some(ignored) = decided(link.rules.matched(path, is_dir)) {
+                return ignored;
             }
+            chain = link.parent.clone();
         }
         decided(self.info_exclude.matched(path, is_dir))
             .or_else(|| decided(self.global.matched(path, is_dir)))
@@ -150,31 +174,33 @@ impl Excludes {
         refused
     }
 
-    /// Whether an ignore file went over the budget: the snapshot fails, so the walk can stop.
+    /// Whether the ignore files went over the budget: the snapshot fails, so the walk can stop.
     pub fn exceeded(&self) -> bool {
         self.exceeded.load(Ordering::Relaxed)
     }
 
-    /// If the budget was exceeded, why, naming the first offending file by path.
+    /// If the budget was exceeded, why. No file is named: which file the total ran out at depends on the
+    /// order of the walk.
     pub fn budget_error(&self) -> Option<String> {
-        let over_budget = self.over_budget.lock().ok()?;
-        let (file, reason) = over_budget.iter().min()?;
-        Some(format!("{}: {reason}", file.display()))
+        self.exceeded().then(|| {
+            format!(
+                "the project's .gitignore and info/exclude files go over the budget of {MAX_IGNORE_WEIGHT} \
+                 pattern weight or {MAX_IGNORE_BYTES} bytes per snapshot"
+            )
+        })
     }
 
     /// The rules of the ignore file at `file`, relative to `dir`. Empty if the file is missing, and also if
     /// it is not used, which is then recorded.
     fn rules(&self, dir: &Path, file: &Path) -> Gitignore {
-        let (list, reason) = match self.load(dir, file) {
+        match self.load(dir, file) {
             Ok(rules) => return rules,
-            Err(Unused::Refused(reason)) => (&self.refused, reason),
-            Err(Unused::OverBudget(reason)) => {
-                self.exceeded.store(true, Ordering::Relaxed);
-                (&self.over_budget, reason)
+            Err(Unused::Refused(reason)) => {
+                if let Ok(mut refused) = self.refused.lock() {
+                    refused.push((file.to_owned(), reason));
+                }
             }
-        };
-        if let Ok(mut list) = list.lock() {
-            list.push((file.to_owned(), reason));
+            Err(Unused::OverBudget) => self.exceeded.store(true, Ordering::Relaxed),
         }
         Gitignore::empty()
     }
@@ -227,20 +253,9 @@ impl Excludes {
 
     /// Takes `bytes` and `weight` from the budget, or nothing if either does not fit.
     fn spend(&self, bytes: u64, weight: u64) -> Result<(), Unused> {
-        let over = |what: String| Unused::OverBudget(format!("over the budget of {what}"));
-        let mut budget = self
-            .budget
-            .lock()
-            .map_err(|_| over("ignore rules, which is unavailable".to_owned()))?;
-        if bytes > budget.bytes {
-            return Err(over(format!(
-                "{MAX_IGNORE_BYTES} bytes for all ignore files"
-            )));
-        }
-        if weight > budget.weight {
-            return Err(over(format!(
-                "{MAX_IGNORE_WEIGHT} pattern weight for all ignore files"
-            )));
+        let mut budget = self.budget.lock().map_err(|_| Unused::OverBudget)?;
+        if bytes > budget.bytes || weight > budget.weight {
+            return Err(Unused::OverBudget);
         }
         budget.bytes -= bytes;
         budget.weight -= weight;
@@ -248,18 +263,26 @@ impl Excludes {
     }
 }
 
-/// What a pattern costs to compile, in units of about 15 µs on the user's machine: 1 for a case-sensitive
-/// literal or `*.ext` (a few µs, matched without a regular expression), otherwise 4 plus 1 per `*`, `?` or
-/// `[` (about 50 to 100 µs).
+/// What a pattern costs to compile, in units of about 10 µs on the user's machine (see
+/// [`MAX_IGNORE_WEIGHT`]): 1 for a short case-sensitive literal or `*.ext`, which are matched without a
+/// regular expression; otherwise 4, plus 1 per `*`, `?`, `[`, and per `{` and `,` of an alternation. Long
+/// patterns add 1 per [`BYTES_PER_WEIGHT`] bytes.
 pub(super) fn weight(pattern: &str) -> u64 {
-    let wildcards = pattern.matches(['*', '?', '[']).count() as u64;
+    let count = |chars: &[char]| pattern.matches(chars).count() as u64;
+    let wildcards = count(&['*', '?', '[']);
+    let alternations = if pattern.contains('{') {
+        count(&['{', ','])
+    } else {
+        0
+    };
+    let length = pattern.len() as u64 / BYTES_PER_WEIGHT;
     let simple_extension = pattern
         .strip_prefix("*.")
-        .is_some_and(|extension| !extension.contains(['*', '?', '[', '/']));
-    if !CASE_INSENSITIVE && (wildcards == 0 || simple_extension) {
-        1
+        .is_some_and(|extension| !extension.contains(['*', '?', '[', '{', '/']));
+    if !CASE_INSENSITIVE && alternations == 0 && (wildcards == 0 || simple_extension) {
+        1 + length
     } else {
-        4 + wildcards
+        4 + wildcards + alternations + length
     }
 }
 

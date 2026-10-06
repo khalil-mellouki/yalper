@@ -39,6 +39,10 @@ const WALK_THREADS: usize = 4;
 /// [`MAX_FILE_BYTES`]), so this bounds memory when many files changed at once.
 const QUEUED_CONTENTS: usize = 16;
 
+/// Directories nested deeper than this are not entered. Paths, and checking them against ignore rules, grow with
+/// depth, so an absurdly deep tree would make every snapshot slow.
+pub const MAX_DEPTH: usize = 256;
+
 /// The result of [`snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -97,6 +101,8 @@ pub enum SkipReason {
     /// An ignore file (`.gitignore` or `info/exclude`) whose rules are not used, so the files it would ignore
     /// are snapshotted. The file itself is snapshotted like any other.
     IgnoreFileNotUsed(String),
+    /// A directory [`MAX_DEPTH`] levels down: what is inside it is not in the snapshot.
+    TooDeep,
 }
 
 impl fmt::Display for Skipped {
@@ -118,6 +124,10 @@ impl fmt::Display for Skipped {
             SkipReason::IgnoreFileNotUsed(reason) => {
                 write!(f, "{path:?} not used as an ignore file: {reason}")
             }
+            SkipReason::TooDeep => write!(
+                f,
+                "{path:?} not entered: nested more than {MAX_DEPTH} directories deep"
+            ),
         }
     }
 }
@@ -169,6 +179,10 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
         scope.spawn(move || walk(root, cache, walk_excludes, sender, permits));
         // If this loop stops early, dropping the receivers makes the walk stop too.
         for walked in receiver {
+            if excludes.exceeded() {
+                // The snapshot fails below: nothing more to store.
+                break;
+            }
             let (file, check) = match walked {
                 Walked::File(file, check) => (file, check),
                 Walked::Skipped(skipped) => {
@@ -438,6 +452,9 @@ fn visit(
         Ok(path) => path,
         Err(lossy) => return skip(lossy, SkipReason::InvalidPath("not valid UTF-8".to_owned())),
     };
+    if file_type.is_dir() && entry.depth() >= MAX_DEPTH {
+        return skip(path, SkipReason::TooDeep);
+    }
 
     let kind = if file_type.is_dir() {
         None
@@ -1330,7 +1347,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("sub") && message.contains("pattern weight"),
+            message.contains("pattern weight") && !message.contains("sub"),
             "{message}"
         );
         assert_eq!(project.store.file_cache().unwrap(), before);
@@ -1615,5 +1632,39 @@ mod tests {
             p.write("a/cache/x", "x");
             p.write("b/cache", "x");
         });
+    }
+
+    #[test]
+    fn a_very_deep_tree_is_cut_off_and_reported() {
+        let project = Project::new();
+        project.write(".gitignore", "*.log\n");
+        let nested = |depth: usize| vec!["d"; depth].join("/");
+        project.write(&format!("{}/mid.txt", nested(100)), "x");
+        project.write(&format!("{}/deep.txt", nested(MAX_DEPTH + 40)), "x");
+
+        let start = std::time::Instant::now();
+        let snapshot = project.snapshot();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            paths(&project, &snapshot),
+            [".gitignore".to_owned(), format!("{}/mid.txt", nested(100))]
+        );
+        assert_eq!(
+            snapshot.skipped,
+            [Skipped {
+                path: nested(MAX_DEPTH),
+                reason: SkipReason::TooDeep,
+            }]
+        );
+        let problems = snapshot.problems().unwrap();
+        assert!(
+            problems.starts_with("snapshot skipped 1 path(s): "),
+            "{problems}"
+        );
+        assert!(problems.contains("not entered"), "{problems}");
     }
 }
