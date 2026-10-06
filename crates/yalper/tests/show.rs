@@ -107,6 +107,11 @@ fn recorded_project() -> tempfile::TempDir {
         snapshot::snapshot(&dir.dir, &store, &lock).unwrap();
     }
     let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    // Tool paths are absolute, under the project: `show_output` shows the project as /home/dev/project.
+    let (lib, factorial) = (
+        format!("{}/src/lib.rs", root.display()),
+        format!("{}/src/factorial.rs", root.display()),
+    );
 
     record_payload(&dir, fixture("session_start.json"));
     let mut prompt = fixture("user_prompt_submit.json");
@@ -121,13 +126,13 @@ fn recorded_project() -> tempfile::TempDir {
             json!({
                 "tool_name": "Edit",
                 "tool_input": {
-                    "file_path": "/home/dev/project/src/lib.rs",
+                    "file_path": lib,
                     "old_string": "pub fn old_name() {}",
                     "new_string": "pub fn new_name() {}",
                     "replace_all": false
                 },
                 "tool_response": {
-                    "filePath": "/home/dev/project/src/lib.rs",
+                    "filePath": lib,
                     "oldString": "pub fn old_name() {}",
                     "newString": "pub fn new_name() {}",
                     "originalFile": LIB_BEFORE,
@@ -163,7 +168,7 @@ fn recorded_project() -> tempfile::TempDir {
             "PostToolUse",
             json!({
                 "tool_name": "Read",
-                "tool_input": {"file_path": "/home/dev/project/src/lib.rs"},
+                "tool_input": {"file_path": lib},
                 "tool_response": "pub fn new_name() {}\n",
                 "duration_ms": 3
             }),
@@ -177,10 +182,10 @@ fn recorded_project() -> tempfile::TempDir {
             "PostToolUse",
             json!({
                 "tool_name": "Write",
-                "tool_input": {"file_path": "/home/dev/project/src/factorial.rs", "content": FACTORIAL},
+                "tool_input": {"file_path": factorial, "content": FACTORIAL},
                 "tool_response": {
                     "type": "create",
-                    "filePath": "/home/dev/project/src/factorial.rs",
+                    "filePath": factorial,
                     "content": FACTORIAL,
                     "structuredPatch": [],
                     "originalFile": null
@@ -225,7 +230,13 @@ fn show_output(root: &Path, step: u32, options: &Options) -> Result<String, Stri
         &TimeZone::fixed(tz::offset(2)),
         &mut out,
     )?;
-    Ok(String::from_utf8(out).unwrap())
+    // The temporary project root, as written in tool paths and as escaped in JSON, shown as a fixed path.
+    let root = root.to_str().unwrap();
+    let escaped = serde_json::to_string(root).unwrap();
+    let output = String::from_utf8(out).unwrap();
+    Ok(output
+        .replace(&escaped[1..escaped.len() - 1], "/home/dev/project")
+        .replace(root, "/home/dev/project"))
 }
 
 fn short(root: &Path, step: u32) -> String {
@@ -495,6 +506,12 @@ fn a_step_whose_snapshot_failed_or_whose_base_is_not_known() {
         ),
         "{output}"
     );
+    // Without the diff, the Edit's own patch and original file stay in its output.
+    assert!(
+        output.contains("\n    \"structuredPatch\": [\n"),
+        "{output}"
+    );
+    assert!(output.contains("\n    \"originalFile\": "), "{output}");
 }
 
 #[test]
@@ -511,6 +528,7 @@ fn a_snapshot_the_store_no_longer_has() {
         let output = short(project.path(), step);
         assert!(output.contains("\nSnapshot not available: "), "{output}");
     }
+    assert!(short(project.path(), 3).contains("\"structuredPatch\""));
     // A missing store too.
     fs::remove_dir_all(project.path().join(YALPER_DIR).join(SNAPSHOTS_DIR)).unwrap();
     let output = short(project.path(), 8);
@@ -606,6 +624,22 @@ fn control_characters_never_reach_the_terminal() {
     }
     assert!(!has_control_characters(&stripped), "{stripped:?}");
     assert_eq!(stripped, output);
+}
+
+#[test]
+fn an_agent_step_keeps_the_content_of_its_answer() {
+    let project = common::project();
+    let root = project.path();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    // The subagent changed a file too: only file tools have their response trimmed when a diff is shown.
+    fs::write(root.join("notes.txt"), "callers\n").unwrap();
+    record_payload(&dir, fixture("post_tool_use_agent.json"));
+    let output = short(root, 1);
+    assert!(output.contains("\n    \"content\": [\n"), "{output}");
+    assert!(
+        output.contains("Found 2 callers of old_name: src/main.rs:4 and src/cli.rs:17."),
+        "{output}"
+    );
 }
 
 #[test]

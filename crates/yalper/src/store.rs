@@ -233,7 +233,7 @@ impl fmt::Display for Error {
             Self::OlderSchema { found, known } => write!(
                 f,
                 "the database has schema version {found}, older than this Yalper's version {known}: run \
-                 `yalper init` to update it"
+                 `yalper init`, or record one more step, to update it"
             ),
         }
     }

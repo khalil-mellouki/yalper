@@ -401,7 +401,7 @@ fn tool_summary(input: Option<&Value>, roots: &[String], max: usize) -> Option<S
 /// `path` relative to the first of `roots` it is inside, with `/` as separator, or `path` itself when it is
 /// outside all of them. Either separator is accepted in both, and on Windows letter case is ignored, so the
 /// result does not depend on how the agent wrote the path.
-fn relative_path(path: &str, roots: &[String]) -> String {
+pub(crate) fn relative_path(path: &str, roots: &[String]) -> String {
     let normalized = path.replace('\\', "/");
     for root in roots {
         let root = root.replace('\\', "/");

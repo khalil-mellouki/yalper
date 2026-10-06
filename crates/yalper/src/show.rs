@@ -28,10 +28,10 @@ use serde_json::Value;
 use crate::hook::HookEvent;
 use crate::init::{printable, say};
 use crate::log::{
-    ELLIPSIS, NOTHING_RECORDED, action, cut_end, find, find_session, local_time, plural, short_id,
-    short_id_chars, takes_snapshot,
+    ELLIPSIS, NOTHING_RECORDED, action, cut_end, find, find_session, local_time, plural,
+    relative_path, short_id, short_id_chars, takes_snapshot,
 };
-use crate::repo::YalperDir;
+use crate::repo::{self, YalperDir};
 use crate::snapshot::{FileChange, FileKind, ShadowStore, validate_path};
 use crate::store::{Event, Store};
 
@@ -138,17 +138,56 @@ pub fn show(
         out,
         &printable(&format!("Session {short}, step {step} of {steps}, {time}")),
     );
-    write_step(out, &event, options.full);
+    // The files section comes last but is built first: a file tool's output repeats the file or its patch,
+    // which is left out only when the diff of that file is shown below.
+    let mut files = Vec::new();
+    let diffed = if takes_snapshot(&event.kind) {
+        write_files(&mut files, &yalper, &event, options)
+    } else {
+        Ok(Vec::new())
+    };
+    let shown_by_diff = match (&diffed, edited_file(&event)) {
+        (Ok(diffed), Some(edited)) => {
+            // Tool paths are absolute. The project root is tried as found from `start` and as `.yalper/` was
+            // opened (canonical on Unix), as `yalper log` does.
+            let roots: Vec<String> = [repo::find_root(start), yalper.dir.path().parent()]
+                .into_iter()
+                .flatten()
+                .filter_map(|root| root.to_str().map(str::to_owned))
+                .collect();
+            diffed.contains(&relative_path(edited, &roots))
+        }
+        _ => false,
+    };
+    write_step(out, &event, options.full, shown_by_diff);
     if takes_snapshot(&event.kind) {
         say(out, "");
-        write_files(out, &yalper, &event, options)?;
+        let _ = out.write_all(&files);
     }
-    Ok(())
+    diffed.map(|_| ())
+}
+
+/// The tools that edit one file, whose response holds that file or its patch, and the input key naming it.
+const FILE_TOOLS: [(&str, &str); 4] = [
+    ("Edit", "file_path"),
+    ("MultiEdit", "file_path"),
+    ("Write", "file_path"),
+    ("NotebookEdit", "notebook_path"),
+];
+
+/// The path of the file a successful file tool call (see [`FILE_TOOLS`]) edited, as the agent gave it.
+fn edited_file(event: &Event) -> Option<&str> {
+    if event.success != Some(true) {
+        return None;
+    }
+    let tool = event.tool_name.as_deref()?;
+    let (_, key) = FILE_TOOLS.iter().find(|(name, _)| *name == tool)?;
+    event.payload.get("tool_input")?.get(key)?.as_str()
 }
 
 /// Writes what the step was: a prompt, a reply, the start or end of the session, or a tool call with its
-/// input and output.
-fn write_step(out: &mut dyn Write, event: &Event, full: bool) {
+/// input and output. `shown_by_diff`: the diff below shows the file a file tool edited (see [`edited_file`]).
+fn write_step(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bool) {
     let text = |key: &str| event.payload.get(key).and_then(Value::as_str);
     match HookEvent::from_name(&event.kind) {
         HookEvent::SessionStart => {
@@ -170,12 +209,14 @@ fn write_step(out: &mut dyn Write, event: &Event, full: bool) {
             };
             say(out, &printable(&line));
         }
-        HookEvent::PostToolUse | HookEvent::PostToolUseFailure => write_tool_call(out, event, full),
+        HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
+            write_tool_call(out, event, full, shown_by_diff)
+        }
         HookEvent::Other(kind) => say(out, &printable(&kind)),
     }
 }
 
-fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool) {
+fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bool) {
     let payload = &event.payload;
     let duration = payload
         .get("duration_ms")
@@ -226,8 +267,8 @@ fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool) {
             }
         }
         Some(Value::String(text)) => text_block(out, "Output", Some(text), full),
-        Some(Value::Object(response)) => {
-            // File tools repeat the whole file or the patch, which the diff below already shows.
+        Some(Value::Object(response)) if shown_by_diff => {
+            // The file tool's response repeats the whole file or the patch, which the diff below shows.
             let mut response = response.clone();
             for key in DIFF_DUPLICATE_KEYS {
                 response.shift_remove(key);
@@ -239,8 +280,8 @@ fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool) {
     }
 }
 
-/// The keys of a successful tool response left out of its Output block: the file content or patch that
-/// Edit, Write and similar tools return, which the step's diff shows.
+/// The keys of a file tool's response left out of its Output block when the diff of its file is shown: the
+/// file content or patch that Edit, Write and similar tools return.
 const DIFF_DUPLICATE_KEYS: [&str; 3] = ["originalFile", "structuredPatch", "content"];
 
 /// A short value shown inside a line (a tool name, a model, an end reason), made printable and cut to
@@ -314,14 +355,14 @@ fn write_files(
     yalper: &YalperDir,
     event: &Event,
     options: &Options,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let Some(tree) = &event.tree_id else {
         say(
             out,
             "No snapshot was recorded for this step (taking it failed, see .yalper/errors.log). Its file \
              changes are in the next step that has a snapshot.",
         );
-        return Ok(());
+        return Ok(Vec::new());
     };
     let Some(base) = &event.base_tree_id else {
         // Steps recorded before Yalper kept each step's base.
@@ -332,7 +373,7 @@ fn write_files(
                 "The snapshot before this step is not known, so its file changes cannot be shown.",
             ),
         }
-        return Ok(());
+        return Ok(Vec::new());
     };
     let not_available = |out: &mut dyn Write| {
         say(
@@ -345,19 +386,19 @@ fn write_files(
     let (tree, base) = (tree_id(tree)?, tree_id(base)?);
     if base == tree {
         say(out, "No files changed.");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let shadow = match ShadowStore::open(&yalper.dir, &yalper.token) {
         Ok(shadow) => shadow,
         Err(crate::snapshot::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             not_available(out);
-            return Ok(());
+            return Ok(Vec::new());
         }
         Err(error) => return Err(failed(error)),
     };
     if !shadow.has_object(tree) || !shadow.has_object(base) {
         not_available(out);
-        return Ok(());
+        return Ok(Vec::new());
     }
     let changes = shadow
         .file_changes(base, tree, MAX_TREE_ENTRIES)
@@ -410,6 +451,7 @@ fn write_files(
         full: options.full,
         budget,
         truncated: false,
+        diffed: Vec::new(),
     };
     for file in &files {
         if !file.diffed {
@@ -427,7 +469,7 @@ fn write_files(
         };
         say(writer.out, &marker);
     }
-    Ok(())
+    Ok(writer.diffed)
 }
 
 /// A tree id read from the event log.
@@ -445,6 +487,8 @@ struct ListedFile {
     verb: &'static str,
     /// Made printable.
     path: String,
+    /// As stored in the tree (lossy if not UTF-8).
+    relative: String,
     note: Option<&'static str>,
     /// The blobs to diff: none before an added file.
     old: Option<ObjectId>,
@@ -464,6 +508,7 @@ impl ListedFile {
         let mut file = Self {
             verb,
             path: printable(&String::from_utf8_lossy(&change.path)),
+            relative: String::from_utf8_lossy(&change.path).into_owned(),
             note,
             old: change.old.map(|old| old.blob),
             new: change.new.map(|new| new.blob),
@@ -539,6 +584,8 @@ struct DiffWriter<'a> {
     budget: Budget,
     /// The budget ran out: the diff shown is cut.
     truncated: bool,
+    /// The paths, as stored in the tree, of the files whose whole diff was written.
+    diffed: Vec<String>,
 }
 
 impl DiffWriter<'_> {
@@ -571,7 +618,11 @@ impl DiffWriter<'_> {
                 if lines(&old).max(lines(&new)) > self.budget.file_lines {
                     "too large to diff"
                 } else {
-                    return Ok(self.diff(&file.path, file.old.is_some(), &old, &new));
+                    let whole = self.diff(&file.path, file.old.is_some(), &old, &new);
+                    if whole {
+                        self.diffed.push(file.relative.clone());
+                    }
+                    return Ok(whole);
                 }
             }
         };
@@ -864,10 +915,12 @@ mod tests {
             full: false,
             budget,
             truncated: false,
+            diffed: Vec::new(),
         };
         for &(path, old, new) in files {
             let file = ListedFile {
                 verb: "modified",
+                relative: String::new(),
                 path: path.to_owned(),
                 note: None,
                 old: Some(shadow.write_blob(old).unwrap()),
@@ -912,9 +965,11 @@ mod tests {
             full: false,
             budget: SHORT_BUDGET,
             truncated: false,
+            diffed: Vec::new(),
         };
         let file = ListedFile {
             verb: "modified",
+            relative: String::new(),
             path: "gone.txt".to_owned(),
             note: None,
             old: Some(ObjectId::from_bytes_or_panic(&[7; 20])),
@@ -1004,9 +1059,11 @@ mod tests {
             full: false,
             budget: SHORT_BUDGET,
             truncated: false,
+            diffed: Vec::new(),
         };
         let added = ListedFile {
             verb: "added",
+            relative: String::new(),
             path: "new.txt".to_owned(),
             note: None,
             old: None,

@@ -427,7 +427,8 @@ fn every_fixture_is_recorded_as_a_step() {
     }
     let events = recorded_events(project.path());
     let steps: Vec<u32> = events.iter().map(|event| event.step).collect();
-    assert_eq!(steps, (1..=7).collect::<Vec<u32>>());
+    let count = u32::try_from(fixtures().len()).unwrap();
+    assert_eq!(steps, (1..=count).collect::<Vec<u32>>());
     assert_eq!(error_lines(project.path()), Vec::<String>::new());
 }
 
