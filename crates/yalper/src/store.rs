@@ -566,7 +566,12 @@ impl Store {
         let mut rows = statement.query([])?;
         let mut files = Vec::new();
         while let Some(row) = rows.next()? {
-            self.check_deadline(files.len())?;
+            if let Err(error) = self.check_deadline(files.len()) {
+                // Freeing a million rows takes a few hundred milliseconds more, and only a hook sets a deadline:
+                // its process exits right after recording the step, which frees them at once.
+                std::mem::forget(files);
+                return Err(error);
+            }
             match cached_file_from_row(row)? {
                 Some(file) => files.push(file),
                 None => return Ok(None),
