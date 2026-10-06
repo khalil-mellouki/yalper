@@ -1,24 +1,27 @@
 //! `yalper show <step>`: one recorded step in full: the prompt, reply or tool call (input and output, as
-//! stored, so already redacted), then the files the step changed, with a unified diff of each changed text
-//! file.
+//! stored, so already redacted), then the files the step changed, with a unified diff of each changed or
+//! added text file.
 //!
-//! The files a step changed are the difference between its snapshot and the snapshot taken just before it
-//! (see [`Store::previous_tree_id`]), so a change made by a shell command shows up like an edit.
+//! The files a step changed are the difference between its snapshot and the tree that snapshot was built
+//! from, both kept with the step (`tree_id` and `base_tree_id`), so a change made by a shell command shows up
+//! like an edit, and the list always matches the step's number of files changed.
 //!
 //! Everything shown comes from the event log or the snapshot store, which hold what agents and repositories
 //! wrote, so every line goes through [`printable`] (tabs are kept in content lines: they move the cursor but
 //! cannot start an escape sequence), every path is checked with the rules of [`validate_path`], and every
 //! blob is read through the hash-checking reader of the snapshot store. The tree diff, the number of files
-//! listed and the size of the diff are capped, so a crafted store cannot make the command run for long or
-//! flood the terminal. Nothing is written: the event log is opened for reading only, and no tree is ever
-//! written to disk.
+//! listed, the size of each file diffed, the content read and the output are capped, so a crafted store
+//! cannot make the command run for long, use much memory, or flood the terminal. Nothing is written: the
+//! event log is opened for reading only, and no tree is ever written to disk.
 
+use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::path::Path;
 
 use gix::ObjectId;
-use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{Algorithm, InternedInput, UnifiedDiff, diff_with_slider_heuristics};
+use gix_imara_diff::{
+    Algorithm, Diff, InternedInput, Interner, Token, UnifiedDiffConfig, UnifiedDiffPrinter,
+};
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
@@ -53,25 +56,33 @@ const CONTEXT_LINES: u32 = 3;
 /// Git's test for a binary file: a NUL byte in its first 8,000 bytes.
 const BINARY_PROBE_BYTES: usize = 8_000;
 
-/// How much diff is shown: lines and bytes printed, and bytes of file content read to compute it.
+/// How much diff is shown: lines and bytes printed and bytes of content read, for all files together, and
+/// the largest file diffed. A line diff costs more than linear time on repetitive input (measured: two
+/// versions of 10 MiB took 80 s), so each file is capped.
 #[derive(Debug, Clone, Copy)]
 struct Budget {
     lines: usize,
     bytes: usize,
     read_bytes: usize,
+    file_bytes: usize,
+    file_lines: usize,
 }
 
 const SHORT_BUDGET: Budget = Budget {
     lines: 300,
     bytes: 64 * 1024,
     read_bytes: 32 * 1024 * 1024,
+    file_bytes: 1024 * 1024,
+    file_lines: 50_000,
 };
 
-/// With `--full`: still bounded, so a crafted snapshot store cannot flood the terminal for minutes.
+/// With `--full`: still bounded, so a crafted snapshot store cannot keep the command busy for minutes.
 const FULL_BUDGET: Budget = Budget {
     lines: usize::MAX,
     bytes: 32 * 1024 * 1024,
-    read_bytes: 512 * 1024 * 1024,
+    read_bytes: 256 * 1024 * 1024,
+    file_bytes: 4 * 1024 * 1024,
+    file_lines: 200_000,
 };
 
 /// How `yalper show` shows a step.
@@ -130,7 +141,7 @@ pub fn show(
     write_step(out, &event, options.full);
     if takes_snapshot(&event.kind) {
         say(out, "");
-        write_files(out, &yalper, &store, &event, options)?;
+        write_files(out, &yalper, &event, options)?;
     }
     Ok(())
 }
@@ -215,10 +226,22 @@ fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool) {
             }
         }
         Some(Value::String(text)) => text_block(out, "Output", Some(text), full),
+        Some(Value::Object(response)) => {
+            // File tools repeat the whole file or the patch, which the diff below already shows.
+            let mut response = response.clone();
+            for key in DIFF_DUPLICATE_KEYS {
+                response.shift_remove(key);
+            }
+            json_block(out, "Output", &Value::Object(response), full);
+        }
         Some(response) => json_block(out, "Output", response, full),
         None => {}
     }
 }
+
+/// The keys of a successful tool response left out of its Output block: the file content or patch that
+/// Edit, Write and similar tools return, which the step's diff shows.
+const DIFF_DUPLICATE_KEYS: [&str; 3] = ["originalFile", "structuredPatch", "content"];
 
 /// A short value shown inside a line (a tool name, a model, an end reason), made printable and cut to
 /// [`MAX_FIELD_CHARS`] characters.
@@ -284,11 +307,11 @@ fn content(text: &str) -> String {
         .join("\t")
 }
 
-/// Writes the files the step changed: a list, then a unified diff of each changed text file.
+/// Writes the files the step changed: a list, then a unified diff of each changed text file, one file at a
+/// time.
 fn write_files(
     out: &mut dyn Write,
     yalper: &YalperDir,
-    store: &Store,
     event: &Event,
     options: &Options,
 ) -> Result<(), String> {
@@ -300,14 +323,30 @@ fn write_files(
         );
         return Ok(());
     };
+    let Some(base) = &event.base_tree_id else {
+        // Steps recorded before Yalper kept each step's base.
+        match event.files_changed {
+            Some(0) => say(out, "No files changed."),
+            _ => say(
+                out,
+                "The snapshot before this step is not known, so its file changes cannot be shown.",
+            ),
+        }
+        return Ok(());
+    };
     let not_available = |out: &mut dyn Write| {
         say(
             out,
-            "Snapshot not available: the snapshot store no longer has it (the store was created again \
-             since this step was recorded).",
+            "Snapshot not available: the snapshot store no longer has the snapshots of this step (it was \
+             lost and created again since).",
         );
     };
     let failed = |error: crate::snapshot::Error| format!("cannot read the snapshots: {error}");
+    let (tree, base) = (tree_id(tree)?, tree_id(base)?);
+    if base == tree {
+        say(out, "No files changed.");
+        return Ok(());
+    }
     let shadow = match ShadowStore::open(&yalper.dir, &yalper.token) {
         Ok(shadow) => shadow,
         Err(crate::snapshot::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -316,51 +355,24 @@ fn write_files(
         }
         Err(error) => return Err(failed(error)),
     };
-    let tree = tree_id(tree)?;
-    let previous = store
-        .previous_tree_id(&event.session_id, event.step)
-        .map_err(|error| format!("cannot read the recordings: {error}"))?;
-    let Some(previous) = previous else {
-        // The step before it was `yalper init`'s baseline, which the event log does not keep.
-        match event.files_changed {
-            Some(0) => say(out, "No files changed."),
-            Some(files) => say(
-                out,
-                &format!(
-                    "{files} file{} changed since the snapshot `yalper init` took, which is not kept, so \
-                     the changes cannot be shown.",
-                    plural(files as usize)
-                ),
-            ),
-            None => say(out, "The snapshot before this step is not kept."),
-        }
-        return Ok(());
-    };
-    let previous = tree_id(&previous)?;
-    if !shadow.has_object(tree) || !shadow.has_object(previous) {
+    if !shadow.has_object(tree) || !shadow.has_object(base) {
         not_available(out);
         return Ok(());
     }
-    if previous == tree {
-        say(out, "No files changed.");
-        return Ok(());
-    }
     let changes = shadow
-        .file_changes(previous, tree, MAX_TREE_ENTRIES)
+        .file_changes(base, tree, MAX_TREE_ENTRIES)
         .map_err(failed)?;
-    let budget = if options.full {
-        FULL_BUDGET
-    } else {
-        SHORT_BUDGET
-    };
-    let listed = if options.full {
-        changes.files.len()
-    } else {
-        changes.files.len().min(MAX_LISTED_FILES)
-    };
-    let files = classify(&shadow, &changes.files[..listed], budget).map_err(failed)?;
-
     let count = changes.files.len();
+    let listed = if options.full {
+        count
+    } else {
+        count.min(MAX_LISTED_FILES)
+    };
+    let files: Vec<ListedFile> = changes.files[..listed]
+        .iter()
+        .map(ListedFile::new)
+        .collect();
+
     say(
         out,
         &if changes.complete {
@@ -387,6 +399,11 @@ fn write_files(
         );
     }
 
+    let budget = if options.full {
+        FULL_BUDGET
+    } else {
+        SHORT_BUDGET
+    };
     let mut writer = DiffWriter {
         out,
         color: options.color,
@@ -395,14 +412,14 @@ fn write_files(
         truncated: false,
     };
     for file in &files {
-        let Some((old, new)) = &file.texts else {
+        if !file.diffed {
             continue;
-        };
-        if !writer.diff(&file.path, old, new) {
+        }
+        if !writer.file(&shadow, file).map_err(failed)? {
             break;
         }
     }
-    if writer.truncated || files.iter().any(|file| file.unread) {
+    if writer.truncated {
         let marker = if options.full {
             format!("{ELLIPSIS} diff truncated: it is larger than Yalper shows")
         } else {
@@ -423,83 +440,57 @@ fn tree_id(hex: &str) -> Result<ObjectId, String> {
     })
 }
 
-/// A changed file, ready to show.
-struct ShownFile {
+/// A changed file, as listed.
+struct ListedFile {
     verb: &'static str,
-    /// Printable, or the path with a note that it is not valid.
+    /// Made printable.
     path: String,
     note: Option<&'static str>,
-    /// The old and new content of a changed text file, to diff.
-    texts: Option<(Vec<u8>, Vec<u8>)>,
-    /// A changed file whose content was not read: the diff budget ran out.
-    unread: bool,
+    /// The blobs to diff: none before an added file.
+    old: Option<ObjectId>,
+    new: Option<ObjectId>,
+    /// Whether its content is shown as a diff: an added file, or a modified one whose content changed and
+    /// that did not turn into or out of a symlink. Never for an invalid path.
+    diffed: bool,
 }
 
-/// Turns each change into a line of the list, and reads the old and new content of modified files to diff,
-/// as long as `budget` allows.
-fn classify(
-    shadow: &ShadowStore,
-    changes: &[FileChange],
-    budget: Budget,
-) -> crate::snapshot::Result<Vec<ShownFile>> {
-    let mut read_left = budget.read_bytes;
-    let mut files = Vec::with_capacity(changes.len());
-    for change in changes {
-        let (verb, mut note) = match (change.old, change.new) {
+impl ListedFile {
+    fn new(change: &FileChange) -> Self {
+        let (verb, note) = match (change.old, change.new) {
             (None, _) => ("added", None),
             (_, None) => ("deleted", None),
             (Some(old), Some(new)) => ("modified", kind_change(old.kind, new.kind)),
         };
-        let mut file = ShownFile {
+        let mut file = Self {
             verb,
-            path: String::new(),
+            path: printable(&String::from_utf8_lossy(&change.path)),
             note,
-            texts: None,
-            unread: false,
+            old: change.old.map(|old| old.blob),
+            new: change.new.map(|new| new.blob),
+            diffed: false,
         };
-        let path = match std::str::from_utf8(&change.path) {
-            Ok(path) => path,
-            Err(_) => {
-                file.path = printable(&String::from_utf8_lossy(&change.path));
-                file.note = Some("not valid UTF-8, not shown");
-                files.push(file);
-                continue;
-            }
+        let Ok(path) = std::str::from_utf8(&change.path) else {
+            file.note = Some("not valid UTF-8, not shown");
+            return file;
         };
         let kind = change
             .new
             .or(change.old)
             .map_or(FileKind::Regular, |file| file.kind);
-        file.path = printable(path);
         if validate_path(path, kind).is_err() {
             file.note = Some("not a valid path on this system, not shown");
-            files.push(file);
-            continue;
+            return file;
         }
-
-        // Content is diffed when it changed and the file did not turn into or out of a symlink.
-        if let (Some(old), Some(new)) = (change.old, change.new)
-            && old.blob != new.blob
-            && (old.kind == FileKind::Symlink) == (new.kind == FileKind::Symlink)
-        {
-            match (
-                read(shadow, old.blob, &mut read_left)?,
-                read(shadow, new.blob, &mut read_left)?,
-            ) {
-                (Some(old), Some(new)) if is_binary(&old) || is_binary(&new) => {
-                    note = Some("binary file changed");
-                }
-                (Some(old), Some(new)) => file.texts = Some((old, new)),
-                _ => {
-                    file.unread = true;
-                    note = note.or(Some("diff not shown"));
-                }
+        file.diffed = match (change.old, change.new) {
+            (None, Some(_)) => true,
+            (Some(old), Some(new)) => {
+                old.blob != new.blob
+                    && (old.kind == FileKind::Symlink) == (new.kind == FileKind::Symlink)
             }
-            file.note = note;
-        }
-        files.push(file);
+            _ => false,
+        };
+        file
     }
-    Ok(files)
 }
 
 /// What changed in how a file is stored, if anything.
@@ -512,27 +503,6 @@ fn kind_change(old: FileKind, new: FileKind) -> Option<&'static str> {
         (Symlink, Regular | Executable) => Some("no longer a symlink"),
         _ => None,
     }
-}
-
-/// The content of blob `id` if it fits in `left` bytes of the read budget, which it then uses. `None` when
-/// it does not fit, or the store does not have it.
-fn read(
-    shadow: &ShadowStore,
-    id: ObjectId,
-    left: &mut usize,
-) -> crate::snapshot::Result<Option<Vec<u8>>> {
-    if *left == 0 {
-        return Ok(None);
-    }
-    let Some(bytes) = shadow.read_blob(id)? else {
-        return Ok(None);
-    };
-    if bytes.len() > *left {
-        *left = 0;
-        return Ok(None);
-    }
-    *left -= bytes.len();
-    Ok(Some(bytes))
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -572,26 +542,86 @@ struct DiffWriter<'a> {
 }
 
 impl DiffWriter<'_> {
-    /// Writes the diff of the file at `path` (already printable) from `old` to `new`. Returns `false` once
-    /// the budget ran out.
-    fn diff(&mut self, path: &str, old: &[u8], new: &[u8]) -> bool {
+    /// Reads the content of `file`, diffs it and writes the diff, or a one-line note when it is binary, too
+    /// large to diff, or missing from the store. Returns `false` once the budget ran out.
+    fn file(&mut self, shadow: &ShadowStore, file: &ListedFile) -> crate::snapshot::Result<bool> {
+        let old = match file.old {
+            Some(id) => self.read(shadow, id)?,
+            None => Content::Text(Vec::new()),
+        };
+        let new = match file.new {
+            Some(id) => self.read(shadow, id)?,
+            None => Content::Text(Vec::new()),
+        };
+        if self.truncated {
+            return Ok(false);
+        }
+        let note = match (old, new) {
+            (Content::Missing, _) | (_, Content::Missing) => "content not available",
+            (Content::TooLarge, _) | (_, Content::TooLarge) => "too large to diff",
+            (Content::Text(old), Content::Text(new)) if is_binary(&old) || is_binary(&new) => {
+                if file.old.is_some() {
+                    "binary file changed"
+                } else {
+                    "binary file added"
+                }
+            }
+            (Content::Text(old), Content::Text(new)) => {
+                let lines = |bytes: &[u8]| bytes.iter().filter(|&&byte| byte == b'\n').count();
+                if lines(&old).max(lines(&new)) > self.budget.file_lines {
+                    "too large to diff"
+                } else {
+                    return Ok(self.diff(&file.path, file.old.is_some(), &old, &new));
+                }
+            }
+        };
+        Ok(self.line(Style::Plain, "")
+            && self.line(Style::Plain, &format!("{}: {note}", file.path)))
+    }
+
+    /// The content of blob `id`, within the budget: what is read counts against the total read budget, and
+    /// a blob larger than the per-file limit is not diffed.
+    fn read(&mut self, shadow: &ShadowStore, id: ObjectId) -> crate::snapshot::Result<Content> {
+        if self.budget.read_bytes == 0 {
+            self.truncated = true;
+            return Ok(Content::TooLarge);
+        }
+        let Some(bytes) = shadow.read_blob(id)? else {
+            return Ok(Content::Missing);
+        };
+        self.budget.read_bytes = self.budget.read_bytes.saturating_sub(bytes.len());
+        if bytes.len() > self.budget.file_bytes {
+            return Ok(Content::TooLarge);
+        }
+        Ok(Content::Text(bytes))
+    }
+
+    /// Writes the diff of the file at `path` (already printable) from `old` to `new`; an added file
+    /// (`!existed`) is diffed against nothing. Returns `false` once the budget ran out.
+    fn diff(&mut self, path: &str, existed: bool, old: &[u8], new: &[u8]) -> bool {
+        let old_path = if existed {
+            format!("--- a/{path}")
+        } else {
+            "--- /dev/null".to_owned()
+        };
         if !self.line(Style::Plain, "")
-            || !self.line(Style::Header, &format!("--- a/{path}"))
+            || !self.line(Style::Header, &old_path)
             || !self.line(Style::Header, &format!("+++ b/{path}"))
         {
             return false;
         }
         let input = InternedInput::new(old, new);
-        let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
-        let hunks = Hunks { writer: self };
+        let mut diff = Diff::compute(Algorithm::Histogram, &input);
+        diff.postprocess_lines(&input);
+        let printer = Printer(&input.interner);
+        let mut config = UnifiedDiffConfig::default();
+        config.context_len(CONTEXT_LINES);
+        let mut lines = Lines {
+            writer: self,
+            pending: String::new(),
+        };
         // An error only means the budget ran out, which `truncated` already says.
-        let _ = UnifiedDiff::new(
-            &diff,
-            &input,
-            hunks,
-            ContextSize::symmetrical(CONTEXT_LINES),
-        )
-        .consume();
+        let _ = write!(lines, "{}", diff.unified_diff(&printer, config, &input));
         !self.truncated
     }
 
@@ -621,52 +651,93 @@ impl DiffWriter<'_> {
     }
 }
 
-/// Receives the hunks of one file's diff from gix and writes them.
-struct Hunks<'a, 'b> {
-    writer: &'a mut DiffWriter<'b>,
+/// The content of one side of a diff.
+enum Content {
+    Text(Vec<u8>),
+    TooLarge,
+    /// The store does not have the blob.
+    Missing,
 }
 
-impl ConsumeHunk for Hunks<'_, '_> {
-    type Out = ();
+/// Formats the hunks of a diff as unified diff lines, each starting with its marker (`@`, ` `, `-`, `+`,
+/// `\`), which [`Lines`] turns into the style of the line.
+struct Printer<'a>(&'a Interner<&'a [u8]>);
 
-    fn consume_hunk(
-        &mut self,
-        header: HunkHeader,
-        lines: &[(DiffLineKind, &[u8])],
-    ) -> io::Result<()> {
-        let budget_out = || io::Error::other("diff budget used up");
-        if !self.writer.line(Style::Hunk, &header.to_string()) {
-            return Err(budget_out());
+impl Printer<'_> {
+    fn token(&self, mut f: impl fmt::Write, marker: char, token: Token) -> fmt::Result {
+        let text = String::from_utf8_lossy(self.0[token]);
+        match text.strip_suffix('\n') {
+            Some(line) => writeln!(f, "{marker}{line}"),
+            None => writeln!(f, "{marker}{text}\n\\ No newline at end of file"),
         }
-        for &(kind, line) in lines {
-            let style = match kind {
-                DiffLineKind::Add => Style::Added,
-                DiffLineKind::Remove => Style::Removed,
-                DiffLineKind::Context => Style::Plain,
-            };
-            let text = String::from_utf8_lossy(line);
-            let (text, newline) = match text.strip_suffix('\n') {
-                Some(text) => (text, true),
-                None => (text.as_ref(), false),
-            };
-            if !self
-                .writer
-                .line(style, &format!("{}{text}", kind.to_prefix()))
-            {
-                return Err(budget_out());
-            }
-            if !newline
-                && !self
-                    .writer
-                    .line(Style::Plain, "\\ No newline at end of file")
-            {
-                return Err(budget_out());
-            }
+    }
+}
+
+impl UnifiedDiffPrinter for Printer<'_> {
+    fn display_header(
+        &self,
+        mut f: impl fmt::Write,
+        start_before: u32,
+        start_after: u32,
+        len_before: u32,
+        len_after: u32,
+    ) -> fmt::Result {
+        // Like git: the first line of each side, counted from 1, or the line before an empty side.
+        let start = |start: u32, len: u32| if len == 0 { start } else { start + 1 };
+        writeln!(
+            f,
+            "@@ -{},{len_before} +{},{len_after} @@",
+            start(start_before, len_before),
+            start(start_after, len_after)
+        )
+    }
+
+    fn display_context_token(&self, f: impl fmt::Write, token: Token) -> fmt::Result {
+        self.token(f, ' ', token)
+    }
+
+    fn display_hunk(
+        &self,
+        mut f: impl fmt::Write,
+        before: &[Token],
+        after: &[Token],
+    ) -> fmt::Result {
+        for &token in before {
+            self.token(&mut f, '-', token)?;
+        }
+        for &token in after {
+            self.token(&mut f, '+', token)?;
         }
         Ok(())
     }
+}
 
-    fn finish(self) -> Self::Out {}
+/// Receives the text of a unified diff and writes it line by line through [`DiffWriter::line`], styled by
+/// each line's marker. Fails once the budget ran out, which stops the diff.
+struct Lines<'a, 'b> {
+    writer: &'a mut DiffWriter<'b>,
+    pending: String,
+}
+
+impl fmt::Write for Lines<'_, '_> {
+    fn write_str(&mut self, mut text: &str) -> fmt::Result {
+        while let Some(end) = text.find('\n') {
+            self.pending.push_str(&text[..end]);
+            let line = std::mem::take(&mut self.pending);
+            let style = match line.chars().next() {
+                Some('@') => Style::Hunk,
+                Some('+') => Style::Added,
+                Some('-') => Style::Removed,
+                _ => Style::Plain,
+            };
+            if !self.writer.line(style, &line) {
+                return Err(fmt::Error);
+            }
+            text = &text[end + 1..];
+        }
+        self.pending.push_str(text);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -727,24 +798,17 @@ mod tests {
 
     #[test]
     fn invalid_paths_are_marked_and_never_diffed() {
-        let dir = tempfile::tempdir().unwrap();
-        let owned = OwnedDir::open(dir.path()).unwrap();
-        let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
-        let shadow = ShadowStore::init(&owned, &token).unwrap();
-        let (old, new) = (
-            shadow.write_blob(b"old\n").unwrap(),
-            shadow.write_blob(b"new\n").unwrap(),
-        );
-        let file = |blob| {
+        let blob = |byte: u8| ObjectId::from_bytes_or_panic(&[byte; 20]);
+        let file = |byte| {
             Some(TreeFile {
                 kind: FileKind::Regular,
-                blob,
+                blob: blob(byte),
             })
         };
         let change = |path: &[u8]| FileChange {
             path: path.to_vec(),
-            old: file(old),
-            new: file(new),
+            old: file(1),
+            new: file(2),
         };
         // `..` is invalid everywhere, `aux.txt` only on Windows.
         let changes = [
@@ -754,60 +818,205 @@ mod tests {
             change(b"aux.txt"),
             change(b"ok\xe2\x80\xaename"),
         ];
-        let files = classify(&shadow, &changes, SHORT_BUDGET).unwrap();
-        let shown: Vec<(&str, Option<&str>, bool)> = files
+        let shown: Vec<(String, Option<&str>, bool)> = changes
             .iter()
-            .map(|file| (file.path.as_str(), file.note, file.texts.is_some()))
+            .map(ListedFile::new)
+            .map(|file| (file.path, file.note, file.diffed))
             .collect();
         let invalid = Some("not a valid path on this system, not shown");
         let aux = if cfg!(windows) {
-            ("aux.txt", invalid, false)
+            ("aux.txt".to_owned(), invalid, false)
         } else {
-            ("aux.txt", None, true)
+            ("aux.txt".to_owned(), None, true)
         };
         assert_eq!(
             shown,
             [
-                ("src/../../escape", invalid, false),
-                ("bad\u{FFFD}name", Some("not valid UTF-8, not shown"), false),
-                (".git/config", invalid, false),
+                ("src/../../escape".to_owned(), invalid, false),
+                (
+                    "bad\u{FFFD}name".to_owned(),
+                    Some("not valid UTF-8, not shown"),
+                    false
+                ),
+                (".git/config".to_owned(), invalid, false),
                 aux,
-                ("ok<U+202E>name", None, true),
+                ("ok<U+202E>name".to_owned(), None, true),
             ]
         );
     }
 
-    #[test]
-    fn the_read_budget_limits_how_much_content_is_diffed() {
+    /// A shadow store in a temporary directory.
+    fn shadow() -> (tempfile::TempDir, ShadowStore) {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
         let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
         let shadow = ShadowStore::init(&owned, &token).unwrap();
-        let blob = |text: &str| {
-            Some(TreeFile {
-                kind: FileKind::Regular,
-                blob: shadow.write_blob(text.as_bytes()).unwrap(),
-            })
+        (dir, shadow)
+    }
+
+    /// The diff output for files changed from `old` to `new` contents, with `budget`.
+    fn diff_output(files: &[(&str, &[u8], &[u8])], budget: Budget) -> (String, bool) {
+        let (_dir, shadow) = shadow();
+        let mut out = Vec::new();
+        let mut writer = DiffWriter {
+            out: &mut out,
+            color: false,
+            full: false,
+            budget,
+            truncated: false,
         };
-        let changes = [
-            FileChange {
-                path: b"a.txt".to_vec(),
-                old: blob("12345\n"),
-                new: blob("67890\n"),
-            },
-            FileChange {
-                path: b"b.txt".to_vec(),
-                old: blob("abcde\n"),
-                new: blob("fghij\n"),
-            },
-        ];
+        for &(path, old, new) in files {
+            let file = ListedFile {
+                verb: "modified",
+                path: path.to_owned(),
+                note: None,
+                old: Some(shadow.write_blob(old).unwrap()),
+                new: Some(shadow.write_blob(new).unwrap()),
+                diffed: true,
+            };
+            if !writer.file(&shadow, &file).unwrap() {
+                break;
+            }
+        }
+        let truncated = writer.truncated;
+        (String::from_utf8(out).unwrap(), truncated)
+    }
+
+    #[test]
+    fn the_read_budget_limits_how_much_content_is_diffed() {
         let budget = Budget {
             read_bytes: 20,
             ..SHORT_BUDGET
         };
-        let files = classify(&shadow, &changes, budget).unwrap();
-        assert!(files[0].texts.is_some() && !files[0].unread);
-        assert!(files[1].texts.is_none() && files[1].unread);
-        assert_eq!(files[1].note, Some("diff not shown"));
+        let (output, truncated) = diff_output(
+            &[
+                ("a.txt", b"12345\n", b"67890\n"),
+                ("b.txt", b"abcde\n", b"fghij\n"),
+                ("c.txt", b"abcde\n", b"fghij\n"),
+            ],
+            budget,
+        );
+        assert!(truncated);
+        assert!(output.contains("+++ b/a.txt\n"), "{output}");
+        assert!(output.contains("+++ b/b.txt\n"), "{output}");
+        assert!(!output.contains("c.txt"), "{output}");
+    }
+
+    #[test]
+    fn a_missing_blob_is_content_not_available() {
+        let (_dir, shadow) = shadow();
+        let mut out = Vec::new();
+        let mut writer = DiffWriter {
+            out: &mut out,
+            color: false,
+            full: false,
+            budget: SHORT_BUDGET,
+            truncated: false,
+        };
+        let file = ListedFile {
+            verb: "modified",
+            path: "gone.txt".to_owned(),
+            note: None,
+            old: Some(ObjectId::from_bytes_or_panic(&[7; 20])),
+            new: Some(shadow.write_blob(b"new\n").unwrap()),
+            diffed: true,
+        };
+        assert!(writer.file(&shadow, &file).unwrap());
+        assert!(!writer.truncated);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\ngone.txt: content not available\n"
+        );
+    }
+
+    /// `lines` lines, each `a` or `b` at random (from `seed`): two such versions are the input that makes
+    /// line diffs slowest.
+    fn repetitive(lines: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..lines)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                if state >> 63 == 0 { "a\n" } else { "b\n" }
+            })
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    #[test]
+    fn large_and_repetitive_files_are_diffed_quickly_or_not_at_all() {
+        let budget = SHORT_BUDGET;
+        // Just under the line limit: diffed, within a bounded time.
+        let (old, new) = (
+            repetitive(budget.file_lines - 1, 1),
+            repetitive(budget.file_lines - 1, 2),
+        );
+        let started = std::time::Instant::now();
+        let (output, truncated) = diff_output(&[("near.txt", &old, &new)], budget);
+        let elapsed = started.elapsed();
+        assert!(truncated, "the output budget cuts it");
+        assert!(output.contains("+++ b/near.txt"), "{output}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 5 }),
+            "{elapsed:?}"
+        );
+
+        // Over the line or byte limit: a note, without diffing.
+        let (old, new) = (
+            repetitive(budget.file_lines + 1, 0),
+            repetitive(budget.file_lines + 1, 1),
+        );
+        let long_line = vec![b'x'; budget.file_bytes + 1];
+        let started = std::time::Instant::now();
+        let (output, truncated) = diff_output(
+            &[
+                ("many_lines.txt", &old, &new),
+                ("big.txt", b"x\n", &long_line),
+            ],
+            budget,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!truncated);
+        assert_eq!(
+            output,
+            "\nmany_lines.txt: too large to diff\n\nbig.txt: too large to diff\n"
+        );
+    }
+
+    #[test]
+    fn diffs_follow_git_conventions() {
+        let (output, _) = diff_output(
+            &[("a.txt", b"one\ntwo\nthree", b"one\n2\nthree\nfour\n")],
+            SHORT_BUDGET,
+        );
+        assert_eq!(
+            output,
+            "\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,4 @@\n one\n-two\n-three\n\\ No newline at end of \
+             file\n+2\n+three\n+four\n"
+        );
+
+        let (_dir, shadow) = shadow();
+        let mut out = Vec::new();
+        let mut writer = DiffWriter {
+            out: &mut out,
+            color: false,
+            full: false,
+            budget: SHORT_BUDGET,
+            truncated: false,
+        };
+        let added = ListedFile {
+            verb: "added",
+            path: "new.txt".to_owned(),
+            note: None,
+            old: None,
+            new: Some(shadow.write_blob(b"x\ny\n").unwrap()),
+            diffed: true,
+        };
+        assert!(writer.file(&shadow, &added).unwrap());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+x\n+y\n"
+        );
     }
 }

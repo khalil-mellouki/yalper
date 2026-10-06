@@ -174,6 +174,12 @@ fn fixtures_in_order_record_every_step_with_its_snapshot() {
         let changed = shadow.changed_paths(old, new).unwrap();
         (changed.added, changed.modified, changed.deleted)
     };
+    // Each step keeps the tree its snapshot was built from: the snapshot before it, init's baseline first.
+    let bases: Vec<Option<String>> = events.iter().map(|e| e.base_tree_id.clone()).collect();
+    let mut expected_bases = vec![Some(baseline.to_string())];
+    expected_bases.extend(trees[..4].iter().map(|tree| Some(tree.to_string())));
+    expected_bases.extend([None, None]);
+    assert_eq!(bases, expected_bases);
     let none = Vec::<String>::new;
     assert_eq!(
         changes(baseline, trees[0]),

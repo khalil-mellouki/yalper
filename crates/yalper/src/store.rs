@@ -36,7 +36,7 @@ const WAL_TRUNCATE_BYTES: u64 = 256 * 1024;
 
 /// Schema migrations, oldest first. `PRAGMA user_version` holds how many have run. A released entry is
 /// never edited: changes go in a new entry at the end.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sessions (
@@ -95,6 +95,13 @@ CREATE TABLE meta (
 ) WITHOUT ROWID;
 ";
 
+/// The tree each snapshot step's snapshot was built from (see `snapshot::Snapshot::base_tree_id`), so `yalper
+/// show` diffs exactly the files the step changed. `NULL` for steps without a snapshot and for steps recorded
+/// before this column existed.
+const SCHEMA_V4: &str = "
+ALTER TABLE events ADD COLUMN base_tree_id TEXT;
+";
+
 /// The `meta` key of the init token.
 const INIT_TOKEN_KEY: &str = "init_token";
 
@@ -141,6 +148,9 @@ pub struct Event {
     pub success: Option<bool>,
     /// The snapshot of the working tree after this step.
     pub tree_id: Option<String>,
+    /// The tree this step's snapshot was built from: `files_changed` counts the files that differ between it
+    /// and `tree_id`. Usually the snapshot before, or the empty tree when the snapshot started over.
+    pub base_tree_id: Option<String>,
     pub files_changed: Option<u32>,
     /// The hook payload, already redacted.
     pub payload: Value,
@@ -404,8 +414,8 @@ impl Store {
         self.conn
             .prepare_cached(
                 "INSERT INTO events (session_id, step, ts_ms, kind, tool_name, tool_use_id, agent_id,
-                                     success, tree_id, files_changed, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                     success, tree_id, files_changed, payload, base_tree_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?
             .execute(params![
                 event.session_id,
@@ -419,6 +429,7 @@ impl Store {
                 event.tree_id,
                 event.files_changed,
                 event.payload,
+                event.base_tree_id,
             ])?;
         Ok(())
     }
@@ -492,24 +503,6 @@ impl Store {
             )
             .optional()?;
         Ok(event)
-    }
-
-    /// The snapshot taken just before step `step` of `session_id`: the tree of the last step recorded before
-    /// it, in any session, that has one. Steps are inserted while the [`WriterLock`] is held, right after
-    /// their snapshot, so insertion order is snapshot order, and this is the tree the step's snapshot was
-    /// built from (unless only `yalper init`'s baseline came before it, which is not a step: then `None`).
-    pub fn previous_tree_id(&self, session_id: &str, step: u32) -> Result<Option<String>> {
-        let tree_id = self
-            .conn
-            .prepare_cached(
-                "SELECT tree_id FROM events
-                 WHERE tree_id IS NOT NULL
-                   AND id < (SELECT id FROM events WHERE session_id = ?1 AND step = ?2)
-                 ORDER BY id DESC LIMIT 1",
-            )?
-            .query_row(params![session_id, step], |row| row.get(0))
-            .optional()?;
-        Ok(tree_id)
     }
 
     /// The latest snapshot and its stat cache, or `None` if there is no snapshot yet or a stored value has a
@@ -697,7 +690,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
 }
 
 const EVENT_COLUMNS: &str = "session_id, step, ts_ms, kind, tool_name, tool_use_id, agent_id, \
-                             success, tree_id, files_changed, payload";
+                             success, tree_id, files_changed, payload, base_tree_id";
 
 fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
@@ -712,6 +705,7 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
         tree_id: row.get(8)?,
         files_changed: row.get(9)?,
         payload: row.get(10)?,
+        base_tree_id: row.get(11)?,
     })
 }
 
@@ -805,6 +799,7 @@ mod tests {
             agent_id: None,
             success: Some(true),
             tree_id: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned()),
+            base_tree_id: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned()),
             files_changed: Some(2),
             payload: json!({"tool_input": {"command": "cargo test"}, "step": step}),
         }
@@ -820,7 +815,7 @@ mod tests {
         let owned = OwnedDir::open(dir.path()).unwrap();
         let store = Store::open(&owned, &token()).unwrap();
 
-        assert_eq!(user_version(&store.conn).unwrap(), 3);
+        assert_eq!(user_version(&store.conn).unwrap(), 4);
         let names: Vec<String> = schema(&store.conn)
             .unwrap()
             .into_iter()
@@ -942,7 +937,7 @@ mod tests {
 
         let store = Store::open(&owned, &token()).unwrap();
         assert_eq!(schema(&store.conn).unwrap(), before);
-        assert_eq!(user_version(&store.conn).unwrap(), 3);
+        assert_eq!(user_version(&store.conn).unwrap(), 4);
         assert_eq!(store.events("s1").unwrap(), [event("s1", 1)]);
     }
 
@@ -987,6 +982,40 @@ mod tests {
     }
 
     #[test]
+    fn a_version_3_database_gains_the_base_tree_column_and_keeps_its_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let path = dir.path().join(DATABASE_FILE);
+        {
+            // A database as the previous Yalper created it.
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
+                .unwrap();
+            migrate(&mut conn, &MIGRATIONS[..3], Some(&token())).unwrap();
+            conn.execute_batch(
+                "INSERT INTO sessions (id, started_at_ms) VALUES ('s1', 1);
+                 INSERT INTO events (session_id, step, ts_ms, kind, tree_id, payload)
+                 VALUES ('s1', 1, 2, 'PostToolUse', 'tree', '{}');",
+            )
+            .unwrap();
+        }
+        // Readers never migrate; a writer (a hook or `yalper init`) does.
+        assert!(matches!(
+            Store::open_for_reading(&owned, &token()),
+            Err(Error::OlderSchema { found: 3, known: 4 })
+        ));
+        let store = Store::open(&owned, &token()).unwrap();
+        assert_eq!(user_version(&store.conn).unwrap(), 4);
+        let step = store.event("s1", 1).unwrap().unwrap();
+        assert_eq!(
+            (step.tree_id.as_deref(), step.base_tree_id),
+            (Some("tree"), None)
+        );
+        drop(store);
+        Store::open_for_reading(&owned, &token()).unwrap();
+    }
+
+    #[test]
     fn a_database_from_a_newer_yalper_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
@@ -1000,7 +1029,7 @@ mod tests {
                 error,
                 Error::NewerSchema {
                     found: 99,
-                    known: 3
+                    known: 4
                 }
             ),
             "{error}"
@@ -1033,7 +1062,7 @@ mod tests {
             "DELETE FROM meta",
             "UPDATE meta SET value = X'30'",
             // A database from before the token: migrating it must not adopt it.
-            "DROP TABLE meta; PRAGMA user_version = 2;",
+            "DROP TABLE meta; ALTER TABLE events DROP COLUMN base_tree_id; PRAGMA user_version = 2;",
         ] {
             let dir = tempfile::tempdir().unwrap();
             tamper(&dir, sql);
@@ -1193,7 +1222,7 @@ mod tests {
             let error = Store::open_for_reading(&owned, &token()).unwrap_err();
             if older {
                 assert!(
-                    matches!(error, Error::OlderSchema { found: 2, known: 3 }),
+                    matches!(error, Error::OlderSchema { found: 2, known: 4 }),
                     "{error}"
                 );
             } else {
@@ -1206,7 +1235,7 @@ mod tests {
         // The current schema reads, with the token and schema checks of a writer.
         Connection::open(&database)
             .unwrap()
-            .pragma_update(None, "user_version", 3)
+            .pragma_update(None, "user_version", 4)
             .unwrap();
         let reader = Store::open_for_reading(&owned, &token()).unwrap();
         assert_eq!(reader.sessions().unwrap(), []);
@@ -1239,6 +1268,7 @@ mod tests {
         sparse.tool_use_id = None;
         sparse.success = None;
         sparse.tree_id = None;
+        sparse.base_tree_id = None;
         sparse.files_changed = None;
         sparse.kind = "prompt".to_owned();
         sparse.payload = json!({"prompt": "hello"});
@@ -1249,35 +1279,6 @@ mod tests {
         assert_eq!(store.events("a").unwrap(), [event("a", 1), event("a", 2)]);
         assert_eq!(store.event("b", 1).unwrap(), Some(sparse));
         assert_eq!(store.event("b", 2).unwrap(), None);
-    }
-
-    #[test]
-    fn the_previous_tree_is_the_last_one_recorded_before_the_step_in_any_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned, &token()).unwrap();
-        store.upsert_session(&Session::new("a", 1)).unwrap();
-        store.upsert_session(&Session::new("b", 2)).unwrap();
-        // Inserted in this order, as the hooks of two sessions in one project would record them.
-        let steps = [
-            ("a", 1, Some("tree a1")),
-            ("b", 1, Some("tree b1")),
-            ("a", 2, None),
-            ("a", 3, Some("tree a3")),
-            ("b", 2, None),
-        ];
-        for (session, step, tree) in steps {
-            let mut event = event(session, step);
-            event.tree_id = tree.map(str::to_owned);
-            store.insert_event(&event).unwrap();
-        }
-        let previous = |session, step| store.previous_tree_id(session, step).unwrap();
-        assert_eq!(previous("a", 1), None);
-        assert_eq!(previous("b", 1).as_deref(), Some("tree a1"));
-        assert_eq!(previous("a", 2).as_deref(), Some("tree b1"));
-        assert_eq!(previous("a", 3).as_deref(), Some("tree b1"));
-        assert_eq!(previous("b", 2).as_deref(), Some("tree a3"));
-        assert_eq!(previous("a", 9), None);
     }
 
     #[test]

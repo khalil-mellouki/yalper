@@ -791,23 +791,48 @@ pub fn printable(text: &str) -> String {
     shown
 }
 
-/// Characters that reorder the text around them (bidirectional marks and overrides), break lines outside
-/// ASCII, or are invisible (zero-width space, word joiner, byte order mark, tag characters). The zero-width
+/// Characters that reorder the text around them, break lines outside ASCII, or show nothing: every format
+/// character (Unicode General_Category Cf: bidirectional marks and overrides, zero-width spaces, word
+/// joiners, byte order mark, tag characters, invisible operators), plus the line and paragraph separators,
+/// variation selectors, and the invisible fillers that can pass for letters in identifiers. The zero-width
 /// joiner U+200D is kept: emoji sequences need it and it hides nothing.
 fn is_hidden_format(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
-            | '\u{200B}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{2028}'
-            | '\u{2029}'
+        // General_Category Cf (Unicode 16), without U+200D.
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200C}'
+            | '\u{200E}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
             | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            // Tag characters (Cf, and the unassigned ones between them).
             | '\u{E0000}'..='\u{E007F}'
+            // Line and paragraph separators.
+            | '\u{2028}'..='\u{2029}'
+            // Invisible fillers and joiners that are not Cf.
+            | '\u{034F}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{3164}'
+            | '\u{FFA0}'
+            // Variation selectors.
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
@@ -1099,6 +1124,25 @@ mod tests {
             '\u{E0000}',
             '\u{E0041}',
             '\u{E007F}',
+            // Other format characters, invisible fillers and variation selectors.
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{0600}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{17B4}',
+            '\u{180E}',
+            '\u{200C}',
+            '\u{2064}',
+            '\u{206F}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{FFA0}',
+            '\u{FFFB}',
+            '\u{1D173}',
+            '\u{E0100}',
+            '\u{E01EF}',
         ] {
             assert_eq!(
                 printable(&c.to_string()),

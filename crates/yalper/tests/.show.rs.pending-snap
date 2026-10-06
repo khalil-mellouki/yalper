@@ -1,0 +1,46 @@
+{"run_id":"1791296491-513542700","line":323,"new":{"module_name":"show","snapshot_name":"binary_deleted_and_large_changes","metadata":{"source":"crates/yalper/tests/show.rs","assertion_line":323,"expression":"head_and_tail.join(\"\\n\")"},"snapshot":"Session 00893aaf, step 7 of 9, 2026-10-07 00:01:00\nBash, succeeded in 2.3 s\n\nCommand:\n  ./scripts/regenerate.sh\n\nOutput: (none)\n\nError output:\n  warning: slow\n\n3 files changed:\n  modified  big.txt\n  modified  logo.png\n  deleted   obsolete.txt\n\n--- a/big.txt\n+++ b/big.txt\n@@ -1,400 +1,400 @@\n-old line 1\n-old line 2\n-old line 3\n-old line 4\n-old line 5\n[...]\n-old line 295\n-old line 296\n... diff truncated (--full shows more)"},"old":{"module_name":"show","metadata":{},"snapshot":"Session 00893aaf, step 7 of 9, 2026-10-07 00:01:00\nBash, succeeded in 2.3 s\n\nCommand:\n  ./scripts/regenerate.sh\n\nOutput: (none)\n\nError output:\n  warning: slow\n\n3 files changed:\n  modified  big.txt\n  modified  logo.png (binary file changed)\n  deleted   obsolete.txt\n\n--- a/big.txt\n+++ b/big.txt\n@@ -1,400 +1,400 @@\n-old line 1\n-old line 2\n-old line 3\n-old line 4\n-old line 5\n[...]\n-old line 295\n-old line 296\n... diff truncated (--full shows more)"}}
+{"run_id":"1791296491-513542700","line":256,"new":{"module_name":"show","snapshot_name":"a_shell_command_shows_the_files_it_changed_including_from_a_child_process","metadata":{"source":"crates/yalper/tests/show.rs","assertion_line":256,"expression":"short(project.path(), 4)"},"snapshot":"Session 00893aaf, step 4 of 9, 2026-10-07 00:00:00\nBash, succeeded in 87 ms, subagent a1b2c3d4\n\nCommand:\n  ./scripts/update.sh && echo done\n\nOutput:\n  updated README.md\n  generated src/gen.rs\n  done\n\n2 files changed:\n  modified  README.md\n  added     src/gen.rs\n\n--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,3 @@\n # Demo\n+\n+Renamed `old_name` to `new_name`.\n\n--- /dev/null\n+++ b/src/gen.rs\n@@ -0,0 +1,1 @@\n+// generated"},"old":{"module_name":"show","metadata":{},"snapshot":"Session 00893aaf, step 4 of 9, 2026-10-07 00:00:00\nBash, succeeded in 87 ms, subagent a1b2c3d4\n\nCommand:\n  ./scripts/update.sh && echo done\n\nOutput:\n  updated README.md\n  generated src/gen.rs\n  done\n\n2 files changed:\n  modified  README.md\n  added     src/gen.rs\n\n--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,3 @@\n # Demo\n+\n+Renamed `old_name` to `new_name`."}}
+{"run_id":"1791296625-863917100","line":328,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":400,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":361,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":374,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":451,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":457,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":238,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":244,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":297,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":472,"new":null,"old":null}
+{"run_id":"1791296625-863917100","line":259,"new":{"module_name":"show","snapshot_name":"an_edit_shows_its_input_output_and_diff","metadata":{"source":"crates/yalper/tests/show.rs","assertion_line":259,"expression":"short(project.path(), 3)"},"snapshot":"Session 00893aaf, step 3 of 10, 2026-10-06 23:59:40\nEdit, succeeded in 12 ms\n\nInput:\n  {\n    \"file_path\": \"/home/dev/project/src/lib.rs\",\n    \"old_string\": \"pub fn old_name() {}\",\n    \"new_string\": \"pub fn new_name() {}\",\n    \"replace_all\": false\n  }\n\nOutput:\n  {\n    \"filePath\": \"/home/dev/project/src/lib.rs\",\n    \"oldString\": \"pub fn old_name() {}\",\n    \"newString\": \"pub fn new_name() {}\",\n    \"replaceAll\": false,\n    \"userModified\": false\n  }\n\n1 file changed:\n  modified  src/lib.rs\n\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,4 +1,4 @@\n-pub fn old_name() {}\n+pub fn new_name() {}\n pub fn helper() -> u32 {\n \t1\n }"},"old":{"module_name":"show","metadata":{},"snapshot":"Session 00893aaf, step 3 of 10, 2026-10-06 23:59:40\nEdit, succeeded in 12 ms\n\nInput:\n  {\n    \"file_path\": \"/home/dev/project/src/lib.rs\",\n    \"old_string\": \"pub fn old_name() {}\",\n    \"new_string\": \"pub fn new_name() {}\",\n    \"replace_all\": false\n  }\n\nOutput:\n  {\n    \"filePath\": \"/home/dev/project/src/lib.rs\",\n    \"oldString\": \"pub fn old_name() {}\",\n    \"newString\": \"pub fn new_name() {}\",\n    \"userModified\": false,\n    \"replaceAll\": false\n  }\n\n1 file changed:\n  modified  src/lib.rs\n\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,4 +1,4 @@\n-pub fn old_name() {}\n+pub fn new_name() {}\n pub fn helper() -> u32 {\n \t1\n }"}}
+{"run_id":"1791296642-106262800","line":472,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":259,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":400,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":238,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":328,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":451,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":361,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":297,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":244,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":374,"new":null,"old":null}
+{"run_id":"1791296642-106262800","line":457,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":361,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":472,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":451,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":400,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":259,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":328,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":238,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":297,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":374,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":457,"new":null,"old":null}
+{"run_id":"1791296752-293174700","line":244,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":361,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":238,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":259,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":400,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":451,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":374,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":472,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":244,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":457,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":297,"new":null,"old":null}
+{"run_id":"1791296766-251993300","line":328,"new":null,"old":null}

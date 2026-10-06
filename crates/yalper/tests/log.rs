@@ -261,6 +261,7 @@ fn control_characters_in_stored_rows_never_reach_the_terminal() {
         agent_id: None,
         success: None,
         tree_id: None,
+        base_tree_id: None,
         files_changed: None,
         payload,
     };

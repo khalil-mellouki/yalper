@@ -116,11 +116,11 @@ fn show(step: u32, session: Option<String>, full: bool) -> Result<(), String> {
     let start = env::current_dir()
         .map_err(|error| format!("cannot read the current directory: {error}"))?;
     let stdout = io::stdout();
-    // Colors only on a terminal, unless NO_COLOR (https://no-color.org) is set. Not on Windows, where an
-    // older console would print the escape sequences as text.
-    let color = cfg!(not(windows))
-        && stdout.is_terminal()
-        && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    let color = color_wanted(
+        stdout.is_terminal(),
+        env::var_os("TERM").as_deref(),
+        env::var_os("NO_COLOR").as_deref(),
+    );
     let options = yalper::show::Options {
         session,
         full,
@@ -133,10 +133,32 @@ fn show(step: u32, session: Option<String>, full: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether to color the output: only on a terminal that shows colors (`TERM` is not `dumb`), unless
+/// `NO_COLOR` (https://no-color.org) is set to anything. Never on Windows, where an older console would print
+/// the escape sequences as text.
+fn color_wanted(is_terminal: bool, term: Option<&OsStr>, no_color: Option<&OsStr>) -> bool {
+    cfg!(not(windows))
+        && is_terminal
+        && term != Some(OsStr::new("dumb"))
+        && no_color.is_none_or(OsStr::is_empty)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, color_wanted};
     use clap::CommandFactory;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn colors_only_on_a_capable_terminal_without_no_color() {
+        let os = |text| Some(OsStr::new(text));
+        let unix = cfg!(not(windows));
+        assert_eq!(color_wanted(true, os("xterm-256color"), None), unix);
+        assert_eq!(color_wanted(true, None, os("")), unix);
+        assert!(!color_wanted(false, os("xterm"), None));
+        assert!(!color_wanted(true, os("dumb"), None));
+        assert!(!color_wanted(true, os("xterm"), os("1")));
+    }
 
     #[test]
     fn cli_definition_is_valid() {

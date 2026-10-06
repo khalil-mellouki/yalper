@@ -69,22 +69,26 @@ pub fn record(yalper: &YalperDir, mut input: HookInput) -> Result<(), String> {
     }
 
     let mut snapshot_error = None;
-    let (tree_id, files_changed) = if takes_snapshot {
+    let (tree_id, base_tree_id, files_changed) = if takes_snapshot {
         match snapshot::snapshot(dir, &store, &lock) {
             Ok(snapshot) => {
                 if let Some(problems) = snapshot.problems() {
                     let _ = hook::append_error(dir, Some(kind), &problems, ERRORS_LOG_MAX_BYTES);
                 }
                 let changed = u32::try_from(snapshot.changed.len()).unwrap_or(u32::MAX);
-                (Some(snapshot.tree_id.to_string()), Some(changed))
+                (
+                    Some(snapshot.tree_id.to_string()),
+                    Some(snapshot.base_tree_id.to_string()),
+                    Some(changed),
+                )
             }
             Err(error) => {
                 snapshot_error = Some(error.to_string());
-                (None, None)
+                (None, None, None)
             }
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let snapshot_saved = tree_id.is_some();
@@ -114,6 +118,7 @@ pub fn record(yalper: &YalperDir, mut input: HookInput) -> Result<(), String> {
                 _ => None,
             },
             tree_id,
+            base_tree_id,
             files_changed,
             payload,
         })
