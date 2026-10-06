@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 aho-corasick.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 gix.workspace = true
 ignore.workspace = true
 regex-automata.workspace = true

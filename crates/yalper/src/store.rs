@@ -17,6 +17,7 @@ use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 
+use crate::repo::Token;
 use crate::safe_fs::{OwnedDir, PathGuard};
 
 pub use lock::{LOCK_FILE, LOCK_TIMEOUT, WriterLock};
@@ -35,7 +36,7 @@ const WAL_TRUNCATE_BYTES: u64 = 256 * 1024;
 
 /// Schema migrations, oldest first. `PRAGMA user_version` holds how many have run. A released entry is
 /// never edited: changes go in a new entry at the end.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE sessions (
@@ -84,6 +85,18 @@ CREATE TABLE latest_snapshot (
     tree_id TEXT NOT NULL
 );
 ";
+
+/// Facts about the database itself. `init_token` holds the init token of the `.yalper/` it was created in (see
+/// `crate::repo`), written in the transaction that creates the schema.
+const SCHEMA_V3: &str = "
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+";
+
+/// The `meta` key of the init token.
+const INIT_TOKEN_KEY: &str = "init_token";
 
 /// One Claude Code session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +184,9 @@ pub enum Error {
     /// The database holds tables, indexes, triggers or views that Yalper did not create, for example a
     /// crafted `yalper.db` committed to a repository.
     UnexpectedSchema,
+    /// The database was not created for this `.yalper/`: it has no init token or another one, for example a
+    /// `yalper.db` that a pulled commit wrote over the local one.
+    ForeignDatabase,
 }
 
 impl fmt::Display for Error {
@@ -188,6 +204,11 @@ impl fmt::Display for Error {
                 "the database contains tables, indexes, triggers or views Yalper did not create, so \
                  it is not used"
             ),
+            Self::ForeignDatabase => write!(
+                f,
+                "the database was not created by `yalper init` for this .yalper folder (its init token \
+                 does not match), so it is not used"
+            ),
         }
     }
 }
@@ -197,7 +218,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
-            Self::NewerSchema { .. } | Self::UnexpectedSchema => None,
+            Self::NewerSchema { .. } | Self::UnexpectedSchema | Self::ForeignDatabase => None,
         }
     }
 }
@@ -221,16 +242,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Store {
     conn: Connection,
     wal_path: PathBuf,
+    token: Token,
     /// See [`OwnedDir::guard_path`]: on Windows it keeps the database file from being renamed or deleted.
     _database: PathGuard,
 }
 
 impl Store {
-    /// Opens the database in `dir`, creating it and bringing its schema up to date if needed.
+    /// Opens the database in `dir`, creating it and bringing its schema up to date if needed. `token` is the
+    /// init token of `dir` (see [`crate::repo::open_yalper_dir`]): a new database stores it, and a database
+    /// that holds no token or another one is refused with [`Error::ForeignDatabase`].
     ///
     /// Creating or migrating takes the [`WriterLock`] for a moment, so a writer opens the store first and
     /// takes the lock after: opening while this process already holds the lock would wait for itself.
-    pub fn open(dir: &OwnedDir) -> Result<Self> {
+    pub fn open(dir: &OwnedDir, token: &Token) -> Result<Self> {
         // SQLite opens its files by path, so they are checked by name first: anything but a regular file
         // with a single link is refused. SQLite then refuses a symlink anywhere in the path (Unix;
         // `dir.path()` is canonical), and the file it reached is compared with the one checked (Unix: device
@@ -269,14 +293,32 @@ impl Store {
             // On a file system without WAL support (network shares) SQLite keeps its default mode, which
             // still works.
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-            migrate(&mut conn, MIGRATIONS)?;
+            migrate(&mut conn, MIGRATIONS, Some(token))?;
         }
         check_schema(&conn)?;
+        if stored_token(&conn)?.as_deref() != Some(token.as_str()) {
+            return Err(Error::ForeignDatabase);
+        }
         Ok(Self {
             conn,
             wal_path: dir.path().join(WAL_FILE),
+            token: token.clone(),
             _database: database,
         })
+    }
+
+    /// The init token this database belongs to.
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+
+    /// Whether a snapshot was saved: the latest tree is known.
+    pub fn has_snapshot(&self) -> Result<bool> {
+        let found = self
+            .conn
+            .prepare_cached("SELECT 1 FROM latest_snapshot WHERE id = 1")?
+            .exists([])?;
+        Ok(found)
     }
 
     /// Creates the session, or updates it: a field given as `None` keeps its stored value, and the start
@@ -454,6 +496,16 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+
+    /// Forgets the latest snapshot and the whole stat cache, so the next snapshot starts over from the empty
+    /// tree. For a snapshot store that had to be created again: the old trees and blobs are gone.
+    pub fn forget_snapshot(&self, _lock: &WriterLock) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM latest_snapshot", [])?;
+        transaction.execute("DELETE FROM file_cache", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 /// A stat cache row, or `None` if a value has an unexpected type.
@@ -544,7 +596,11 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
 
 /// Runs the migrations the database has not had yet, all in one transaction. The caller holds the
 /// [`WriterLock`], so no other process migrates at the same time.
-fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
+///
+/// A database created by this call (it had no schema yet) also gets `token` in `meta`, in the same
+/// transaction. An existing database never does: a token is only ever written into a database Yalper
+/// creates.
+fn migrate(conn: &mut Connection, migrations: &[&str], token: Option<&Token>) -> Result<()> {
     let known = schema_version(migrations);
     let found = user_version(conn)?;
     if found == known {
@@ -558,8 +614,25 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
         transaction.execute_batch(sql)?;
         transaction.pragma_update(None, "user_version", version)?;
     }
+    if let (0, Some(token)) = (found, token) {
+        transaction.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            [INIT_TOKEN_KEY, token.as_str()],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
+}
+
+/// The init token stored in the database, if any. A value that is not text counts as none.
+fn stored_token(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    let token = conn
+        .prepare_cached("SELECT value FROM meta WHERE key = ?1")?
+        .query_row([INIT_TOKEN_KEY], |row| {
+            Ok(row.get_ref(0)?.as_str().ok().map(str::to_owned))
+        })
+        .optional()?;
+    Ok(token.flatten())
 }
 
 fn schema_version(migrations: &[&str]) -> u32 {
@@ -574,7 +647,7 @@ fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
 /// [`MIGRATIONS`] create, compared with a fresh in-memory copy.
 fn check_schema(conn: &Connection) -> Result<()> {
     let mut expected = Connection::open_in_memory()?;
-    migrate(&mut expected, MIGRATIONS)?;
+    migrate(&mut expected, MIGRATIONS, None)?;
     if schema(conn)? == schema(&expected)? {
         Ok(())
     } else {
@@ -615,13 +688,18 @@ mod tests {
             payload: json!({"tool_input": {"command": "cargo test"}, "step": step}),
         }
     }
+
+    fn token() -> Token {
+        Token::parse("0123456789abcdef0123456789abcdef").unwrap()
+    }
+
     #[test]
     fn the_schema_is_created_on_first_open() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
 
-        assert_eq!(user_version(&store.conn).unwrap(), 2);
+        assert_eq!(user_version(&store.conn).unwrap(), 3);
         let names: Vec<String> = schema(&store.conn)
             .unwrap()
             .into_iter()
@@ -635,6 +713,7 @@ mod tests {
                 "events",
                 "file_cache",
                 "latest_snapshot",
+                "meta",
                 "sessions"
             ]
         );
@@ -676,7 +755,8 @@ mod tests {
                         scope.spawn(|| {
                             let owned = OwnedDir::open(dir.path()).unwrap();
                             start.wait();
-                            Store::open(&owned).map(|store| store.sessions().unwrap().len())
+                            Store::open(&owned, &token())
+                                .map(|store| store.sessions().unwrap().len())
                         })
                     })
                     .collect();
@@ -690,7 +770,7 @@ mod tests {
     /// Opens the database behind Yalper's back, the way a crafted file in a repository could be made.
     fn tamper(dir: &tempfile::TempDir, sql: &str) {
         let owned = OwnedDir::open(dir.path()).unwrap();
-        drop(Store::open(&owned).unwrap());
+        drop(Store::open(&owned, &token()).unwrap());
         Connection::open(dir.path().join(DATABASE_FILE))
             .unwrap()
             .execute_batch(sql)
@@ -705,7 +785,10 @@ mod tests {
             "CREATE TRIGGER wipe AFTER INSERT ON events BEGIN DELETE FROM sessions; END;",
         );
         let owned = OwnedDir::open(dir.path()).unwrap();
-        assert!(matches!(Store::open(&owned), Err(Error::UnexpectedSchema)));
+        assert!(matches!(
+            Store::open(&owned, &token()),
+            Err(Error::UnexpectedSchema)
+        ));
     }
 
     #[test]
@@ -720,7 +803,7 @@ mod tests {
             tamper(&dir, sql);
             let owned = OwnedDir::open(dir.path()).unwrap();
             assert!(
-                matches!(Store::open(&owned), Err(Error::UnexpectedSchema)),
+                matches!(Store::open(&owned, &token()), Err(Error::UnexpectedSchema)),
                 "{sql}"
             );
         }
@@ -730,15 +813,15 @@ mod tests {
     fn reopening_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         store.upsert_session(&Session::new("s1", 1)).unwrap();
         store.insert_event(&event("s1", 1)).unwrap();
         let before = schema(&store.conn).unwrap();
         drop(store);
 
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         assert_eq!(schema(&store.conn).unwrap(), before);
-        assert_eq!(user_version(&store.conn).unwrap(), 2);
+        assert_eq!(user_version(&store.conn).unwrap(), 3);
         assert_eq!(store.events("s1").unwrap(), [event("s1", 1)]);
     }
 
@@ -759,12 +842,12 @@ mod tests {
                 .unwrap()
         };
 
-        migrate(&mut conn, &[first, second]).unwrap();
-        migrate(&mut conn, &[first, second]).unwrap();
+        migrate(&mut conn, &[first, second], None).unwrap();
+        migrate(&mut conn, &[first, second], None).unwrap();
         assert_eq!(runs(&conn), [1, 2]);
         assert_eq!(user_version(&conn).unwrap(), 2);
 
-        migrate(&mut conn, &[first, second, third]).unwrap();
+        migrate(&mut conn, &[first, second, third], None).unwrap();
         assert_eq!(runs(&conn), [1, 2, 3]);
         assert_eq!(user_version(&conn).unwrap(), 3);
     }
@@ -774,7 +857,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         let good = "CREATE TABLE runs (migration INTEGER);";
         let bad = "INSERT INTO runs VALUES (2); THIS IS NOT SQL;";
-        assert!(migrate(&mut conn, &[good, bad]).is_err());
+        assert!(migrate(&mut conn, &[good, bad], None).is_err());
         assert_eq!(user_version(&conn).unwrap(), 0);
         let tables: u32 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
@@ -786,17 +869,17 @@ mod tests {
     fn a_database_from_a_newer_yalper_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         store.conn.pragma_update(None, "user_version", 99).unwrap();
         drop(store);
 
-        let error = Store::open(&owned).unwrap_err();
+        let error = Store::open(&owned, &token()).unwrap_err();
         assert!(
             matches!(
                 error,
                 Error::NewerSchema {
                     found: 99,
-                    known: 2
+                    known: 3
                 }
             ),
             "{error}"
@@ -804,10 +887,72 @@ mod tests {
     }
 
     #[test]
+    fn a_database_belongs_to_the_token_it_was_created_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        assert_eq!(store.token(), &token());
+        assert_eq!(
+            stored_token(&store.conn).unwrap().as_deref(),
+            Some(token().as_str())
+        );
+        drop(store);
+
+        let other = Token::parse("fedcba9876543210fedcba9876543210").unwrap();
+        assert!(matches!(
+            Store::open(&owned, &other),
+            Err(Error::ForeignDatabase)
+        ));
+        Store::open(&owned, &token()).unwrap();
+    }
+
+    #[test]
+    fn a_database_without_a_token_is_refused_and_not_given_one() {
+        for sql in [
+            "DELETE FROM meta",
+            "UPDATE meta SET value = X'30'",
+            // A database from before the token: migrating it must not adopt it.
+            "DROP TABLE meta; PRAGMA user_version = 2;",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            tamper(&dir, sql);
+            let owned = OwnedDir::open(dir.path()).unwrap();
+            assert!(
+                matches!(Store::open(&owned, &token()), Err(Error::ForeignDatabase)),
+                "{sql}"
+            );
+            let conn = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+            assert_eq!(stored_token(&conn).unwrap(), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn has_snapshot_tells_whether_a_tree_was_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        assert!(!store.has_snapshot().unwrap());
+        let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
+        store
+            .save_snapshot(&lock, "tree", &[cached("a.rs", "aa")], &[], true)
+            .unwrap();
+        assert!(store.has_snapshot().unwrap());
+
+        store.forget_snapshot(&lock).unwrap();
+        assert!(!store.has_snapshot().unwrap());
+        assert_eq!(store.file_cache().unwrap(), None);
+        let rows: u32 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
     fn a_session_keeps_its_start_and_gains_fields() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
 
         let mut start = Session::new("s1", 100);
         start.source = Some("startup".to_owned());
@@ -834,7 +979,7 @@ mod tests {
     fn sessions_are_listed_newest_first() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         for (id, start) in [("old", 1), ("new", 3), ("middle", 2)] {
             store.upsert_session(&Session::new(id, start)).unwrap();
         }
@@ -851,7 +996,7 @@ mod tests {
     fn events_round_trip_and_steps_count_per_session() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         store.upsert_session(&Session::new("a", 1)).unwrap();
         store.upsert_session(&Session::new("b", 2)).unwrap();
         assert_eq!(store.next_step("a").unwrap(), 1);
@@ -879,7 +1024,7 @@ mod tests {
     fn a_taken_step_or_an_unknown_session_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         store.upsert_session(&Session::new("a", 1)).unwrap();
         store.insert_event(&event("a", 1)).unwrap();
         assert!(store.insert_event(&event("a", 1)).is_err());
@@ -893,7 +1038,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let owned = OwnedDir::open(dir.path()).unwrap();
-            let store = Store::open(&owned).unwrap();
+            let store = Store::open(&owned, &token()).unwrap();
             store.upsert_session(&Session::new("even", 1)).unwrap();
             store.upsert_session(&Session::new("odd", 2)).unwrap();
         }
@@ -906,7 +1051,7 @@ mod tests {
                     for _ in 0..EVENTS_PER_WRITER {
                         // What each hook process does: open, lock, number the step, insert.
                         let owned = OwnedDir::open(path).unwrap();
-                        let store = Store::open(&owned).unwrap();
+                        let store = Store::open(&owned, &token()).unwrap();
                         let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
                         let step = store.next_step(session).unwrap();
                         store.insert_event(&event(session, step)).unwrap();
@@ -916,7 +1061,7 @@ mod tests {
         });
 
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         let mut total = 0;
         let mut steps_per_session = HashMap::new();
         for session in ["even", "odd"] {
@@ -977,9 +1122,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
         let database = owned.path().join(DATABASE_FILE);
-        let first = Store::open(&owned).unwrap();
+        let first = Store::open(&owned, &token()).unwrap();
         first.upsert_session(&Session::new("s1", 1)).unwrap();
-        drop(Store::open(&owned).unwrap());
+        drop(Store::open(&owned, &token()).unwrap());
 
         // On Unix, closing any descriptor of a file drops every POSIX lock the process holds on it. The
         // first store's shared lock on the database (it tells other processes the database is in use) must
@@ -1010,7 +1155,7 @@ mod tests {
     fn a_reader_is_not_blocked_by_a_writer() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let writer = Store::open(&owned).unwrap();
+        let writer = Store::open(&owned, &token()).unwrap();
         let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
         writer.upsert_session(&Session::new("s1", 1)).unwrap();
         writer.insert_event(&event("s1", 1)).unwrap();
@@ -1019,7 +1164,7 @@ mod tests {
         writer.insert_event(&event("s1", 2)).unwrap();
 
         let start = Instant::now();
-        let reader = Store::open(&owned).unwrap();
+        let reader = Store::open(&owned, &token()).unwrap();
         assert_eq!(reader.events("s1").unwrap(), [event("s1", 1)]);
         assert_eq!(reader.sessions().unwrap().len(), 1);
         assert!(
@@ -1046,7 +1191,7 @@ mod tests {
             return;
         }
         let owned = OwnedDir::open(dir.path()).unwrap();
-        assert!(Store::open(&owned).is_err());
+        assert!(Store::open(&owned, &token()).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
     }
 
@@ -1055,7 +1200,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join(DATABASE_FILE)).unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        assert!(matches!(Store::open(&owned), Err(Error::Io(_))));
+        assert!(matches!(Store::open(&owned, &token()), Err(Error::Io(_))));
     }
 
     #[cfg(unix)]
@@ -1067,7 +1212,7 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let owned = OwnedDir::open(&link.join(".yalper")).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         store.upsert_session(&Session::new("s1", 1)).unwrap();
     }
 
@@ -1082,7 +1227,7 @@ mod tests {
         let moved = project.path().join("moved");
         fs::rename(&yalper, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &yalper).unwrap();
-        assert!(Store::open(&owned).is_err());
+        assert!(Store::open(&owned, &token()).is_err());
     }
 
     #[test]
@@ -1092,14 +1237,14 @@ mod tests {
         let wal_bytes = || fs::metadata(&wal).unwrap().len();
         let owned = OwnedDir::open(dir.path()).unwrap();
 
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         store.upsert_session(&Session::new("s1", 1)).unwrap();
         store.insert_event(&event("s1", 1)).unwrap();
         drop(store);
         assert!(wal_bytes() > 0);
         assert!(wal_bytes() <= WAL_TRUNCATE_BYTES);
 
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         let mut large = event("s1", 2);
         large.payload = json!({"tool_response": "x".repeat(2 * WAL_TRUNCATE_BYTES as usize)});
         store.insert_event(&large).unwrap();
@@ -1107,7 +1252,7 @@ mod tests {
         drop(store);
         assert_eq!(wal_bytes(), 0);
 
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         assert_eq!(store.events("s1").unwrap(), [event("s1", 1), large]);
     }
 
@@ -1133,7 +1278,7 @@ mod tests {
     fn the_file_cache_is_saved_with_its_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = Store::open(&owned).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
         assert_eq!(store.file_cache().unwrap(), None);
         let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
 
@@ -1188,7 +1333,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let owned = OwnedDir::open(dir.path()).unwrap();
-            let store = Store::open(&owned).unwrap();
+            let store = Store::open(&owned, &token()).unwrap();
             let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
             store
                 .save_snapshot(&lock, "tree", &[cached("a.rs", "aa")], &[], false)

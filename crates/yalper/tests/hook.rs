@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
 use serde_json::json;
-use yalper::hook::{ERRORS_LOG, HookEvent, HookInput, MAX_PAYLOAD_BYTES, YALPER_DIR};
+use yalper::hook::{
+    ERRORS_LOG, HookEvent, HookInput, MAX_PAYLOAD_BYTES, YALPER_DIR, find_yalper_dir,
+};
 use yalper::repo::{GIT_ID_FILE, ID_FILE};
-use yalper::safe_fs::OwnedDir;
 use yalper::snapshot::SNAPSHOTS_DIR;
 use yalper::store::{DATABASE_FILE, Event, Store};
 
@@ -392,7 +393,8 @@ fn linked_error_log_is_not_written() {
 
 /// The steps recorded in the project at `root`, session by session.
 fn recorded_events(root: &Path) -> Vec<Event> {
-    let store = Store::open(&OwnedDir::open(&root.join(YALPER_DIR)).unwrap()).unwrap();
+    let found = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let store = Store::open(&found.dir, &found.token).unwrap();
     store
         .sessions()
         .unwrap()

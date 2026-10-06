@@ -25,6 +25,7 @@ use gix::objs::{Find, FindExt};
 use gix::validate::path::component;
 use gix::{ObjectId, oid};
 
+use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 
 pub use scan::{MAX_FILE_BYTES, SkipReason, Skipped, Snapshot, snapshot};
@@ -35,12 +36,20 @@ pub const SNAPSHOTS_DIR: &str = "snapshots.git";
 /// The store's whole `config`: written by [`ShadowStore::init`] and required byte for byte by
 /// [`ShadowStore::open`]. Snapshots are only referenced from the event log, never from refs, so automatic gc
 /// is off and unreachable objects never expire: running `git gc` on the store cannot delete a snapshot.
-const STORE_CONFIG: &str = "[core]\n\
-                            \trepositoryformatversion = 0\n\
-                            \tbare = true\n\
-                            [gc]\n\
-                            \tauto = 0\n\
-                            \tpruneExpire = never\n";
+/// It also holds the init token of the `.yalper/` the store was created in (see [`crate::repo`]), so a store
+/// that a pulled commit wrote over the local one is refused.
+fn store_config(token: &Token) -> String {
+    format!(
+        "[core]\n\
+         \trepositoryformatversion = 0\n\
+         \tbare = true\n\
+         [gc]\n\
+         \tauto = 0\n\
+         \tpruneExpire = never\n\
+         [yalper]\n\
+         \tinitToken = {token}\n"
+    )
+}
 
 /// `HEAD` holds one line like `ref: refs/heads/main`; anything larger was not written by Yalper.
 const MAX_HEAD_BYTES: u64 = 256;
@@ -215,9 +224,9 @@ impl fmt::Debug for ShadowStore {
 }
 
 impl ShadowStore {
-    /// Creates an empty store in `yalper_dir` and opens it. Fails if anything, even a link, already exists
-    /// at its path.
-    pub fn init(yalper_dir: &OwnedDir) -> Result<Self> {
+    /// Creates an empty store in `yalper_dir`, bound to its init token `token`, and opens it. Fails if
+    /// anything, even a link, already exists at its path.
+    pub fn init(yalper_dir: &OwnedDir, token: &Token) -> Result<Self> {
         let path = yalper_dir.path().join(SNAPSHOTS_DIR);
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -239,23 +248,24 @@ impl ShadowStore {
         )?;
         // A fixed config instead of the probed one (its file system settings only matter for a work tree), and
         // no ref directories: `open` requires `refs/` to be empty.
-        fs::write(path.join("config"), STORE_CONFIG)?;
+        fs::write(path.join("config"), store_config(token))?;
         fs::remove_dir(path.join("refs").join("heads"))?;
         fs::remove_dir(path.join("refs").join("tags"))?;
-        Self::open(yalper_dir)
+        Self::open(yalper_dir, token)
     }
 
-    /// Opens the store in `yalper_dir`.
+    /// Opens the store in `yalper_dir`, whose init token is `token`.
     ///
     /// Before gix reads anything, the layout must be exactly what [`init`](Self::init) and object writes
-    /// produce: a real directory (on Unix owned by the current user), Yalper's own `config`, a small `HEAD`,
-    /// no refs, packs, alternates or `commondir`, and no link in `objects/`. Links, alternates and `commondir`
-    /// could send writes or reads to another repository, such as the user's own `.git`; refs could replace
-    /// objects. Every object read is also checked against its id, see [`Verified`]. Remaining gap, outside the
-    /// threat model: another process of the same user could change the store after these checks.
-    pub fn open(yalper_dir: &OwnedDir) -> Result<Self> {
+    /// produce: a real directory (on Unix owned by the current user), Yalper's own `config` with `token` in it,
+    /// a small `HEAD`, no refs, packs, alternates or `commondir`, and no link in `objects/`. Links, alternates
+    /// and `commondir` could send writes or reads to another repository, such as the user's own `.git`; refs
+    /// could replace objects. Every object read is also checked against its id, see [`Verified`]. Remaining
+    /// gap, outside the threat model: another process of the same user could change the store after these
+    /// checks.
+    pub fn open(yalper_dir: &OwnedDir, token: &Token) -> Result<Self> {
         let dir = OwnedDir::open(&yalper_dir.path().join(SNAPSHOTS_DIR))?;
-        check_layout(&dir)?;
+        check_layout(&dir, &store_config(token))?;
         let options = gix::open::Options::isolated()
             .open_path_as_is(true)
             // Full trust skips gix's own ownership check (slow on Windows; `OwnedDir` checks ownership on
@@ -460,7 +470,7 @@ pub fn validate_path(path: &str, kind: FileKind) -> Result<()> {
 }
 
 /// See [`ShadowStore::open`]. A few metadata reads, three short directory listings and one read of `config`.
-fn check_layout(dir: &OwnedDir) -> Result<()> {
+fn check_layout(dir: &OwnedDir, expected_config: &str) -> Result<()> {
     let root = dir.path();
     let unexpected = |what: &str| Err(Error::UnexpectedLayout(what.to_owned()));
     for name in ["commondir", "packed-refs", "objects/info/alternates"] {
@@ -473,10 +483,10 @@ fn check_layout(dir: &OwnedDir) -> Result<()> {
 
     let config = fs::symlink_metadata(root.join("config"))?;
     if !config.is_file()
-        || config.len() != STORE_CONFIG.len() as u64
-        || fs::read(root.join("config"))? != STORE_CONFIG.as_bytes()
+        || config.len() != expected_config.len() as u64
+        || fs::read(root.join("config"))? != expected_config.as_bytes()
     {
-        return unexpected("a `config` Yalper did not write");
+        return unexpected("a `config` Yalper did not write for this .yalper folder");
     }
     let head = fs::symlink_metadata(root.join("HEAD"))?;
     if !head.is_file() || head.len() > MAX_HEAD_BYTES {
@@ -518,11 +528,15 @@ mod tests {
 
     use FileKind::{Executable, Regular, Symlink};
 
+    fn token() -> Token {
+        Token::parse("0123456789abcdef0123456789abcdef").unwrap()
+    }
+
     /// A `.yalper` directory with an initialized store in it.
     fn new_store() -> (tempfile::TempDir, ShadowStore) {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = ShadowStore::init(&owned).unwrap();
+        let store = ShadowStore::init(&owned, &token()).unwrap();
         (dir, store)
     }
 
@@ -825,18 +839,29 @@ mod tests {
         let tree = from_scratch(&store, &[("a/b.txt", Regular, "b")]);
         drop(store);
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let store = ShadowStore::open(&owned).unwrap();
+        let store = ShadowStore::open(&owned, &token()).unwrap();
         let changed = store.changed_paths(store.empty_tree(), tree).unwrap();
         assert_eq!(changed.added, ["a/b.txt"]);
+    }
+
+    #[test]
+    fn a_store_created_with_another_token_is_refused() {
+        let (dir, store) = new_store();
+        drop(store);
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let other = Token::parse("fedcba9876543210fedcba9876543210").unwrap();
+        let error = ShadowStore::open(&owned, &other).unwrap_err();
+        assert!(matches!(error, Error::UnexpectedLayout(_)), "{error}");
+        ShadowStore::open(&owned, &token()).unwrap();
     }
 
     #[test]
     fn init_refuses_an_existing_path_and_open_a_missing_store() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        assert!(ShadowStore::open(&owned).is_err());
+        assert!(ShadowStore::open(&owned, &token()).is_err());
         fs::create_dir(dir.path().join(SNAPSHOTS_DIR)).unwrap();
-        assert!(ShadowStore::init(&owned).is_err());
+        assert!(ShadowStore::init(&owned, &token()).is_err());
     }
 
     #[test]
@@ -849,7 +874,7 @@ mod tests {
             drop(store);
             fs::write(dir.path().join(SNAPSHOTS_DIR).join(name), content).unwrap();
             let owned = OwnedDir::open(dir.path()).unwrap();
-            let error = ShadowStore::open(&owned).unwrap_err();
+            let error = ShadowStore::open(&owned, &token()).unwrap_err();
             assert!(
                 matches!(error, Error::UnexpectedLayout(_)),
                 "{name}: {error}"
@@ -866,19 +891,19 @@ mod tests {
         let fan_out = dir.path().join(SNAPSHOTS_DIR).join("objects").join("ce");
         link_dir(outside.path(), &fan_out);
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let error = ShadowStore::open(&owned).unwrap_err();
+        let error = ShadowStore::open(&owned, &token()).unwrap_err();
         assert!(matches!(error, Error::UnexpectedLayout(_)), "{error}");
 
         let dir = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        ShadowStore::init(&OwnedDir::open(elsewhere.path()).unwrap()).unwrap();
+        ShadowStore::init(&OwnedDir::open(elsewhere.path()).unwrap(), &token()).unwrap();
         link_dir(
             &elsewhere.path().join(SNAPSHOTS_DIR),
             &dir.path().join(SNAPSHOTS_DIR),
         );
         let owned = OwnedDir::open(dir.path()).unwrap();
-        assert!(ShadowStore::open(&owned).is_err());
-        assert!(ShadowStore::init(&owned).is_err());
+        assert!(ShadowStore::open(&owned, &token()).is_err());
+        assert!(ShadowStore::init(&owned, &token()).is_err());
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
@@ -947,13 +972,13 @@ mod tests {
         let before = contents(&root.join(".git"));
 
         let yalper = OwnedDir::open(&root.join(".yalper")).unwrap();
-        let store = ShadowStore::init(&yalper).unwrap();
+        let store = ShadowStore::init(&yalper, &token()).unwrap();
         // The same content as the user's committed file: it is still written to the shadow store.
         let old = from_scratch(&store, &[("main.rs", Regular, "fn main() {}\n")]);
         let added = upserts(&store, &[("lib.rs", Regular, "pub fn f() {}\n")]);
         let new = store.edit_tree(old, &added).unwrap();
         drop(store);
-        let store = ShadowStore::open(&yalper).unwrap();
+        let store = ShadowStore::open(&yalper, &token()).unwrap();
         assert_eq!(store.changed_paths(old, new).unwrap().added, ["lib.rs"]);
         let store_dir = root.join(".yalper").join(SNAPSHOTS_DIR);
         assert_eq!(loose_objects(&store_dir).len(), 4, "two blobs, two trees");
@@ -987,13 +1012,13 @@ mod tests {
         assert_eq!(name.to_string(), "From Global");
 
         let owned = OwnedDir::open(&yalper).unwrap();
-        let store = ShadowStore::init(&owned).unwrap();
+        let store = ShadowStore::init(&owned, &token()).unwrap();
         let head = fs::read_to_string(yalper.join(SNAPSHOTS_DIR).join("HEAD")).unwrap();
         assert!(!head.contains("from-global"), "{head}");
         assert!(store.repo.config_snapshot().string("user.name").is_none());
         drop(store);
 
-        let store = ShadowStore::open(&owned).unwrap();
+        let store = ShadowStore::open(&owned, &token()).unwrap();
         assert!(store.repo.config_snapshot().string("user.name").is_none());
         let blob = store.write_blob(b"isolated").unwrap();
         assert!(loose_objects(&yalper.join(SNAPSHOTS_DIR)).contains(&blob.to_string()));
@@ -1015,7 +1040,7 @@ mod tests {
         fs::write(home.path().join("xdg").join("git").join("config"), config).unwrap();
         fs::create_dir_all(home.path().join("project").join(".yalper")).unwrap();
         fs::create_dir(home.path().join("env-objects")).unwrap();
-        ShadowStore::init(&OwnedDir::open(home.path()).unwrap()).unwrap();
+        ShadowStore::init(&OwnedDir::open(home.path()).unwrap(), &token()).unwrap();
         fs::rename(
             home.path().join(SNAPSHOTS_DIR),
             home.path().join("control.git"),
@@ -1235,7 +1260,7 @@ mod tests {
             drop(store);
             tamper(&dir.path().join(SNAPSHOTS_DIR));
             let owned = OwnedDir::open(dir.path()).unwrap();
-            let error = ShadowStore::open(&owned).unwrap_err();
+            let error = ShadowStore::open(&owned, &token()).unwrap_err();
             assert!(
                 matches!(error, Error::UnexpectedLayout(_)),
                 "{name}: {error}"
@@ -1254,7 +1279,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("config"), store_dir.join("config"))
             .unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let error = ShadowStore::open(&owned).unwrap_err();
+        let error = ShadowStore::open(&owned, &token()).unwrap_err();
         assert!(matches!(error, Error::UnexpectedLayout(_)), "{error}");
     }
 
@@ -1262,7 +1287,7 @@ mod tests {
     fn the_store_keeps_snapshots_from_gc_and_limits_allocations() {
         let (dir, store) = new_store();
         let config = fs::read_to_string(dir.path().join(SNAPSHOTS_DIR).join("config")).unwrap();
-        assert_eq!(config, STORE_CONFIG);
+        assert_eq!(config, store_config(&token()));
         let config = store.repo.config_snapshot();
         assert_eq!(config.integer("gc.auto"), Some(0));
         assert_eq!(

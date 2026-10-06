@@ -12,12 +12,12 @@ use serde_json::Value;
 
 use crate::hook::{self, ERRORS_LOG_MAX_BYTES, HookEvent, HookInput};
 use crate::redact::redact_json;
-use crate::safe_fs::OwnedDir;
+use crate::repo::YalperDir;
 use crate::snapshot;
 use crate::store::{Event, LOCK_TIMEOUT, Session, Store, WriterLock};
 
-/// Records `input` in the `.yalper/` directory `dir`, which must be one `yalper init` created (see
-/// [`crate::repo::is_initialized`]). Events Yalper does not register for are ignored.
+/// Records `input` in the `.yalper/` directory `yalper`, which must be one `yalper init` created (see
+/// [`crate::repo::open_yalper_dir`]). Events Yalper does not register for are ignored.
 ///
 /// `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `PostToolUseFailure` take a snapshot. `Stop` and
 /// `SessionEnd` do not: nothing ran since the last tool call, and `SessionEnd` hooks share a 1.5 s budget.
@@ -29,7 +29,8 @@ use crate::store::{Event, LOCK_TIMEOUT, Session, Store, WriterLock};
 /// The snapshot saves the new latest tree and stat cache before the step is inserted. If the insert then
 /// fails, the next snapshot starts from that tree, so the files changed in this step belong to no recorded
 /// step; the logged error says so.
-pub fn record(dir: &OwnedDir, mut input: HookInput) -> Result<(), String> {
+pub fn record(yalper: &YalperDir, mut input: HookInput) -> Result<(), String> {
+    let dir = &yalper.dir;
     let Some(kind) = input.event.name() else {
         return Ok(());
     };
@@ -45,7 +46,7 @@ pub fn record(dir: &OwnedDir, mut input: HookInput) -> Result<(), String> {
     redact_json(&mut payload);
 
     // Opened before taking the lock: opening a new database takes the lock for a moment itself.
-    let store = Store::open(dir).map_err(|error| error.to_string())?;
+    let store = Store::open(dir, &yalper.token).map_err(|error| error.to_string())?;
     let lock = WriterLock::acquire(dir, LOCK_TIMEOUT).map_err(|error| error.to_string())?;
     let now = now_ms();
 

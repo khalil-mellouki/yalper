@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use yalper::repo::{GIT_ID_FILE, ID_FILE};
-use yalper::safe_fs::OwnedDir;
-use yalper::snapshot::ShadowStore;
+use yalper::hook::find_yalper_dir;
 use yalper::store::Store;
 
 const FILES: usize = 1000;
@@ -38,19 +36,19 @@ fn build_project(root: &Path) {
         .expect("git must be installed to run this benchmark");
     assert!(status.success(), "git init failed");
     fs::write(root.join(".gitignore"), "target/\n").unwrap();
-    fs::create_dir(root.join(".yalper")).unwrap();
-    // The init token `yalper init` writes: the hook only records into a `.yalper/` that carries it.
-    let token = "0123456789abcdef0123456789abcdef\n";
-    fs::write(root.join(".git").join(GIT_ID_FILE), token).unwrap();
-    fs::write(root.join(".yalper").join(ID_FILE), token).unwrap();
-    ShadowStore::init(&OwnedDir::open(&root.join(".yalper")).unwrap()).unwrap();
-
     for index in 0..FILES {
         let path = file_path(root, index);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let body = format!("pub fn value_{index}() -> usize {{\n    {index}\n}}\n").repeat(20);
         fs::write(path, body).unwrap();
     }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yalper"))
+        .arg("init")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "yalper init failed: {output:?}");
 }
 
 fn change_files(root: &Path, call: usize) {
@@ -185,16 +183,15 @@ fn main() {
         "the hook logged an error during the benchmark"
     );
     // The last snapshot has the 1,000 files plus `.gitignore` in its stat cache.
-    let yalper = OwnedDir::open(&root.join(".yalper")).unwrap();
-    let store = Store::open(&yalper).unwrap();
+    let yalper = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let store = Store::open(&yalper.dir, &yalper.token).unwrap();
     let cache = store.file_cache().unwrap();
     assert_eq!(cache.map(|cache| cache.files.len()), Some(FILES + 1));
-    // Every call was recorded as a step. The first one took the first snapshot of the whole project, each
-    // later one found the 3 files it changed.
+    // Every call was recorded as a step, and found the 3 files it changed (`yalper init` took the baseline).
     let events = store.events("bench-session").unwrap();
     assert_eq!(events.len(), WARMUP_CALLS + calls);
     assert!(
-        events[1..]
+        events
             .iter()
             .all(|event| event.files_changed == Some(CHANGED_PER_CALL as u32))
     );

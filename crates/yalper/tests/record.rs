@@ -8,7 +8,7 @@ use std::process::Command;
 use gix::ObjectId;
 use yalper::hook::{ERRORS_LOG, HookInput, YALPER_DIR, find_yalper_dir};
 use yalper::record::{record, session_stand_in};
-use yalper::safe_fs::OwnedDir;
+use yalper::repo::YalperDir;
 use yalper::snapshot::{self, SNAPSHOTS_DIR, ShadowStore};
 use yalper::store::{LOCK_TIMEOUT, Store, WriterLock};
 
@@ -68,11 +68,11 @@ fn fixtures_in_order_record_every_step_with_its_snapshot() {
     // What `yalper init` sets up, including its baseline snapshot.
     let baseline = {
         let dir = common::init(root);
-        let store = Store::open(&dir).unwrap();
-        let lock = WriterLock::acquire(&dir, LOCK_TIMEOUT).unwrap();
-        snapshot::snapshot(&dir, &store, &lock).unwrap().tree_id
+        let store = Store::open(&dir.dir, &dir.token).unwrap();
+        let lock = WriterLock::acquire(&dir.dir, LOCK_TIMEOUT).unwrap();
+        snapshot::snapshot(&dir.dir, &store, &lock).unwrap().tree_id
     };
-    let dir: OwnedDir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let dir: YalperDir = find_yalper_dir([root.to_path_buf()]).unwrap();
 
     // The developer edits a file before starting Claude Code, and another one before the first prompt.
     fs::write(root.join("README.md"), "# Demo project\n").unwrap();
@@ -90,7 +90,7 @@ fn fixtures_in_order_record_every_step_with_its_snapshot() {
     record(&dir, fixture("session_end.json")).unwrap();
 
     assert!(!root.join(YALPER_DIR).join(ERRORS_LOG).exists());
-    let store = Store::open(&dir).unwrap();
+    let store = Store::open(&dir.dir, &dir.token).unwrap();
     let sessions = store.sessions().unwrap();
     assert_eq!(sessions.len(), 1);
     let session = &sessions[0];
@@ -165,7 +165,7 @@ fn fixtures_in_order_record_every_step_with_its_snapshot() {
     assert_eq!(session.ended_at_ms, Some(events[6].ts_ms));
 
     // Each snapshot holds exactly the change made before its event.
-    let shadow = ShadowStore::open(&dir).unwrap();
+    let shadow = ShadowStore::open(&dir.dir, &dir.token).unwrap();
     let trees: Vec<ObjectId> = events[..5]
         .iter()
         .map(|event| tree_id(event.tree_id.as_deref().unwrap()))
@@ -210,7 +210,7 @@ fn an_event_of_an_unknown_session_creates_it_and_a_resume_reopens_it() {
     // Yalper was set up in the middle of a session: its first event is a tool call.
     record(&dir, fixture("post_tool_use_failure.json")).unwrap();
     record(&dir, fixture("session_end.json")).unwrap();
-    let store = Store::open(&dir).unwrap();
+    let store = Store::open(&dir.dir, &dir.token).unwrap();
     let session = &store.sessions().unwrap()[0];
     assert_eq!(session.source, None);
     assert!(session.ended_at_ms.is_some());
@@ -248,7 +248,13 @@ fn events_yalper_does_not_register_for_are_ignored() {
     let mut input = fixture("stop.json");
     input.event = yalper::hook::HookEvent::Other("PostToolBatch".to_owned());
     record(&dir, input).unwrap();
-    assert_eq!(Store::open(&dir).unwrap().sessions().unwrap(), []);
+    assert_eq!(
+        Store::open(&dir.dir, &dir.token)
+            .unwrap()
+            .sessions()
+            .unwrap(),
+        []
+    );
 }
 
 #[test]
@@ -263,7 +269,7 @@ fn a_session_id_that_redaction_changes_is_stored_as_its_hash() {
         record(&dir, input).unwrap();
     }
 
-    let store = Store::open(&dir).unwrap();
+    let store = Store::open(&dir.dir, &dir.token).unwrap();
     let sessions = store.sessions().unwrap();
     assert_eq!(sessions.len(), 1, "both events belong to one session");
     assert_eq!(sessions[0].id, session_stand_in(&secret_id));
