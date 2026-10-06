@@ -754,10 +754,14 @@ mod tests {
         files
     }
 
+    /// Runs git in `project`. Newer git versions start maintenance in the background after a commit, which
+    /// can create lock files in `.git` while the test reads it (seen on macOS CI), so that is turned off, as
+    /// is the file system monitor daemon.
     fn git(project: &Path, args: &[&str]) {
         let status = Command::new("git")
             .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
-            .args(["-c", "core.autocrlf=false"])
+            .args(["-c", "core.autocrlf=false", "-c", "maintenance.auto=false"])
+            .args(["-c", "gc.auto=0", "-c", "core.fsmonitor=false"])
             .args(args)
             .current_dir(project)
             .stdout(Stdio::null())
