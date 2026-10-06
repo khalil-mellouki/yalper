@@ -17,6 +17,7 @@ mod scan;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use gix::bstr::{BStr, ByteSlice};
 use gix::error::ErrorExt;
@@ -28,7 +29,9 @@ use gix::{ObjectId, oid};
 use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 
-pub use scan::{MAX_FILE_BYTES, SkipReason, Skipped, Snapshot, snapshot};
+pub use scan::{
+    Base, MAX_FILE_BYTES, Pending, SkipReason, Skipped, Snapshot, remember_failure, snapshot, take,
+};
 
 /// The shadow repository inside `.yalper/`.
 pub const SNAPSHOTS_DIR: &str = "snapshots.git";
@@ -151,8 +154,12 @@ pub enum Error {
     /// not used.
     UnexpectedLayout(String),
     /// The ignore files of the project go over the budget for one snapshot, so no snapshot is taken (see
-    /// `snapshot::excludes`).
-    IgnoreRulesOverBudget(String),
+    /// `snapshot::excludes`). `remember` is what to save so the next snapshots fail at once while the ignore
+    /// files stay the same (see [`scan::remember_failure`]); `None` when this failure was such a fast one.
+    IgnoreRulesOverBudget {
+        reason: String,
+        remember: Option<String>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -165,7 +172,9 @@ impl fmt::Display for Error {
                 write!(f, "cannot store the path {path:?} in a snapshot: {reason}")
             }
             Self::MissingObject(id) => write!(f, "the snapshot store has no object {id}"),
-            Self::IgnoreRulesOverBudget(why) => write!(f, "ignore rules exceed the budget: {why}"),
+            Self::IgnoreRulesOverBudget { reason, .. } => {
+                write!(f, "ignore rules exceed the budget: {reason}")
+            }
             Self::UnexpectedLayout(what) => write!(
                 f,
                 "the snapshot store contains {what}, which Yalper does not create, so it is not used"
@@ -183,7 +192,7 @@ impl std::error::Error for Error {
             Self::InvalidPath { .. }
             | Self::MissingObject(_)
             | Self::UnexpectedLayout(_)
-            | Self::IgnoreRulesOverBudget(_) => None,
+            | Self::IgnoreRulesOverBudget { .. } => None,
         }
     }
 }
@@ -212,7 +221,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct ShadowStore {
     repo: gix::Repository,
     /// Held open: on Windows it keeps the store from being renamed or replaced while in use.
-    _dir: OwnedDir,
+    dir: OwnedDir,
 }
 
 impl fmt::Debug for ShadowStore {
@@ -278,12 +287,50 @@ impl ShadowStore {
         // pack directory, which this store never has (measured: 22 ms instead of 15 ms per 3-file step on
         // Windows). Loose objects are still found.
         repo.objects.refresh_never();
-        Ok(Self { repo, _dir: dir })
+        Ok(Self { repo, dir })
     }
 
     /// Stores `bytes` as a blob and returns its id. Content already in the store is not written again.
     pub fn write_blob(&self, bytes: &[u8]) -> Result<ObjectId> {
-        Ok(self.repo.write_blob(bytes)?.detach())
+        self.write_object(gix::objs::Kind::Blob, bytes)
+    }
+
+    /// Writes `data` as a loose object of `kind`, unless the store already has it, and returns its id.
+    ///
+    /// gix's own writer streams into a temporary file in `objects/`, then moves it into place and makes it
+    /// read-only, about 2 ms per object on Windows (measured). Here the object is compressed in memory and
+    /// written with one call to a temporary file next to its final name, then renamed into place (see
+    /// [`persist`]): about 1 ms.
+    fn write_object(&self, kind: gix::objs::Kind, data: &[u8]) -> Result<ObjectId> {
+        let (id, new) = self.prepare(kind, data)?;
+        if let Some(new) = new {
+            persist(&self.objects_dir(), &new)?;
+        }
+        Ok(id)
+    }
+
+    /// The id of `data` as an object of `kind` and, unless the store already has it, the object compressed
+    /// for [`persist`].
+    fn prepare(&self, kind: gix::objs::Kind, data: &[u8]) -> Result<(ObjectId, Option<NewObject>)> {
+        use std::io::Write as _;
+        let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, kind, data)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if self.repo.has_object(id) {
+            return Ok((id, None));
+        }
+        let mut zlib = gix::zlib::stream::deflate::Write::new(
+            Vec::with_capacity(data.len() / 2 + 64),
+            gix::zlib::Compression::BEST_SPEED,
+        );
+        zlib.write_all(&gix::objs::encode::loose_header(kind, data.len() as u64))?;
+        zlib.write_all(data)?;
+        zlib.flush()?;
+        let compressed = zlib.into_inner();
+        Ok((id, Some(NewObject { id, compressed })))
+    }
+
+    fn objects_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("objects")
     }
 
     /// The id of the tree with no entries, the base of the first snapshot.
@@ -336,7 +383,37 @@ impl ShadowStore {
                     .map_err(gix::Error::from)?;
             }
         }
-        let tree = editor.write(|tree| self.repo.write_object(tree).map(|id| id.detach()))?;
+        // Each id is known as soon as its tree is encoded, so the new trees are written together at the end, in
+        // parallel: creating a file on Windows is mostly waiting (measured: 4.6 instead of 5.8 ms for the usual
+        // 3 trees of a step).
+        let mut bytes = Vec::new();
+        let mut new_trees = Vec::new();
+        let tree = editor.write(|tree| {
+            use gix::objs::WriteTo;
+            bytes.clear();
+            tree.write_to(&mut bytes)?;
+            let (id, new) = self.prepare(gix::objs::Kind::Tree, &bytes)?;
+            new_trees.extend(new);
+            Ok::<_, Error>(id)
+        })?;
+        let objects = self.objects_dir();
+        std::thread::scope(|scope| {
+            let others: Vec<_> = (new_trees.iter().skip(1))
+                .map(|new| scope.spawn(|| persist(&objects, new)))
+                .collect();
+            let first = new_trees
+                .first()
+                .map_or(Ok(()), |new| persist(&objects, new));
+            others
+                .into_iter()
+                .map(|writer| {
+                    writer
+                        .join()
+                        .unwrap_or_else(|_| Err(io::Error::other("writing a tree failed")))
+                })
+                .chain([first])
+                .collect::<io::Result<()>>()
+        })?;
         Ok(tree)
     }
 
@@ -635,6 +712,64 @@ pub fn validate_path(path: &str, kind: FileKind) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A new loose object, compressed, see [`ShadowStore::prepare`].
+struct NewObject {
+    id: ObjectId,
+    compressed: Vec<u8>,
+}
+
+/// Writes `object` into the object directory `objects`: to a temporary file next to its final name, then
+/// renamed into place. The rename keeps a hook stopped at its deadline from leaving a partial object under a
+/// final name, which later writes of the same content would trust. Like git, the object's directory is created
+/// on demand, and a leftover `tmp_obj_*` file is harmless.
+fn persist(objects: &Path, object: &NewObject) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
+
+    let hex = object.id.to_string();
+    let fan_out = objects.join(&hex[..2]);
+    let temp = fan_out.join(format!(
+        "tmp_obj_{}_{}",
+        std::process::id(),
+        TEMP_FILES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = match create_object_file(&temp) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match fs::create_dir(&fan_out) {
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+                _ => {}
+            }
+            create_object_file(&temp)?
+        }
+        other => other?,
+    };
+    let written = file.write_all(&object.compressed);
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    let path = fan_out.join(&hex[2..]);
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        // On Windows, an object being read cannot be replaced, and it already holds this content.
+        if fs::symlink_metadata(&path).is_err() {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Creates a new file for a loose object at `path`, read-only for everyone on Unix as git makes its objects.
+fn create_object_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o444);
+    options.open(path)
 }
 
 /// See [`ShadowStore::open`]. A few metadata reads, three short directory listings and one read of `config`.

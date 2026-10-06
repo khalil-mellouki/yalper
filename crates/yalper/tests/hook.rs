@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use yalper::hook::{
@@ -12,7 +13,7 @@ use yalper::hook::{
 };
 use yalper::repo::{GIT_ID_FILE, ID_FILE};
 use yalper::snapshot::SNAPSHOTS_DIR;
-use yalper::store::{DATABASE_FILE, Event, Store};
+use yalper::store::{DATABASE_FILE, Event, LOCK_TIMEOUT, Store, WriterLock};
 
 mod common;
 use common::{TOKEN, project};
@@ -629,4 +630,148 @@ fn secrets_never_reach_the_database_its_wal_or_the_error_log() {
     let events = recorded_events(project.path());
     assert_eq!(events.len(), 3);
     assert_eq!(events[2].agent_id.as_deref(), Some("[REDACTED:github-pat]"));
+}
+
+/// Runs a `PostToolUse` hook in the project at `dir` with a snapshot deadline of `deadline_ms` (honored by debug
+/// builds only) and returns its output and how long it took, process start included.
+#[cfg(debug_assertions)]
+fn run_with_deadline(dir: &Path, deadline_ms: u64) -> (Output, Duration) {
+    let payload = json!({
+        "session_id": "deadline",
+        "hook_event_name": "PostToolUse",
+        "cwd": dir,
+        "tool_name": "Bash",
+        "tool_input": {"command": "./generate.sh"},
+        "tool_response": {"stdout": "", "stderr": ""},
+        "tool_use_id": "toolu_deadline",
+    })
+    .to_string();
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yalper"))
+        .arg("hook")
+        .current_dir(dir)
+        .env("CLAUDE_PROJECT_DIR", dir)
+        .env("YALPER_TEST_DEADLINE_MS", deadline_ms.to_string())
+        .env_remove("YALPER_TEST_PANIC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    (output, start.elapsed())
+}
+
+/// What a hook may take beyond its snapshot deadline: recording the step and starting and ending a debug
+/// build's process on a busy CI machine.
+#[cfg(debug_assertions)]
+const DEADLINE_MARGIN: Duration = Duration::from_millis(1500);
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_snapshot_not_done_by_the_deadline_is_abandoned_and_the_step_still_recorded() {
+    const DEADLINE_MS: u64 = 300;
+    let project = project();
+    let root = project.path();
+    // A first snapshot, so the next one is incremental.
+    let start = json!({"session_id": "deadline", "hook_event_name": "SessionStart", "cwd": root});
+    assert_silent_success(&run_in(root, start.to_string().as_bytes()));
+    let found = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let cache_before = Store::open(&found.dir, &found.token)
+        .unwrap()
+        .file_cache()
+        .unwrap();
+
+    // A large unignored tree appears, as if a command downloaded data into the project: 24 MiB that does not
+    // compress, which a debug build needs many seconds to hash and store.
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    for index in 0..24 {
+        let bytes: Vec<u8> = (0..1024 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let dir = root.join("data").join(format!("part{}", index % 4));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("chunk{index}.bin")), bytes).unwrap();
+    }
+
+    let (output, took) = run_with_deadline(root, DEADLINE_MS);
+    assert_silent_success(&output);
+    let deadline = Duration::from_millis(DEADLINE_MS);
+    assert!(took < deadline + DEADLINE_MARGIN, "the hook took {took:?}");
+    let lines = error_lines(root);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("step 2 recorded without a snapshot: abandoned"),
+        "{lines:?}"
+    );
+    // The step is recorded without a tree, and the latest snapshot and its stat cache are unchanged.
+    let events = recorded_events(root);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].tool_use_id.as_deref(), Some("toolu_deadline"));
+    assert_eq!(
+        (events[1].tree_id.as_ref(), events[1].files_changed),
+        (None, None)
+    );
+    let store = Store::open(&found.dir, &found.token).unwrap();
+    assert_eq!(store.file_cache().unwrap(), cache_before);
+
+    // With time enough, the next step's snapshot has all the new files. It takes much longer than the bound
+    // checked above, so that bound came from the deadline.
+    let (output, took) = run_with_deadline(root, 600_000);
+    assert_silent_success(&output);
+    assert!(
+        took > deadline + DEADLINE_MARGIN,
+        "too fast to test the deadline: {took:?}"
+    );
+    let events = recorded_events(root);
+    assert_eq!(events[2].files_changed, Some(24));
+    assert_eq!(error_lines(root).len(), 1);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_step_whose_snapshot_waits_too_long_for_the_writer_lock_is_recorded_without_it() {
+    const DEADLINE_MS: u64 = 300;
+    let project = project();
+    let root = project.path();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Another hook holds the writer lock, for example one taking a slow snapshot for a parallel tool call.
+    let found = find_yalper_dir([root.to_path_buf()]).unwrap();
+    drop(Store::open(&found.dir, &found.token).unwrap());
+    let held = WriterLock::acquire(&found.dir, LOCK_TIMEOUT).unwrap();
+
+    let (output, took) = run_with_deadline(root, DEADLINE_MS);
+    assert_silent_success(&output);
+    let deadline = Duration::from_millis(DEADLINE_MS);
+    assert!(
+        took >= deadline && took < deadline + DEADLINE_MARGIN,
+        "the hook took {took:?}"
+    );
+    let lines = error_lines(root);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("writer lock was not free in time"),
+        "{lines:?}"
+    );
+    let events = recorded_events(root);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tree_id, None);
+
+    // Once the lock is free, the change is in the next snapshot.
+    drop(held);
+    let (output, _) = run_with_deadline(root, 600_000);
+    assert_silent_success(&output);
+    let events = recorded_events(root);
+    assert_eq!(events[1].files_changed, Some(1));
 }
