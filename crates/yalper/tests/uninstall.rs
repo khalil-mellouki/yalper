@@ -370,8 +370,12 @@ fn a_linked_settings_file_is_skipped_and_a_linked_exclude_file_refused() {
     run(root, &["init"]);
     fs::remove_file(settings_path(root)).unwrap();
     std::os::unix::fs::symlink(&target, settings_path(root)).unwrap();
+    // Nothing else to do without --purge: the link is never followed, so nothing changes.
     let text = run(root, &["uninstall"]);
+    assert!(text.contains("nothing to remove"), "{text}");
+    let text = run(root, &["uninstall", "--purge"]);
     assert!(text.contains("settings.local.json skipped"), "{text}");
+    assert!(text.contains("  .yalper/: deleted"), "{text}");
     assert!(
         fs::symlink_metadata(settings_path(root))
             .unwrap()
