@@ -13,6 +13,7 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+gix.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 
@@ -25,6 +26,10 @@ tempfile.workspace = true
 
 [[bench]]
 name = "hook_latency"
+harness = false
+
+[[bench]]
+name = "shadow_store"
 harness = false
 
 [lints]
