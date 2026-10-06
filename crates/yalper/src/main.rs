@@ -1,9 +1,10 @@
 use std::env;
 use std::ffi::OsStr;
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jiff::tz::TimeZone;
 
 /// Record, replay, and debug AI coding agent sessions.
 #[derive(Parser)]
@@ -28,6 +29,15 @@ enum Command {
         #[arg(long)]
         purge: bool,
     },
+    /// List the recorded sessions and their steps. Shows the most recent session unless told otherwise.
+    Log {
+        /// Show the session whose id starts with this.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        /// Show every session, the most recent first.
+        #[arg(long, conflicts_with = "session")]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -43,11 +53,13 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Init { recreate } => init(recreate),
         Command::Uninstall { purge } => uninstall(purge),
+        Command::Log { session, all } => log(session, all),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("error: {message}");
+            // Messages quote paths and file system errors, which can hold repository text.
+            eprintln!("error: {}", yalper::init::printable(&message));
             ExitCode::FAILURE
         }
     }
@@ -66,6 +78,21 @@ fn uninstall(purge: bool) -> Result<(), String> {
     let start = env::current_dir()
         .map_err(|error| format!("cannot read the current directory: {error}"))?;
     yalper::uninstall::uninstall(&start, purge, &mut io::stdout().lock())
+}
+
+fn log(session: Option<String>, all: bool) -> Result<(), String> {
+    let start = env::current_dir()
+        .map_err(|error| format!("cannot read the current directory: {error}"))?;
+    let selection = match (session, all) {
+        (Some(prefix), _) => yalper::log::Selection::Session(prefix),
+        (None, true) => yalper::log::Selection::All,
+        (None, false) => yalper::log::Selection::Latest,
+    };
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    yalper::log::log(&start, &selection, &TimeZone::system(), &mut out)?;
+    // A closed output (`yalper log | head`) is not an error.
+    let _ = out.flush();
+    Ok(())
 }
 
 #[cfg(test)]

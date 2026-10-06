@@ -774,21 +774,48 @@ fn other_commands(settings: &Value, exe: &str) -> Vec<(String, String)> {
     commands
 }
 
-/// `text` with every control character (line breaks, terminal escape sequences) replaced by a space, so text
-/// from a repository cannot change what the terminal shows.
-pub(crate) fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+/// `text` with every control character (line breaks, terminal escape sequences) replaced by a space, and every
+/// invisible formatting character (see [`is_hidden_format`]) shown as `<U+XXXX>`, so text from a repository or
+/// a recording cannot change what the terminal shows or hide what it says.
+pub fn printable(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            shown.push(' ');
+        } else if is_hidden_format(c) {
+            shown.push_str(&format!("<U+{:04X}>", u32::from(c)));
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+/// Characters that reorder the text around them (bidirectional marks and overrides), break lines outside
+/// ASCII, or are invisible (zero-width space, word joiner, byte order mark, tag characters). The zero-width
+/// joiner U+200D is kept: emoji sequences need it and it hides nothing.
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 /// `command` on one line, cut after [`MAX_LISTED_COMMAND_CHARS`] characters.
 fn shortened(command: &str) -> String {
-    let mut line: String = printable(command)
-        .chars()
-        .take(MAX_LISTED_COMMAND_CHARS)
-        .collect();
-    if command.chars().count() > MAX_LISTED_COMMAND_CHARS {
+    let shown = printable(command);
+    let mut line: String = shown.chars().take(MAX_LISTED_COMMAND_CHARS).collect();
+    if shown.chars().count() > MAX_LISTED_COMMAND_CHARS {
         line.push_str("...");
     }
     line
@@ -1050,6 +1077,37 @@ mod tests {
         assert!(!is_yalper_handler(
             &json!({"type": "command", "command": "yalper hook"})
         ));
+    }
+
+    #[test]
+    fn printable_shows_hidden_formatting_characters() {
+        assert_eq!(printable("a\u{1b}[31m\r\tb"), "a [31m  b");
+        // A right-to-left override makes `rm -rf ~ # txt.exe` look like something else.
+        assert_eq!(printable("run \u{202E}exe.txt"), "run <U+202E>exe.txt");
+        for c in [
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202A}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{E0000}',
+            '\u{E0041}',
+            '\u{E007F}',
+        ] {
+            assert_eq!(
+                printable(&c.to_string()),
+                format!("<U+{:04X}>", u32::from(c))
+            );
+        }
+        // Kept: the emoji joiner, accents, other scripts.
+        let kept = "\u{1F469}\u{200D}\u{1F4BB} é 日本 שלום";
+        assert_eq!(printable(kept), kept);
     }
 
     #[test]

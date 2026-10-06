@@ -17,6 +17,7 @@ clap.workspace = true
 getrandom.workspace = true
 gix.workspace = true
 ignore.workspace = true
+jiff.workspace = true
 regex-automata.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
@@ -29,6 +30,7 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 toml.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
 tempfile.workspace = true
 
 [[bench]]
