@@ -2,4 +2,5 @@
 
 pub mod hook;
 pub mod safe_fs;
+pub mod snapshot;
 pub mod store;

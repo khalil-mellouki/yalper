@@ -52,11 +52,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run hook latency benchmark (report only)
+      - name: Run hook latency and shadow store benchmarks (report only)
         shell: bash
         run: |
-          cargo bench --locked --bench hook_latency | tee bench.txt
-          grep '^hook_latency' bench.txt >> "$GITHUB_STEP_SUMMARY"
+          cargo bench --locked --bench hook_latency --bench shadow_store | tee bench.txt
+          grep -E '^(hook_latency|shadow_store)' bench.txt >> "$GITHUB_STEP_SUMMARY"
 
   deny:
     name: Licenses and advisories
