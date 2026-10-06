@@ -20,9 +20,10 @@ use std::process::{Command, Output, Stdio};
 
 use common::{files, git, yalper};
 use serde_json::{Value, json};
-use yalper::hook::{ERRORS_LOG, YALPER_DIR};
+use yalper::hook::{ERRORS_LOG, YALPER_DIR, find_yalper_dir};
 use yalper::init::is_yalper_handler;
 use yalper::snapshot::SNAPSHOTS_DIR;
+use yalper::store::{DATABASE_FILE, Store};
 
 const SESSION: &str = "5f3c2a1e-8b4d-4e6f-9a7b-1c2d3e4f5a6b";
 
@@ -405,43 +406,74 @@ fn a_claude_code_session_is_recorded_inspected_and_uninstalled() {
     No files changed.
     ");
 
-    // 4. The last snapshot is exactly the tree git itself makes of the working tree: every file that is not
-    // ignored, with the shell command's changes, without `.yalper/`, the settings file or the bytecode.
-    let store = root.join(YALPER_DIR).join(SNAPSHOTS_DIR);
+    // 4. The snapshot of the last step that changed a file, and of every step after it, is exactly the tree
+    // git itself makes of the working tree: every file that is not ignored, with the shell command's
+    // changes, without `.yalper/`, the settings file or the bytecode.
     let working_tree = git_tree_of_working_tree(root);
-    git_in_store(&store, &["cat-file", "-e", &working_tree]);
+    // The open `.yalper` folder is closed at the end of the block, or Windows would not let purge delete it.
+    let events = {
+        let yalper_dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+        let store = Store::open_for_reading(&yalper_dir.dir, &yalper_dir.token).unwrap();
+        store.events(SESSION).unwrap()
+    };
+    // Steps 6 to 9.
+    for event in &events[5..9] {
+        assert_eq!(
+            event.tree_id.as_deref(),
+            Some(working_tree.as_str()),
+            "step {}",
+            event.step
+        );
+    }
 
     // The token is nowhere in `.yalper/`: not in the database, its WAL, the error log, or any object of the
-    // snapshot store (read uncompressed through git).
-    let mut recorded: Vec<u8> = files(&root.join(YALPER_DIR))
-        .into_values()
-        .flatten()
+    // snapshot store (read uncompressed through git). The prompt is stored with the token masked in place.
+    let store = root.join(YALPER_DIR).join(SNAPSHOTS_DIR);
+    let recorded = files(&root.join(YALPER_DIR));
+    let event_log: Vec<u8> = recorded
+        .iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(DATABASE_FILE)
+        })
+        .flat_map(|(_, bytes)| bytes.clone())
         .collect();
+    let mut recorded: Vec<u8> = recorded.into_values().flatten().collect();
     recorded.extend(git_in_store(&store, &["cat-file", "--batch-all-objects", "--batch"]).stdout);
-    let contains = |text: &str| {
-        recorded
+    let contains = |bytes: &[u8], text: &str| {
+        bytes
             .windows(text.len())
-            .any(|bytes| bytes == text.as_bytes())
+            .any(|window| window == text.as_bytes())
     };
-    assert!(contains(GREET_AFTER), "the search sees the recorded code");
+    assert!(contains(
+        &event_log,
+        "Use my token [REDACTED:github-pat] to push."
+    ));
     assert!(
-        !contains(&token["ghp_".len()..]),
+        contains(&recorded, GREET_AFTER),
+        "the search sees the recorded code"
+    );
+    assert!(
+        !contains(&recorded, &token["ghp_".len()..]),
         "the token reached .yalper/"
     );
 
     // 5. Uninstall removes the hooks and gives the developer's settings back byte for byte. The
     // recordings stay readable.
     let project_files = without_setup(files(root));
+    let only_user_settings = BTreeMap::from([(
+        root.join(".claude").join("settings.local.json"),
+        USER_SETTINGS.as_bytes().to_vec(),
+    )]);
     insta::assert_snapshot!(shown(root, &run(root, &["uninstall"])), @r"
     Removing Yalper from /home/dev/greeter
       Claude Code hooks: removed from .claude/settings.local.json
       .yalper/: kept, with your recordings (`yalper uninstall --purge` deletes them)
     Done.
     ");
-    assert_eq!(
-        fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
-        USER_SETTINGS
-    );
+    assert_eq!(files(&root.join(".claude")), only_user_settings);
     assert!(run(root, &["log"]).contains("ended (prompt_input_exit), 11 steps"));
 
     // `--purge` also deletes the recordings. The project is as it was before init, apart from the git
@@ -454,10 +486,7 @@ fn a_claude_code_session_is_recorded_inspected_and_uninstalled() {
     Done.
     ");
     assert!(!root.join(YALPER_DIR).exists());
-    assert_eq!(
-        fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
-        USER_SETTINGS
-    );
+    assert_eq!(files(&root.join(".claude")), only_user_settings);
     let mut expected_git_dir = git_dir_before_init;
     expected_git_dir
         .get_mut(&root.join(".git").join("info").join("exclude"))
