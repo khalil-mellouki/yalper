@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::safe_fs::{Access, OwnedDir};
+use crate::{record, repo};
 
 pub use input::{HookEvent, HookInput, InputError};
 
@@ -33,12 +34,6 @@ pub const ERRORS_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Payloads larger than this are not parsed (the rest of stdin is drained and discarded).
 pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-
-/// When set, every hook call takes a real snapshot. A test entry point for the latency benchmark until
-/// M1-T06 records every step (and checks that `yalper init` created the `.yalper/` it writes to). Only in
-/// builds with the `bench-snapshot` feature, which release builds never enable.
-#[cfg(feature = "bench-snapshot")]
-pub const BENCH_SNAPSHOT_ENV: &str = "YALPER_BENCH_SNAPSHOT";
 
 const MAX_MESSAGE_CHARS: usize = 2000;
 const MAX_EVENT_CHARS: usize = 64;
@@ -76,7 +71,7 @@ pub fn run(stdin: &mut dyn Read) {
     };
     if let Some(dir) = &call.yalper_dir {
         // Nowhere is left to report a failure to write the error log, so it is ignored.
-        let _ = append_error(dir, call.event.as_deref(), &error, ERRORS_LOG_MAX_BYTES);
+        let _ = append_error(dir, call.event, &error, ERRORS_LOG_MAX_BYTES);
     }
 }
 
@@ -92,7 +87,7 @@ fn panic_text(payload: &(dyn Any + Send)) -> &str {
 #[derive(Default)]
 struct Call {
     yalper_dir: Option<OwnedDir>,
-    event: Option<String>,
+    event: Option<&'static str>,
 }
 
 fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
@@ -116,47 +111,27 @@ fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
                 .collect()
         }
     };
-    // A project without `.yalper/` is not recorded, and there is nowhere to log to.
+    // A project without a `.yalper/` that `yalper init` created is not recorded, and there is nowhere to log
+    // to.
     let Some(dir) = find_yalper_dir(starts) else {
         return Ok(());
     };
-    call.yalper_dir = Some(dir);
+    let dir = &*call.yalper_dir.insert(dir);
 
     let payload = payload?;
+    // Only the names of known events are logged: the error log never contains payload text.
     call.event = payload
         .get("hook_event_name")
         .and_then(Value::as_str)
-        .map(str::to_owned);
-    HookInput::from_value(payload).map_err(|error| error.to_string())?;
-
-    #[cfg(feature = "bench-snapshot")]
-    if let Some(dir) = &call.yalper_dir
-        && env::var_os(BENCH_SNAPSHOT_ENV).is_some()
-    {
-        take_snapshot(dir, call.event.as_deref())?;
-    }
+        .and_then(|name| HookEvent::from_name(name).name());
+    let input = HookInput::from_value(payload).map_err(|error| error.to_string())?;
 
     #[cfg(debug_assertions)]
     if env::var_os("YALPER_TEST_PANIC").is_some() {
         panic!("forced by YALPER_TEST_PANIC");
     }
 
-    Ok(())
-}
-
-/// Takes a snapshot of the project the way recording a step will: open the event log, take the writer lock,
-/// snapshot, and log one line if files could not be read or stored.
-#[cfg(feature = "bench-snapshot")]
-fn take_snapshot(dir: &OwnedDir, event: Option<&str>) -> Result<(), String> {
-    use crate::store::{LOCK_TIMEOUT, Store, WriterLock};
-    let store = Store::open(dir).map_err(|error| error.to_string())?;
-    let lock = WriterLock::acquire(dir, LOCK_TIMEOUT).map_err(|error| error.to_string())?;
-    let snapshot =
-        crate::snapshot::snapshot(dir, &store, &lock).map_err(|error| error.to_string())?;
-    if let Some(problems) = snapshot.problems() {
-        let _ = append_error(dir, event, &problems, ERRORS_LOG_MAX_BYTES);
-    }
-    Ok(())
+    record::record(dir, &input)
 }
 
 /// Reads `reader` to the end, but keeps at most `limit` bytes. A longer input is drained (so the writer
@@ -177,8 +152,9 @@ fn read_limited(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>, String> {
 ///
 /// From each start, the search walks up only as far as the nearest git root (the first directory that
 /// contains `.git`), so a `.yalper` in a parent folder or in another project is never used. Outside a git
-/// repository nothing is found. A `.yalper` that is a symlink, or (on Unix) owned by another user, is
-/// ignored. The directory is returned open, see [`OwnedDir`].
+/// repository nothing is found. A `.yalper` that is a symlink, (on Unix) owned by another user, or not created
+/// by `yalper init` for this repository (see [`repo::is_initialized`]) is ignored. The directory is returned
+/// open, see [`OwnedDir`].
 pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<OwnedDir> {
     starts.into_iter().find_map(|start| {
         let git_root = start
@@ -187,7 +163,10 @@ pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<Owne
         start
             .ancestors()
             .take_while(|dir| dir.starts_with(git_root))
-            .find_map(|dir| OwnedDir::open(&dir.join(YALPER_DIR)).ok())
+            .find_map(|dir| {
+                let yalper_dir = OwnedDir::open(&dir.join(YALPER_DIR)).ok()?;
+                repo::is_initialized(git_root, &yalper_dir).then_some(yalper_dir)
+            })
     })
 }
 
@@ -231,11 +210,20 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// A temporary git project (it only needs a `.git` entry) with `.yalper/` in it.
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Writes the init token to the git directory `git_dir` and to `yalper_dir`, as `yalper init` does.
+    fn write_token(git_dir: &Path, yalper_dir: &Path) {
+        fs::write(git_dir.join(repo::GIT_ID_FILE), TOKEN).unwrap();
+        fs::write(yalper_dir.join(repo::ID_FILE), TOKEN).unwrap();
+    }
+
+    /// A temporary git project (it only needs a `.git` entry) with an initialized `.yalper/` in it.
     fn project() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".git")).unwrap();
         fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        write_token(&root.path().join(".git"), &root.path().join(YALPER_DIR));
         root
     }
 
@@ -258,9 +246,15 @@ mod tests {
 
     #[test]
     fn a_git_file_marks_the_root_like_a_git_directory() {
+        let git_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        fs::write(
+            root.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.path().display()),
+        )
+        .unwrap();
         fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        write_token(git_dir.path(), &root.path().join(YALPER_DIR));
         assert_eq!(
             found([root.path().to_path_buf()]),
             Some(fs::canonicalize(root.path().join(YALPER_DIR)).unwrap())
@@ -281,8 +275,7 @@ mod tests {
 
     #[test]
     fn stops_at_the_git_root() {
-        let parent = tempfile::tempdir().unwrap();
-        fs::create_dir(parent.path().join(YALPER_DIR)).unwrap();
+        let parent = project();
         let repo = parent.path().join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         let deep = repo.join("src");
@@ -294,6 +287,7 @@ mod tests {
     fn nothing_is_found_outside_a_git_repository() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        fs::write(root.path().join(YALPER_DIR).join(repo::ID_FILE), TOKEN).unwrap();
         assert_eq!(found([root.path().to_path_buf()]), None);
     }
 
@@ -303,6 +297,34 @@ mod tests {
         fs::create_dir(root.path().join(".git")).unwrap();
         fs::write(root.path().join(YALPER_DIR), "not a directory").unwrap();
         assert_eq!(found([root.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn a_yalper_dir_init_did_not_create_is_ignored() {
+        // No token anywhere, as in a repository that committed its own `.yalper/`.
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        assert_eq!(found([root.path().to_path_buf()]), None);
+
+        // The committed `.yalper/` carries a token, but the git directory has none or another one.
+        fs::write(root.path().join(YALPER_DIR).join(repo::ID_FILE), TOKEN).unwrap();
+        assert_eq!(found([root.path().to_path_buf()]), None);
+        let other = "fedcba9876543210fedcba9876543210";
+        fs::write(root.path().join(".git").join(repo::GIT_ID_FILE), other).unwrap();
+        assert_eq!(found([root.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn a_planted_yalper_dir_in_a_subdirectory_is_skipped() {
+        let root = project();
+        let sub = root.path().join("sub");
+        fs::create_dir_all(sub.join(YALPER_DIR)).unwrap();
+        fs::write(sub.join(YALPER_DIR).join(repo::ID_FILE), "planted").unwrap();
+        assert_eq!(
+            found([sub]),
+            Some(fs::canonicalize(root.path().join(YALPER_DIR)).unwrap())
+        );
     }
 
     #[test]

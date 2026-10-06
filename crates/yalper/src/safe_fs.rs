@@ -13,7 +13,7 @@
 //! [`OwnedDir::guard_path`], and `Store::open`.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 /// How [`OwnedDir::open_file`] opens a file. Both create the file if it is missing and never truncate it.
@@ -277,6 +277,21 @@ pub fn open_regular_file(path: &Path) -> io::Result<File> {
         )));
     }
     Ok(file)
+}
+
+/// The content of `path` if it is a regular file (not a link, FIFO or device) of at most `max_bytes`.
+pub fn read_small_regular_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    open_regular_file(path)
+        .ok()?
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
 }
 
 /// Device and inode, typed like `std::os::unix::fs::MetadataExt`.

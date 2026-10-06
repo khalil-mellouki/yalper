@@ -27,7 +27,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -56,7 +55,7 @@ jobs:
       - name: Run hook latency, shadow store and redaction benchmarks (report only)
         shell: bash
         run: |
-          cargo bench --locked --features bench-snapshot --bench hook_latency --bench shadow_store --bench redact | tee bench.txt
+          cargo bench --locked --bench hook_latency --bench shadow_store --bench redact | tee bench.txt
           grep -E '^(hook_latency|shadow_store|redact)' bench.txt >> "$GITHUB_STEP_SUMMARY"
 
   deny:

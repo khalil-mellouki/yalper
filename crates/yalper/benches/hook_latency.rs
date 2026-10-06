@@ -1,9 +1,8 @@
 //! Measures how long one `PostToolUse` hook call takes, process spawn included, the way Claude Code runs it.
 //!
 //! Builds a temporary git project with 1,000 files, then for each call changes 3 files and runs the real
-//! `yalper hook` binary with a `PostToolUse` payload on stdin. Each call takes a real snapshot of the project
-//! (through the `YALPER_BENCH_SNAPSHOT` test entry point until the hook records steps). Prints the median and
-//! p90.
+//! `yalper hook` binary with a `PostToolUse` payload on stdin. Each call records the step: redaction, the
+//! event log, and a real snapshot of the project. Prints the median and p90.
 //!
 //! Run with `cargo bench --bench hook_latency`. Set `YALPER_BENCH_CALLS` to change the number of calls.
 
@@ -14,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use yalper::hook::BENCH_SNAPSHOT_ENV;
+use yalper::repo::{GIT_ID_FILE, ID_FILE};
 use yalper::safe_fs::OwnedDir;
 use yalper::snapshot::ShadowStore;
 use yalper::store::Store;
@@ -39,6 +38,10 @@ fn build_project(root: &Path) {
     assert!(status.success(), "git init failed");
     fs::write(root.join(".gitignore"), "target/\n").unwrap();
     fs::create_dir(root.join(".yalper")).unwrap();
+    // The init token `yalper init` writes: the hook only records into a `.yalper/` that carries it.
+    let token = "0123456789abcdef0123456789abcdef\n";
+    fs::write(root.join(".git").join(GIT_ID_FILE), token).unwrap();
+    fs::write(root.join(".yalper").join(ID_FILE), token).unwrap();
     ShadowStore::init(&OwnedDir::open(&root.join(".yalper")).unwrap()).unwrap();
 
     for index in 0..FILES {
@@ -63,7 +66,6 @@ fn run_hook(root: &Path, payload: &[u8]) -> Duration {
         .arg("hook")
         .current_dir(root)
         .env("CLAUDE_PROJECT_DIR", root)
-        .env(BENCH_SNAPSHOT_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -127,8 +129,18 @@ fn main() {
     );
     // The last snapshot has the 1,000 files plus `.gitignore` in its stat cache.
     let yalper = OwnedDir::open(&root.join(".yalper")).unwrap();
-    let cache = Store::open(&yalper).unwrap().file_cache().unwrap();
+    let store = Store::open(&yalper).unwrap();
+    let cache = store.file_cache().unwrap();
     assert_eq!(cache.map(|cache| cache.files.len()), Some(FILES + 1));
+    // Every call was recorded as a step. The first one took the first snapshot of the whole project, each
+    // later one found the 3 files it changed.
+    let events = store.events("bench-session").unwrap();
+    assert_eq!(events.len(), WARMUP_CALLS + calls);
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| event.files_changed == Some(CHANGED_PER_CALL as u32))
+    );
 
     let median = if calls % 2 == 1 {
         millis(times[calls / 2])

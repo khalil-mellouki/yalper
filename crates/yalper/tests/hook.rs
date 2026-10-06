@@ -4,11 +4,17 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use serde_json::json;
-use tempfile::TempDir;
 use yalper::hook::{ERRORS_LOG, HookEvent, HookInput, MAX_PAYLOAD_BYTES, YALPER_DIR};
+use yalper::repo::{GIT_ID_FILE, ID_FILE};
+use yalper::safe_fs::OwnedDir;
+use yalper::snapshot::SNAPSHOTS_DIR;
+use yalper::store::{DATABASE_FILE, Event, Store};
+
+mod common;
+use common::{TOKEN, project};
 
 fn fixtures() -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks");
@@ -18,14 +24,6 @@ fn fixtures() -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
-}
-
-/// A temporary git project (it only needs a `.git` entry) with `.yalper/` in it.
-fn project() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join(".git")).unwrap();
-    fs::create_dir(dir.path().join(YALPER_DIR)).unwrap();
-    dir
 }
 
 struct Hook<'a> {
@@ -43,7 +41,6 @@ impl Hook<'_> {
             .current_dir(self.current_dir)
             .env_remove("CLAUDE_PROJECT_DIR")
             .env_remove("YALPER_TEST_PANIC")
-            .env_remove("YALPER_BENCH_SNAPSHOT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -323,8 +320,7 @@ fn project_dir_without_yalper_does_not_fall_back_to_cwd() {
 
 #[test]
 fn yalper_dir_above_the_git_root_is_not_used() {
-    let parent = tempfile::tempdir().unwrap();
-    fs::create_dir(parent.path().join(YALPER_DIR)).unwrap();
+    let parent = project();
     let repo = parent.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
     let output = run_in(&repo, b"not json");
@@ -336,6 +332,7 @@ fn yalper_dir_above_the_git_root_is_not_used() {
 fn yalper_dir_outside_a_git_repository_is_not_used() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join(YALPER_DIR)).unwrap();
+    fs::write(dir.path().join(YALPER_DIR).join(ID_FILE), TOKEN).unwrap();
     let output = run_in(dir.path(), b"not json");
     assert_silent_success(&output);
     assert_eq!(error_lines(dir.path()), Vec::<String>::new());
@@ -393,58 +390,240 @@ fn linked_error_log_is_not_written() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
 }
 
-/// The benchmark's snapshot entry point, only built with the `bench-snapshot` feature.
-#[cfg(feature = "bench-snapshot")]
-mod bench_snapshot {
-    use super::*;
-    use yalper::hook::BENCH_SNAPSHOT_ENV;
-    use yalper::safe_fs::OwnedDir;
-    use yalper::snapshot::ShadowStore;
-    use yalper::store::Store;
+/// The steps recorded in the project at `root`, session by session.
+fn recorded_events(root: &Path) -> Vec<Event> {
+    let store = Store::open(&OwnedDir::open(&root.join(YALPER_DIR)).unwrap()).unwrap();
+    store
+        .sessions()
+        .unwrap()
+        .iter()
+        .flat_map(|session| store.events(&session.id).unwrap())
+        .collect()
+}
 
-    /// Runs the hook with the benchmark's snapshot entry point turned on.
-    fn run_with_snapshot(dir: &Path, stdin: &[u8]) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_yalper"))
-            .arg("hook")
-            .current_dir(dir)
-            .env("CLAUDE_PROJECT_DIR", dir)
-            .env(BENCH_SNAPSHOT_ENV, "1")
-            .env_remove("YALPER_TEST_PANIC")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
-        child.wait_with_output().unwrap()
+/// The names of the entries of `dir`, sorted.
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hooks")
+        .join(name)
+}
+
+#[test]
+fn every_fixture_is_recorded_as_a_step() {
+    let project = project();
+    for fixture in fixtures() {
+        assert_silent_success(&run_in(project.path(), &fs::read(&fixture).unwrap()));
+    }
+    let events = recorded_events(project.path());
+    let steps: Vec<u32> = events.iter().map(|event| event.step).collect();
+    assert_eq!(steps, (1..=7).collect::<Vec<u32>>());
+    assert_eq!(error_lines(project.path()), Vec::<String>::new());
+}
+
+#[test]
+fn a_yalper_dir_init_did_not_create_is_never_written() {
+    let other = "fedcba9876543210fedcba9876543210";
+    // (token in `.yalper/id`, token in `.git/yalper-id`)
+    for (yalper_token, git_token) in [
+        (None, Some(TOKEN)),
+        (Some(other), Some(TOKEN)),
+        (Some(TOKEN), None),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let yalper_dir = root.path().join(YALPER_DIR);
+        fs::create_dir(&yalper_dir).unwrap();
+        if let Some(token) = yalper_token {
+            fs::write(yalper_dir.join(ID_FILE), token).unwrap();
+        }
+        if let Some(token) = git_token {
+            fs::write(root.path().join(".git").join(GIT_ID_FILE), token).unwrap();
+        }
+        fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let before = entry_names(&yalper_dir);
+
+        for fixture in fixtures() {
+            assert_silent_success(&run_in(root.path(), &fs::read(&fixture).unwrap()));
+        }
+        assert_silent_success(&run_in(root.path(), b"not json"));
+        assert_eq!(
+            entry_names(&yalper_dir),
+            before,
+            "{yalper_token:?} {git_token:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_snapshot_still_records_the_step_and_is_logged() {
+    let project = project();
+    // Without its snapshot store, the snapshot cannot store the new file.
+    fs::remove_dir_all(project.path().join(YALPER_DIR).join(SNAPSHOTS_DIR)).unwrap();
+    fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let stdin = fs::read(fixture("post_tool_use_bash_subagent.json")).unwrap();
+
+    assert_silent_success(&run_in(project.path(), &stdin));
+    let lines = error_lines(project.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(" PostToolUse "), "{lines:?}");
+    assert!(
+        lines[0].contains("step 1 recorded without a snapshot"),
+        "{lines:?}"
+    );
+    let events = recorded_events(project.path());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].tree_id, None);
+    assert_eq!(events[0].tool_name.as_deref(), Some("Bash"));
+}
+
+/// Starts the hook the way Claude Code does, with `CLAUDE_PROJECT_DIR` and the current directory set to
+/// `dir`, and writes `stdin` to it.
+fn start_in(dir: &Path, stdin: &[u8]) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yalper"))
+        .arg("hook")
+        .current_dir(dir)
+        .env("CLAUDE_PROJECT_DIR", dir)
+        .env_remove("YALPER_TEST_PANIC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    child
+}
+
+#[test]
+fn concurrent_post_tool_use_hooks_both_record_a_step() {
+    const ROUNDS: u32 = 5;
+    let project = project();
+    let payload = |round: u32, call: u32| {
+        json!({
+            "session_id": "parallel",
+            "hook_event_name": "PostToolUse",
+            "cwd": project.path(),
+            "tool_name": "Write",
+            "tool_input": {"file_path": format!("f{round}_{call}.txt"), "content": "x"},
+            "tool_response": {"type": "create"},
+            "tool_use_id": format!("toolu_{round}_{call}"),
+        })
+        .to_string()
+    };
+    for round in 0..ROUNDS {
+        // Two tool calls ran in parallel, then both of their PostToolUse hooks run at once.
+        for call in 0..2 {
+            fs::write(project.path().join(format!("f{round}_{call}.txt")), "x").unwrap();
+        }
+        let first = start_in(project.path(), payload(round, 0).as_bytes());
+        let second = start_in(project.path(), payload(round, 1).as_bytes());
+        assert_silent_success(&first.wait_with_output().unwrap());
+        assert_silent_success(&second.wait_with_output().unwrap());
     }
 
-    #[test]
-    fn the_snapshot_entry_point_records_the_project_silently() {
-        let project = project();
-        let yalper = OwnedDir::open(&project.path().join(YALPER_DIR)).unwrap();
-        ShadowStore::init(&yalper).unwrap();
-        fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let stdin = fs::read(&fixtures()[0]).unwrap();
+    assert_eq!(error_lines(project.path()), Vec::<String>::new());
+    let events = recorded_events(project.path());
+    let steps: Vec<u32> = events.iter().map(|event| event.step).collect();
+    assert_eq!(steps, (1..=2 * ROUNDS).collect::<Vec<u32>>());
+    let mut tool_use_ids: Vec<String> = events
+        .iter()
+        .map(|event| event.tool_use_id.clone().unwrap())
+        .collect();
+    tool_use_ids.sort();
+    let mut expected: Vec<String> = (0..ROUNDS)
+        .flat_map(|round| (0..2).map(move |call| format!("toolu_{round}_{call}")))
+        .collect();
+    expected.sort();
+    assert_eq!(tool_use_ids, expected);
+    // Each round's two new files are counted once, by whichever hook took its snapshot first.
+    let changed: u32 = events
+        .iter()
+        .map(|event| event.files_changed.unwrap())
+        .sum();
+    assert_eq!(changed, 2 * ROUNDS);
+}
 
-        let output = run_with_snapshot(project.path(), &stdin);
-        assert_silent_success(&output);
-        assert_eq!(error_lines(project.path()), Vec::<String>::new());
-        let cache = Store::open(&yalper).unwrap().file_cache().unwrap().unwrap();
-        let paths: Vec<&str> = cache.files.iter().map(|file| file.path.as_str()).collect();
-        assert_eq!(paths, ["main.rs"]);
+/// A fake GitHub token, built at run time so that no token-shaped literal is in the repository.
+fn fake_github_token(seed: &str) -> String {
+    format!("ghp_{}", seed.chars().cycle().take(36).collect::<String>())
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+#[test]
+fn secrets_never_reach_the_database_its_wal_or_the_error_log() {
+    let project = project();
+    let in_prompt = fake_github_token("q7W2e9R4t1Y6u3I8o5P0");
+    let in_output = fake_github_token("Z8x3C6v1B9n4M7a2S5d0");
+    let in_columns = fake_github_token("L4k8J2h6G1f5D9s3A7p0");
+    let session = json!({
+        "session_id": "secret-session",
+        "hook_event_name": "SessionStart",
+        "cwd": project.path(),
+        "transcript_path": format!("/home/dev/{in_columns}/t.jsonl"),
+        "source": "startup",
+    });
+    let prompt = json!({
+        "session_id": "secret-session",
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": project.path(),
+        "prompt": format!("Use the token {in_prompt} to clone the repository"),
+    });
+    let tool = json!({
+        "session_id": "secret-session",
+        "hook_event_name": "PostToolUse",
+        "cwd": project.path(),
+        "agent_id": in_columns,
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat .env"},
+        "tool_response": {"stdout": format!("GITHUB_TOKEN={in_output}\n"), "stderr": ""},
+        "tool_use_id": "toolu_secret",
+    });
+    for payload in [&session, &prompt, &tool] {
+        assert_silent_success(&run_in(project.path(), payload.to_string().as_bytes()));
+    }
+    // Calls that fail are logged, and their payload must not reach the log.
+    let unparsable = format!("{{\"hook_event_name\": \"Stop\", \"prompt\": \"{in_prompt}\"");
+    let no_session = json!({"session_id": 7, "hook_event_name": "Stop", "x": in_output});
+    let unknown_event = json!({"session_id": "s", "hook_event_name": in_output});
+    for stdin in [
+        unparsable,
+        no_session.to_string(),
+        unknown_event.to_string(),
+    ] {
+        assert_silent_success(&run_in(project.path(), stdin.as_bytes()));
     }
 
-    #[test]
-    fn a_failed_snapshot_is_logged_and_exits_zero() {
-        // No shadow store: the snapshot cannot store the new file.
-        let project = project();
-        fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let stdin = fs::read(&fixtures()[0]).unwrap();
-
-        let output = run_with_snapshot(project.path(), &stdin);
-        assert_silent_success(&output);
-        let lines = error_lines(project.path());
-        assert_eq!(lines.len(), 1, "{lines:?}");
+    let yalper_dir = project.path().join(YALPER_DIR);
+    let read = |name: &str| fs::read(yalper_dir.join(name)).unwrap_or_default();
+    let mut database = read(DATABASE_FILE);
+    database.extend(read(&format!("{DATABASE_FILE}-wal")));
+    let errors_log = read(ERRORS_LOG);
+    assert_eq!(
+        error_lines(project.path()).len(),
+        2,
+        "the failed calls are logged"
+    );
+    for secret in [&in_prompt, &in_output, &in_columns] {
+        let body = &secret["ghp_".len()..];
+        assert!(!contains(&database, body), "{secret} reached the database");
+        assert!(!contains(&errors_log, body), "{secret} reached errors.log");
     }
+    // The steps were recorded, with the secrets masked.
+    assert!(contains(&database, "[REDACTED:github-pat]"));
+    let events = recorded_events(project.path());
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].agent_id.as_deref(), Some("[REDACTED:github-pat]"));
 }

@@ -28,6 +28,19 @@ impl HookEvent {
             other => Self::Other(other.to_owned()),
         }
     }
+
+    /// The event's name as Claude Code sends it, or `None` for an event Yalper does not register for.
+    pub fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::SessionStart => Some("SessionStart"),
+            Self::UserPromptSubmit => Some("UserPromptSubmit"),
+            Self::PostToolUse => Some("PostToolUse"),
+            Self::PostToolUseFailure => Some("PostToolUseFailure"),
+            Self::Stop => Some("Stop"),
+            Self::SessionEnd => Some("SessionEnd"),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 /// One hook call from Claude Code.
@@ -230,6 +243,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.duration_ms, Some(13));
+    }
+
+    #[test]
+    fn known_event_names_round_trip() {
+        for name in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert_eq!(HookEvent::from_name(name).name(), Some(name));
+        }
+        assert_eq!(HookEvent::from_name("PostToolBatch").name(), None);
     }
 
     #[test]
