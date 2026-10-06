@@ -19,14 +19,16 @@
 //! with `\"` and `\\` unescaped (JSON escaped twice, as in logs).
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
 use regex_automata::meta::{self, Regex};
 use regex_automata::util::syntax;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Longer strings are cut to this many bytes and end with `[TRUNCATED: <original length> bytes in total]`.
 pub const MAX_STRING_BYTES: usize = 256 * 1024;
@@ -35,13 +37,26 @@ pub const MAX_STRING_BYTES: usize = 256 * 1024;
 /// its truncation marker. Real payloads rarely come close.
 pub const MAX_JSON_TEXT_BYTES: usize = 1024 * 1024;
 
-/// How long one [`redact_json`] or [`redact_str`] call may take. Its cost is the text's size times the
-/// number of rules whose keywords occur, and hostile text (a file the agent reads, a command's output) can
-/// contain every keyword: up to about 0.7 s for one 256 KiB string and 1.4 s for a payload were measured.
-/// The deadline is checked before each rule runs; once it has passed, the current string and every later
-/// one are replaced by their truncation marker, never written raw. So a hostile payload costs about 50 ms
-/// (plus at most one rule run), and normal payloads take a few milliseconds.
+/// How long one [`redact_json`] or [`redact_str`] call may take in a release build (debug builds allow
+/// [`DEBUG_DEADLINE_FACTOR`] times more). Its cost is the text's size times the number of rules whose
+/// keywords occur, and hostile text (a file the agent reads, a command's output) can contain every keyword
+/// (up to 1.4 s per payload measured), or target one slow rule (one rule run over 256 KiB measured at
+/// 0.6 s). So:
+/// - from four fifths of the deadline, checked before each rule runs, the current string and every later
+///   one are replaced by their truncation marker, and the redaction returns early with what it has done;
+/// - a payload with more than 4 KiB of text is redacted on a worker thread. At the deadline, if the worker
+///   has not returned (stuck in one rule run), the call returns the payload with every string and key
+///   replaced by its truncation marker, and the worker is left to die with the process. Smaller payloads
+///   run on the calling thread, where one rule run cannot take much more than 10 ms.
+///
+/// Either way nothing is written raw. Normal payloads take a few milliseconds.
 pub const DEADLINE: Duration = Duration::from_millis(50);
+
+/// Debug builds run the rules many times slower: normal payloads of 100 to 256 KiB take 40 to 60 ms.
+pub const DEBUG_DEADLINE_FACTOR: u32 = 40;
+
+/// Values with at most this much text are redacted on the calling thread (see `redact_json_bounded`).
+const INLINE_TEXT_BYTES: usize = 4 * 1024;
 
 /// What each string costs from [`MAX_JSON_TEXT_BYTES`] on top of its length: the fixed work of scanning
 /// one string, so that a payload of millions of tiny strings is bounded too.
@@ -67,6 +82,8 @@ struct Rule {
     entropy: f64,
     /// gitleaks' allowlist `^[a-zA-Z_.-]+$`: a secret made only of these is a plain identifier.
     letters_only_allowlist: bool,
+    /// The capture groups are alternatives for the secret (Yalper rules): the first non-empty one is masked.
+    alternative_groups: bool,
 }
 
 // Defines `RULE_COUNT`, `RULES`, `KEYWORDS` (lowercase, sorted) and `KEYWORD_RULES` (for each keyword,
@@ -76,30 +93,137 @@ include!(concat!(env!("OUT_DIR"), "/rules.rs"));
 /// Redacts every string in `value`, object keys included, in place. In each object, keys come first, then
 /// string values from the shortest, then nested arrays and objects, so short metadata is not lost when the
 /// budget or the deadline runs out. Each string is cut to [`MAX_STRING_BYTES`] and the whole value to
-/// [`MAX_JSON_TEXT_BYTES`]; the call stops scanning at [`DEADLINE`].
+/// [`MAX_JSON_TEXT_BYTES`]; the call returns within [`DEADLINE`].
 pub fn redact_json(value: &mut Value) {
-    redact_json_until(value, Instant::now() + deadline());
+    redact_json_within(value, deadline());
 }
 
 /// `text` with its secrets masked and cut to [`MAX_STRING_BYTES`], or `None` when it is unchanged. Becomes
 /// a truncation marker if scanning takes longer than [`DEADLINE`].
 pub fn redact_str(text: &str) -> Option<String> {
-    let mut pass = Pass::new(Instant::now() + deadline());
-    redact_string(text, None, &mut pass)
+    let mut value = Value::String(text.to_owned());
+    redact_json(&mut value);
+    match value {
+        Value::String(redacted) if redacted != text => Some(redacted),
+        _ => None,
+    }
 }
 
-/// [`DEADLINE`], except in this module's unit tests, which run unoptimized and in parallel; the tests of the
-/// deadline itself set their own.
 fn deadline() -> Duration {
-    if cfg!(test) {
-        Duration::from_secs(60)
+    if cfg!(debug_assertions) {
+        DEADLINE * DEBUG_DEADLINE_FACTOR
     } else {
         DEADLINE
     }
 }
 
-fn redact_json_until(value: &mut Value, deadline: Instant) {
-    redact_value(value, &mut Pass::new(deadline));
+/// Redacts `value` within `limit` (see [`DEADLINE`]).
+fn redact_json_within(value: &mut Value, limit: Duration) {
+    redact_json_bounded(value, limit * 4 / 5, limit);
+}
+
+/// Redacts `value`, stopping the scan after `soft` and returning markers after `hard`.
+///
+/// Small values run on the calling thread: one rule run over [`INLINE_TEXT_BYTES`] takes at most about
+/// 10 ms (2.5 µs per byte for the slowest rule on targeted input), and a worker thread costs 0.4 to 0.7 ms
+/// on Windows, more when several calls each warm up the rules' caches on a new thread. Larger values run
+/// on a worker thread, abandoned if it has not returned at `hard` (on Windows the wait can end up to one
+/// timer tick, about 15 ms, late).
+fn redact_json_bounded(value: &mut Value, soft: Duration, hard: Duration) {
+    let start = Instant::now();
+    let mut inline_budget = INLINE_TEXT_BYTES;
+    if fits_in(value, &mut inline_budget) {
+        redact_value(value, &mut Pass::new(start + soft));
+        return;
+    }
+    // Built before the payload moves to the worker, for when the worker does not return in time.
+    let markers = markers_only(value);
+    let payload = std::mem::take(value);
+    let soft_deadline = start + soft;
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("yalper-redact".into())
+        .spawn(move || {
+            let mut payload = payload;
+            redact_value(&mut payload, &mut Pass::new(soft_deadline));
+            // The receiver is gone if the call already returned the markers.
+            let _ = sender.send(payload);
+        });
+    *value = match worker {
+        Ok(_) => receiver
+            .recv_timeout(hard.saturating_sub(start.elapsed()))
+            .unwrap_or(markers),
+        // The payload was dropped with the closure; nothing raw is kept.
+        Err(_) => markers,
+    };
+}
+
+/// Whether the strings and keys of `value` hold at most `budget` bytes, each counting
+/// [`STRING_COST_BYTES`] more. Stops as soon as they do not.
+fn fits_in(value: &Value, budget: &mut usize) -> bool {
+    fn charge(text: &str, budget: &mut usize) -> bool {
+        match budget.checked_sub(text.len() + STRING_COST_BYTES) {
+            Some(left) => {
+                *budget = left;
+                true
+            }
+            None => false,
+        }
+    }
+    match value {
+        Value::String(text) => charge(text, budget),
+        Value::Array(items) => items.iter().all(|item| fits_in(item, budget)),
+        Value::Object(map) => map
+            .iter()
+            .all(|(key, item)| charge(key, budget) && fits_in(item, budget)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+/// `value` with every string and key replaced by its truncation marker.
+fn markers_only(value: &Value) -> Value {
+    match value {
+        Value::String(text) if !text.is_empty() => Value::String(truncation_marker(text.len())),
+        Value::Array(items) => Value::Array(items.iter().map(markers_only).collect()),
+        Value::Object(map) => {
+            let mut markers = Map::new();
+            let mut taken = HashMap::new();
+            for (key, item) in map {
+                let key = if key.is_empty() {
+                    key.clone()
+                } else {
+                    truncation_marker(key.len())
+                };
+                insert_unique(&mut markers, &mut taken, key, markers_only(item));
+            }
+            Value::Object(markers)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Inserts `item` under `key`, or under `key #2`, `key #3`, ... when the key is already taken (two keys
+/// that became the same marker or the same redacted text). `taken` holds the next suffix to try per key,
+/// so many equal keys cost linear time.
+fn insert_unique(
+    map: &mut Map<String, Value>,
+    taken: &mut HashMap<String, usize>,
+    key: String,
+    item: Value,
+) {
+    if !map.contains_key(&key) {
+        map.insert(key, item);
+        return;
+    }
+    let next = taken.entry(key.clone()).or_insert(2);
+    loop {
+        let candidate = format!("{key} #{next}");
+        *next += 1;
+        if !map.contains_key(&candidate) {
+            map.insert(candidate, item);
+            return;
+        }
+    }
 }
 
 /// The limits of one redaction call.
@@ -136,7 +260,23 @@ fn redact_value(value: &mut Value, pass: &mut Pass) {
                 *text = redacted;
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(|item| redact_value(item, pass)),
+        Value::Array(items) => {
+            // In an argument list, a string after a short flag (`["--password", "..."]`) is scanned with
+            // the flag, like an object value with its key.
+            let mut flag: Option<String> = None;
+            for item in items {
+                let Value::String(text) = item else {
+                    flag = None;
+                    redact_value(item, pass);
+                    continue;
+                };
+                let next_flag = (text.starts_with('-') && text.len() <= 64).then(|| text.clone());
+                if let Some(redacted) = redact_string(text, flag.as_deref(), pass) {
+                    *text = redacted;
+                }
+                flag = next_flag;
+            }
+        }
         Value::Object(map) => {
             let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             let keys: Vec<Option<String>> = entries
@@ -161,10 +301,9 @@ fn redact_value(value: &mut Value, pass: &mut Pass) {
                     redact_value(item, pass);
                 }
             }
-            // If two keys became equal (after redaction, or as markers), the later entry replaces the
-            // earlier one.
+            let mut taken = HashMap::new();
             for ((key, item), redacted) in entries.into_iter().zip(keys) {
-                map.insert(redacted.unwrap_or(key), item);
+                insert_unique(map, &mut taken, redacted.unwrap_or(key), item);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -227,24 +366,26 @@ struct Secret {
 }
 
 /// The secrets of a string, on its character boundaries, sorted and merged so that no two overlap: found
-/// in the string itself, in it with `\"` and `\\` unescaped, and with the key it is the value of.
+/// in the string (with `\"` and `\\` unescaped when it contains `\"`), and with the key it is the value of.
 fn string_secrets(
     text: &str,
     key: Option<&str>,
     deadline: Instant,
 ) -> Result<Vec<Secret>, Expired> {
-    let mut secrets = find_secrets(text, deadline)?;
-
-    if text.contains("\\\"") {
-        let (unescaped, offsets) = unescape_quotes(text);
-        for secret in find_secrets(&unescaped, deadline)? {
-            secrets.push(Secret {
-                start: offsets[secret.start],
-                end: offsets[secret.end],
+    // Unescaping keeps every secret of the escaped form findable, so only one form is scanned.
+    let mut secrets = if text.contains("\\\"") {
+        let (unescaped, unescaped_at) = unescape_quotes(text);
+        find_secrets(&unescaped, deadline)?
+            .into_iter()
+            .map(|secret| Secret {
+                start: original_offset(&unescaped_at, secret.start),
+                end: original_offset(&unescaped_at, secret.end),
                 ..secret
-            });
-        }
-    }
+            })
+            .collect()
+    } else {
+        find_secrets(text, deadline)?
+    };
 
     if let Some(key) = key {
         let key = &key[ceil_char_boundary(key, key.len().saturating_sub(PAIR_KEY_BYTES))..];
@@ -256,7 +397,14 @@ fn string_secrets(
         let value_start = key.len() + 5;
         for secret in find_secrets(&pair, deadline)? {
             let start = secret.start.max(value_start) - value_start;
-            let end = secret.end.saturating_sub(value_start).min(value_end);
+            let mut end = secret.end.saturating_sub(value_start).min(value_end);
+            // A secret that runs into the cut of the value (rules may match up to the end of the text)
+            // continues to the end of its token in the real value.
+            if end == value_end && value_end < text.len() {
+                end = text[value_end..]
+                    .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ';'))
+                    .map_or(text.len(), |offset| value_end + offset);
+            }
             if start < end {
                 secrets.push(Secret {
                     start,
@@ -282,26 +430,30 @@ fn string_secrets(
     Ok(merged)
 }
 
-/// `text` with `\"` and `\\` unescaped, and for each byte of the result, plus its end, the offset of that
-/// byte in `text`.
+/// `text` with `\"` and `\\` unescaped, and the positions in the result of the characters that lost their
+/// backslash (see [`original_offset`]).
 fn unescape_quotes(text: &str) -> (String, Vec<usize>) {
     let bytes = text.as_bytes();
     let mut unescaped = Vec::with_capacity(bytes.len());
-    let mut offsets = Vec::with_capacity(bytes.len() + 1);
+    let mut unescaped_at = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        // An escape pair maps to its backslash, so a secret that ends before `\"` ends before the `\`.
-        offsets.push(index);
         if bytes[index] == b'\\' && matches!(bytes.get(index + 1), Some(b'"' | b'\\')) {
+            unescaped_at.push(unescaped.len());
             index += 1;
         }
         unescaped.push(bytes[index]);
         index += 1;
     }
-    offsets.push(bytes.len());
     // Only ASCII backslashes were removed, so the result is still UTF-8.
     let unescaped = String::from_utf8(unescaped).expect("removing ASCII bytes keeps UTF-8 valid");
-    (unescaped, offsets)
+    (unescaped, unescaped_at)
+}
+
+/// The offset in the escaped text of offset `index` in the unescaped text. An unescaped character maps to
+/// its backslash, so a secret that ends before `\"` ends before the `\`.
+fn original_offset(unescaped_at: &[usize], index: usize) -> usize {
+    index + unescaped_at.partition_point(|&position| position < index)
 }
 
 /// The secrets the rules find in `text` (unsorted, may overlap), or `Expired` if the deadline passes
@@ -371,9 +523,10 @@ fn find_secrets(text: &str, deadline: Instant) -> Result<Vec<Secret>, Expired> {
 /// Whether a match of `rule`, whose regex has `group_len` groups counting the whole match, is masked
 /// whole. Without a secret group, gitleaks reports the first non-empty group; when a rule has several,
 /// they are classifiers or fragments (`jwt-base64` captures the header type, `microsoft-teams-webhook` a
-/// 5-character piece), so masking only that group would write most of the secret raw.
+/// 5-character piece), so masking only that group would write most of the secret raw. Yalper's own rules
+/// use several groups only as alternatives for the secret.
 fn masks_whole_match(rule: &Rule, group_len: usize) -> bool {
-    rule.secret_group == 0 && group_len > 2
+    rule.secret_group == 0 && group_len > 2 && !rule.alternative_groups
 }
 
 /// gitleaks' `^[a-zA-Z_.-]+$`.
@@ -535,8 +688,13 @@ mod tests {
                 assert!(rule.secret_group == 0 && groups > 2, "{}", rule.id);
                 whole.push(rule.id);
             } else {
-                // A rule masks its secret group, its only group, or (no group) the whole match.
-                assert!(rule.secret_group > 0 || groups <= 2, "{}", rule.id);
+                // A rule masks its secret group, its only group, (no group) the whole match, or (Yalper
+                // rules) the first of its alternative groups.
+                assert!(
+                    rule.secret_group > 0 || groups <= 2 || rule.alternative_groups,
+                    "{}",
+                    rule.id
+                );
             }
         }
         for id in [
@@ -560,6 +718,7 @@ mod tests {
             [
                 "generic-api-key",
                 "yalper-password-assignment",
+                "yalper-password-value",
                 "yalper-bearer-token"
             ]
         );
@@ -909,9 +1068,106 @@ mod tests {
         );
         assert_masked(&escaped, &lines[0], "yalper-private-key-partial");
 
-        // Code that only mentions the header is kept.
-        let code = "if pem.starts_with(\"-----BEGIN RSA PRIVATE KEY-----\") { return Kind::Rsa; }";
-        assert_eq!(redact_str(code), None);
+        // On one line, or with spaces instead of newlines.
+        for separator in ["", " "] {
+            let text = format!(
+                "pasted -----BEGIN {} KEY-----{separator}{}",
+                "RSA PRIVATE",
+                lines[..3].join(separator)
+            );
+            let result = assert_masked(&text, &lines[2], "yalper-private-key-partial");
+            assert_eq!(result, "pasted [REDACTED:yalper-private-key-partial]");
+        }
+
+        // A header in code or in prose, without a key body, leaves the rest of the text alone.
+        for text in [
+            "if pem.starts_with(\"-----BEGIN RSA PRIVATE KEY-----\") {\n    return Kind::Rsa;\n}\n",
+            "const HEADER: &str = \"-----BEGIN PRIVATE KEY-----\\n\";\nfn parse(text: &str) {}\n",
+            "Paste the key, which starts with -----BEGIN OPENSSH PRIVATE KEY-----\nand ends with the END line, \
+             into the settings page. Never commit it.\n",
+        ] {
+            assert_eq!(redact_str(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn passwords_with_symbols_are_masked() {
+        for (text, password) in [
+            ("DB_PASSWORD=P@ssw0rd!2024xQ\n", "P@ssw0rd!2024xQ"),
+            (
+                "POSTGRES_PASSWORD: \"S3cr3t#Pass!word\"\n",
+                "S3cr3t#Pass!word",
+            ),
+            ("{\"password\": \"Tr0ub4dor&3xyz!Q\"}", "Tr0ub4dor&3xyz!Q"),
+        ] {
+            let result = redacted(text);
+            assert!(!result.contains(password), "{result}");
+            assert!(
+                result.contains("[REDACTED:yalper-password-value]"),
+                "{result}"
+            );
+        }
+        let mut value = json!({ "env": { "password": "Tr0ub4dor&3xyz!Q" } });
+        redact_json(&mut value);
+        assert_eq!(value["env"]["password"], "[REDACTED:yalper-password-value]");
+
+        for text in [
+            "DB_PASSWORD=${DB_PASSWORD}",
+            "password: ${DB_PASSWORD}",
+            "let password = getPassword();",
+            "password = user.getPassword(realm)",
+            "struct Login { password: Option<String>, hash: Vec<u8> }",
+            "password: process.env.DB_PASSWORD,",
+        ] {
+            assert_eq!(redact_str(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn command_line_passwords_are_masked() {
+        let password = fake(ALNUM, 12, 44);
+        for command in [
+            format!("mysql -u root -p{password} shop"),
+            format!("mysqldump -h db -uroot -p'{password}' shop > dump.sql"),
+            format!("sshpass -p {password} ssh deploy@host"),
+            format!("docker login -u ci -p {password} registry.example.com"),
+            format!("helm registry login ghcr.io --username ci --password={password}"),
+            format!("app --password {password} --verbose"),
+        ] {
+            let result = redacted(&command);
+            assert!(!result.contains(&password), "{result}");
+        }
+        let mut argv = json!(["psql-wrapper", "--password", password]);
+        redact_json(&mut argv);
+        assert!(!argv.to_string().contains(&password), "{argv}");
+        let mut args = json!({ "args": format!("[\"--password\", \"{password}\"]") });
+        redact_json(&mut args);
+        assert!(!args.to_string().contains(&password), "{args}");
+
+        for text in [
+            "mysql -u root -p shop",
+            "mysql -h db -P3306 -u app shop",
+            "docker login --password-stdin ghcr.io",
+            "app --password $APP_PASSWORD",
+        ] {
+            assert_eq!(redact_str(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_long_value_found_through_its_key_is_masked_to_the_end_of_the_token() {
+        let key = fake(
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+            2000,
+            45,
+        );
+        let mut value = json!({ "data": { "tls.key": format!("{key}=="), "tls.crt": "n/a" } });
+        redact_json(&mut value);
+        assert_eq!(value["data"]["tls.key"], "[REDACTED:generic-api-key]");
+
+        let mut value = json!({ "secret": format!("{key} and more text") });
+        redact_json(&mut value);
+        assert_eq!(value["secret"], "[REDACTED:generic-api-key] and more text");
     }
 
     #[test]
@@ -1036,36 +1292,83 @@ mod tests {
     #[test]
     fn after_the_deadline_strings_become_markers() {
         let github = format!("ghp_{}", fake(ALNUM, 36, 41));
-        let mut payload = json!({ "a": format!("token {github}"), "bb": ["plain", ""], "ccc": 1 });
-        redact_json_until(&mut payload, Instant::now());
+        let mut payload = json!({
+            "a": format!("token {github}"),
+            "b": "same length key",
+            "cc": ["plain", ""],
+            "ddd": 1,
+        });
+        redact_json_within(&mut payload, Duration::ZERO);
         assert_eq!(
             payload,
             json!({
                 "[TRUNCATED: 1 bytes in total]": "[TRUNCATED: 46 bytes in total]",
+                "[TRUNCATED: 1 bytes in total] #2": "[TRUNCATED: 15 bytes in total]",
                 "[TRUNCATED: 2 bytes in total]": ["[TRUNCATED: 5 bytes in total]", ""],
                 "[TRUNCATED: 3 bytes in total]": 1,
             })
         );
     }
 
+    /// `{"tool_response": [text, text, text, text]}`.
+    fn four_copies(text: &str) -> Value {
+        json!({ "tool_response": [text, text, text, text] })
+    }
+
     #[test]
     fn hostile_text_stops_at_the_deadline_without_leaking() {
-        // Every keyword followed by an assignment, so every rule runs over the whole string.
+        // Every keyword followed by an assignment, so every rule runs over the whole string. Unoptimized
+        // test builds cannot finish one copy in time.
         let keywords = KEYWORDS.join("_v = \"Zq8Lx3Vn7Rb2Kt9Ws4Pd6\"\n");
-        let github = format!("ghp_{}", fake(ALNUM, 36, 42));
         let mut text = keywords.repeat(MAX_STRING_BYTES / keywords.len() + 1);
         text.truncate(MAX_STRING_BYTES - 100);
-        text.push_str(&github);
-        let mut payload =
-            json!({ "tool_response": [text.clone(), text.clone(), text.clone(), text] });
+        text.push_str(&format!("ghp_{}", fake(ALNUM, 36, 42)));
+        let mut payload = four_copies(&text);
         let start = Instant::now();
-        redact_json_until(&mut payload, start + DEADLINE);
+        redact_json_within(&mut payload, DEADLINE);
         let elapsed = start.elapsed();
-        // Debug builds run every rule much slower; the margin covers one rule run past the deadline.
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
-        let output = payload.to_string();
-        assert!(!output.contains(&github));
-        assert!(output.contains("[TRUNCATED: "));
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        // Either the worker stopped before a rule run (the key was done by then) or the call gave up on
+        // it (every key is a marker too).
+        let (key, strings) = payload.as_object().unwrap().iter().next().unwrap();
+        assert!(
+            key == "tool_response" || *key == truncation_marker(13),
+            "{key}"
+        );
+        let marker = Value::String(truncation_marker(text.len()));
+        assert_eq!(strings, &json!([marker, marker, marker, marker]));
+    }
+
+    #[test]
+    fn a_worker_stuck_in_one_rule_is_abandoned_at_the_deadline() {
+        // `pwd` and up to 7 random name characters, repeated: one run of the password rules over this
+        // takes about half a second even in a release build. With no early stop, only the hard deadline
+        // returns.
+        let lengths = fake(b"01234567", MAX_STRING_BYTES / 3, 43);
+        let names = fake(
+            b"abcdefghijklmnopqrstuvwxyz0123456789_.-",
+            MAX_STRING_BYTES,
+            44,
+        );
+        let (mut text, mut position) = (String::new(), 0);
+        for length in lengths.bytes().map(|digit| usize::from(digit - b'0')) {
+            if text.len() >= MAX_STRING_BYTES {
+                break;
+            }
+            text.push_str("pwd");
+            text.push_str(&names[position..position + length]);
+            position += length;
+        }
+        let mut payload = four_copies(&text);
+        let start = Instant::now();
+        redact_json_bounded(&mut payload, Duration::from_secs(600), DEADLINE);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        let marker = truncation_marker(text.len());
+        assert_eq!(
+            payload,
+            json!({ truncation_marker(13): [marker, marker, marker, marker] })
+        );
     }
 
     #[test]

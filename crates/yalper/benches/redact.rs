@@ -100,6 +100,27 @@ fn every_keyword(bytes: usize) -> String {
     text
 }
 
+/// A hostile string aimed at one slow rule: `pwd` and 0 to 7 random name characters, repeated. One run
+/// of the password rules over it takes about half a second.
+fn one_slow_rule(bytes: usize) -> String {
+    const NAME: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_.-";
+    let mut state: u64 = 7;
+    let mut next = |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    let mut text = String::with_capacity(bytes + 16);
+    while text.len() < bytes {
+        text.push_str("pwd");
+        for _ in 0..next(8) {
+            text.push(char::from(NAME[next(NAME.len() as u64) as usize]));
+        }
+    }
+    text
+}
+
 /// A `PostToolUse` payload whose tool output is `output`.
 fn payload(output: String) -> Value {
     json!({
@@ -148,6 +169,11 @@ const CASES: &[Case] = &[
         changes: true,
     },
     Case {
+        name: "code with 2 secrets, 100 KB, JSON-escaped (contains \\\")",
+        build: || payload(serde_json::to_string(&code_with_secrets(100 * KB)).unwrap()),
+        changes: true,
+    },
+    Case {
         name: "code, 256 KiB",
         build: || payload(code_text(256 * 1024)),
         changes: false,
@@ -155,6 +181,11 @@ const CASES: &[Case] = &[
     Case {
         name: "every keyword, 256 KiB (hostile)",
         build: || payload(every_keyword(256 * 1024)),
+        changes: true,
+    },
+    Case {
+        name: "one slow rule, 256 KiB (hostile)",
+        build: || payload(one_slow_rule(256 * 1024)),
         changes: true,
     },
     Case {

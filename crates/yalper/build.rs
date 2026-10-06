@@ -65,6 +65,8 @@ fn main() {
                     .get("lettersOnlyAllowlist")
                     .and_then(toml::Value::as_bool)
                     .unwrap_or(false);
+            // Yalper rules write their groups as alternatives for the secret (see `rules/yalper.toml`).
+            let alternative_groups = file == YALPER_RULES;
             let rule_keywords = rule
                 .get("keywords")
                 .and_then(toml::Value::as_array)
@@ -82,7 +84,8 @@ fn main() {
             writeln!(
                 table,
                 "    Rule {{ id: {id:?}, regex: {regex:?}, secret_group: {secret_group}, \
-                 entropy: {entropy:?}, letters_only_allowlist: {letters_only_allowlist} }},"
+                 entropy: {entropy:?}, letters_only_allowlist: {letters_only_allowlist}, \
+                 alternative_groups: {alternative_groups} }},"
             )
             .unwrap();
             count += 1;
