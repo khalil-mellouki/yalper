@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
@@ -284,7 +284,7 @@ fn a_claude_code_session_is_recorded_inspected_and_uninstalled() {
 
     // No hook ran into an error, and the session left the user's git repository as init left it.
     assert!(!root.join(YALPER_DIR).join(ERRORS_LOG).exists());
-    assert_eq!(files(&root.join(".git")), git_dir_after_init);
+    assert_same_files(files(&root.join(".git")), git_dir_after_init);
 
     // 3. Inspect the session from the terminal: every step in order, with the number of files it changed.
     insta::assert_snapshot!(shown(root, &run(root, &["log"])), @r"
@@ -492,7 +492,7 @@ fn a_claude_code_session_is_recorded_inspected_and_uninstalled() {
         .get_mut(&root.join(".git").join("info").join("exclude"))
         .unwrap()
         .extend_from_slice(b".claude/settings.local.json\n");
-    assert_eq!(files(&root.join(".git")), expected_git_dir);
+    assert_same_files(files(&root.join(".git")), expected_git_dir);
     assert_eq!(without_setup(files(root)), project_files);
 }
 
@@ -708,4 +708,30 @@ fn git_in_store(store: &Path, args: &[&str]) -> Output {
         .unwrap();
     assert!(output.status.success(), "git {args:?}: {output:?}");
     output
+}
+
+/// Checks that `actual` and `expected` hold the same files with the same contents, naming the paths that
+/// differ instead of printing every file.
+fn assert_same_files(actual: BTreeMap<PathBuf, Vec<u8>>, expected: BTreeMap<PathBuf, Vec<u8>>) {
+    let differing: Vec<String> = actual
+        .keys()
+        .chain(expected.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| actual.get(*path) != expected.get(*path))
+        .map(|path| {
+            let text = |files: &BTreeMap<PathBuf, Vec<u8>>| {
+                files.get(path).map(|bytes| {
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).into_owned()
+                })
+            };
+            format!(
+                "{}: {:?} instead of {:?}",
+                path.display(),
+                text(&actual),
+                text(&expected)
+            )
+        })
+        .collect();
+    assert!(differing.is_empty(), "{differing:#?}");
 }
