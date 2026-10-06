@@ -789,7 +789,13 @@ mod tests {
         let store_dir = root.join(".yalper").join(SNAPSHOTS_DIR);
         assert_eq!(loose_objects(&store_dir).len(), 4, "two blobs, two trees");
 
-        assert_eq!(contents(&root.join(".git")), before);
+        let after = contents(&root.join(".git"));
+        let differing: Vec<&String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .collect();
+        assert!(differing.is_empty(), "changed in .git: {differing:?}");
     }
 
     const ISOLATION_HOME: &str = "YALPER_TEST_ISOLATION_HOME";
