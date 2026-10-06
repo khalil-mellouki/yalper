@@ -395,10 +395,17 @@ impl Store {
         Ok(())
     }
 
-    /// Every session, newest first.
+    /// Every session, the most recently active first: by the time of its last step, or of its start if it
+    /// has none. A session resumed today comes before one started yesterday, even if it started last week.
     pub fn sessions(&self) -> Result<Vec<Session>> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY started_at_ms DESC, id"
+            "SELECT {SESSION_COLUMNS} FROM sessions
+             ORDER BY COALESCE(
+                          (SELECT ts_ms FROM events WHERE session_id = sessions.id ORDER BY step DESC LIMIT 1),
+                          started_at_ms
+                      ) DESC,
+                      started_at_ms DESC,
+                      id"
         ))?;
         let sessions = statement
             .query_map([], session_from_row)?
@@ -410,6 +417,23 @@ impl Store {
     pub fn events(&self, session_id: &str) -> Result<Vec<Event>> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT {EVENT_COLUMNS} FROM events WHERE session_id = ?1 ORDER BY step"
+        ))?;
+        let events = statement
+            .query_map([session_id], event_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(events)
+    }
+
+    /// The steps of a session, in order, for a listing: like [`events`](Self::events), but the payload has no
+    /// `tool_response`, the part that can be large and that a listing does not show. A payload that is not
+    /// valid JSON becomes `Value::Null` instead of failing the whole listing.
+    pub fn events_without_output(&self, session_id: &str) -> Result<Vec<Event>> {
+        let columns = EVENT_COLUMNS.replace(
+            "payload",
+            "CASE WHEN json_valid(payload) THEN json_remove(payload, '$.tool_response') END",
+        );
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {columns} FROM events WHERE session_id = ?1 ORDER BY step"
         ))?;
         let events = statement
             .query_map([session_id], event_from_row)?
@@ -990,6 +1014,44 @@ mod tests {
             .map(|s| s.id)
             .collect();
         assert_eq!(ids, ["new", "middle", "old"]);
+
+        // A step makes the old session the most recently active one.
+        let mut step = event("old", 1);
+        step.ts_ms = 10;
+        store.insert_event(&step).unwrap();
+        let ids: Vec<String> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["old", "new", "middle"]);
+    }
+
+    #[test]
+    fn a_listing_leaves_out_the_tool_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        store.upsert_session(&Session::new("s1", 1)).unwrap();
+        let mut with_output = event("s1", 1);
+        with_output.payload =
+            json!({"tool_input": {"command": "ls"}, "tool_response": "x".repeat(1000)});
+        store.insert_event(&with_output).unwrap();
+        store.insert_event(&event("s1", 2)).unwrap();
+        store
+            .conn
+            .execute("UPDATE events SET payload = 'not json' WHERE step = 2", [])
+            .unwrap();
+
+        let listed = store.events_without_output("s1").unwrap();
+        let mut expected = with_output.clone();
+        expected.payload = json!({"tool_input": {"command": "ls"}});
+        assert_eq!(listed[0], expected);
+        let mut invalid = event("s1", 2);
+        invalid.payload = Value::Null;
+        assert_eq!(listed[1], invalid);
+        assert_eq!(listed.len(), 2);
     }
 
     #[test]

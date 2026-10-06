@@ -2,6 +2,7 @@
 
 pub mod hook;
 pub mod init;
+pub mod log;
 pub mod record;
 pub mod redact;
 pub mod repo;

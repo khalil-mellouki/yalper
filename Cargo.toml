@@ -21,6 +21,10 @@ getrandom = "0.4"
 gix = { version = "0.88", default-features = false, features = ["sha1"] }
 # ripgrep's directory walker: `.gitignore`, `.git/info/exclude` and global excludes, in parallel threads.
 ignore = "0.4"
+# Snapshot tests: compares command output with the expected text kept in the test.
+insta = { version = "1", default-features = false }
+# Dates and times in the user's time zone for `yalper log`. Already built, with the same features, for gix.
+jiff = "0.2"
 # `bundled` compiles SQLite into the binary, so users install nothing else.
 rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
 # The engine behind the `regex` crate, used directly to tune how secret rules compile. Unicode is off for
