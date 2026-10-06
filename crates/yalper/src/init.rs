@@ -5,6 +5,7 @@
 //! settings file from git, and registers `yalper hook` for Claude Code in that settings file. Running it again
 //! changes nothing, and nothing the user already had in the settings file is removed.
 
+use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -12,16 +13,19 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::hook::{HookEvent, YALPER_DIR};
-use crate::repo::{self, GIT_ID_FILE, ID_FILE, Token, YalperDir};
+use crate::repo::{self, GIT_ID_FILE, ID_FILE, Refusal, Token, YalperDir};
 use crate::safe_fs::{self, Access, OwnedDir};
 use crate::snapshot::{self, SNAPSHOTS_DIR, ShadowStore};
-use crate::store::{LOCK_TIMEOUT, Store, WriterLock};
+use crate::store::{self, DATABASE_FILE, LOCK_TIMEOUT, Store, WriterLock};
 
 /// Claude Code's settings folder at the repository root.
 pub const CLAUDE_DIR: &str = ".claude";
 
 /// Claude Code's personal (never committed) project settings file, inside [`CLAUDE_DIR`].
 pub const SETTINGS_FILE: &str = "settings.local.json";
+
+/// Claude Code's shared (committed) project settings file, inside [`CLAUDE_DIR`]. Yalper never writes it.
+pub const SHARED_SETTINGS_FILE: &str = "settings.json";
 
 /// The events Yalper registers `yalper hook` for. No `PreToolUse`: the Post events carry the tool input too,
 /// and a call denied before it ran changed nothing.
@@ -41,16 +45,29 @@ pub const HOOK_TIMEOUT_SECONDS: u64 = 30;
 /// The lines `yalper init` adds to the repository's `info/exclude`.
 pub const EXCLUDE_LINES: [&str; 2] = [".yalper/", ".claude/settings.local.json"];
 
+/// Settings, besides hooks, whose value is a command Claude Code runs.
+const COMMAND_SETTINGS: [&str; 4] = [
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "otelHeadersHelper",
+];
+
 /// A settings file larger than this is not read.
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024 * 1024;
 
+/// A command listed in init's output is cut after this many characters.
+const MAX_LISTED_COMMAND_CHARS: usize = 120;
+
+const BOM: char = '\u{feff}';
+
 /// Sets up Yalper in the git repository around `start`, registering `exe` as the hook command, and reports
-/// each step to `out`. A `.yalper/` that Yalper cannot use (not created by `yalper init` for this repository,
-/// or with contents that belong to another one) is refused, unless `recreate` is set: then it is deleted and
-/// created again.
+/// each step to `out`. A `.yalper/` that Yalper cannot use because it was not created by `yalper init` for
+/// this repository, or holds contents created for another one, is refused unless `recreate` is set: then it
+/// is deleted and created again.
 ///
-/// Nothing is written when the repository root, its git directory, the settings file, or (without `recreate`)
-/// an existing `.yalper/` is unusable. Returns the message to show when setup fails.
+/// Nothing is written when the repository root, its git directory, the settings file, or an existing
+/// `.yalper/` is unusable. Returns the message to show when setup fails.
 pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Result<(), String> {
     let root = repo::find_root(start).ok_or_else(|| {
         format!(
@@ -59,19 +76,19 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
             start.display()
         )
     })?;
-    let unreadable_git = || {
+    let no_git_dir = || {
         format!(
-            "cannot find the git directory of {}: its .git file names a folder that does not exist",
+            "cannot find the git directory of {}: its .git does not lead to a git directory",
             root.display()
         )
     };
     let git_dir = repo::git_dir(root)
-        .filter(|dir| dir.is_dir())
-        .ok_or_else(unreadable_git)?;
+        .filter(|dir| is_git_dir(dir))
+        .ok_or_else(no_git_dir)?;
     let common_dir = repo::git_common_dir(root)
-        .filter(|dir| dir.is_dir())
-        .ok_or_else(unreadable_git)?;
-    let exe = exe.to_str().ok_or_else(|| {
+        .filter(|dir| is_git_dir(dir))
+        .ok_or_else(no_git_dir)?;
+    let exe_text = exe.to_str().ok_or_else(|| {
         format!(
             "the path of the yalper binary is not valid UTF-8: {}",
             exe.display()
@@ -80,7 +97,7 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
 
     // Everything that can stop init is checked before anything is written.
     let settings_path = root.join(CLAUDE_DIR).join(SETTINGS_FILE);
-    let settings = registered_settings(&settings_path, exe)?;
+    let settings = registered_settings(&settings_path, exe_text)?;
     let yalper_path = root.join(YALPER_DIR);
     let existing = inspect(root, &yalper_path)?;
     if let Existing::Unusable(why) = &existing
@@ -102,19 +119,22 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
             say(out, "  .yalper/: already set up, kept");
             yalper
         }
-        Existing::Missing => {
-            let yalper = create_yalper_dir(&yalper_path, &git_dir)?;
+        Existing::Missing { empty_dir } => {
+            let yalper = create_yalper_dir(&yalper_path, &git_dir, empty_dir)?;
             say(out, "  .yalper/: created");
             yalper
         }
         Existing::Unusable(_) => {
             remove(&yalper_path)
                 .map_err(|error| format!("cannot delete {}: {error}", yalper_path.display()))?;
-            let yalper = create_yalper_dir(&yalper_path, &git_dir)?;
+            let yalper = create_yalper_dir(&yalper_path, &git_dir, false)?;
             say(out, "  .yalper/: deleted and created again");
             yalper
         }
     };
+    if create_contents(&yalper)? {
+        forget_lost_snapshots(&yalper, out)?;
+    }
     take_baseline(&yalper, out)?;
     drop(yalper);
     say(
@@ -129,7 +149,10 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
     match settings {
         Settings::Unchanged => say(out, "  Claude Code hooks: already registered"),
         Settings::Updated(text) => {
-            write_atomically(&settings_path, &text)
+            let existing = fs::symlink_metadata(&settings_path)
+                .ok()
+                .filter(fs::Metadata::is_file);
+            replace_file(&settings_path, text.as_bytes(), existing.as_ref())
                 .map_err(|error| format!("cannot write {}: {error}", settings_path.display()))?;
             say(
                 out,
@@ -137,8 +160,14 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
             );
         }
     }
+    list_other_commands(root, exe_text, out);
 
-    if warn_if_the_hook_cannot_use(root, out) {
+    let mut warned = warn_if_the_hook_cannot_use(root, out);
+    for warning in exe_warnings(exe) {
+        say(out, &format!("warning: {warning}"));
+        warned = true;
+    }
+    if warned {
         say(out, "Done, but see the warning above.");
     } else {
         say(
@@ -148,6 +177,12 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
         );
     }
     Ok(())
+}
+
+/// Whether `dir` is a real directory (not a link) holding a `HEAD` file, as every git directory does.
+fn is_git_dir(dir: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+        && fs::symlink_metadata(dir.join("HEAD")).is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Whether `handler` (one entry of a matcher group's `hooks` array) runs `yalper hook`: its first argument is
@@ -164,6 +199,29 @@ pub fn is_yalper_handler(handler: &Value) -> bool {
         .and_then(|command| Path::new(command).file_stem())
         .and_then(|stem| stem.to_str());
     first_arg == Some("hook") && stem.is_some_and(|stem| stem.eq_ignore_ascii_case("yalper"))
+}
+
+/// Whether `handler`, in a group whose matcher matches every call (`group_matches_all`), is a Yalper handler
+/// that runs on every event the way `yalper init` registers it: a synchronous command with no `if`
+/// condition. Any other Yalper handler (for example one committed with a matcher that never matches) does
+/// not count, so it cannot stop init from registering the real one.
+fn is_registration(group_matches_all: bool, handler: &Value) -> bool {
+    group_matches_all
+        && is_yalper_handler(handler)
+        && handler.get("type").and_then(Value::as_str) == Some("command")
+        && handler.get("if").is_none()
+        && handler
+            .get("async")
+            .is_none_or(|value| *value == Value::Bool(false))
+}
+
+/// Whether the matcher group `group` runs its handlers for every call: no matcher, an empty one, or `*`.
+fn matches_all(group: &Map<String, Value>) -> bool {
+    match group.get("matcher") {
+        None => true,
+        Some(Value::String(matcher)) => matcher.is_empty() || matcher == "*",
+        Some(_) => false,
+    }
 }
 
 /// The handler `yalper init` registers for `event`.
@@ -185,11 +243,13 @@ enum Settings {
 }
 
 /// Reads the settings file at `path` (if it exists) and registers the hooks in it, see [`register_hooks`].
+/// A leading byte order mark (Windows PowerShell 5.1 writes one) is kept.
 fn registered_settings(path: &Path, exe: &str) -> Result<Settings, String> {
     let claude_dir = path.parent().unwrap_or(path);
     if fs::symlink_metadata(claude_dir).is_ok_and(|metadata| !metadata.is_dir()) {
         return Err(format!(
-            "{} is not a folder (it may be a link), so Yalper will not write its settings there",
+            "{} is not a folder (it may be a link), so Yalper will not write its settings there. \
+             Nothing was changed.",
             claude_dir.display()
         ));
     }
@@ -198,32 +258,40 @@ fn registered_settings(path: &Path, exe: &str) -> Result<Settings, String> {
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
         Ok(metadata) if !metadata.is_file() => {
             return Err(format!(
-                "{} is not a regular file (it may be a link), so Yalper will not edit it",
+                "{} is not a regular file (it may be a link), so Yalper will not edit it. Nothing was \
+                 changed.",
                 path.display()
             ));
         }
-        Ok(_) => {
-            let bytes = safe_fs::read_small_regular_file(path, MAX_SETTINGS_BYTES)
-                .ok_or_else(|| format!("cannot read {}", path.display()))?;
-            Some(String::from_utf8(bytes).map_err(|_| {
-                format!(
-                    "{} is not valid UTF-8. Nothing was changed.",
-                    path.display()
-                )
-            })?)
-        }
+        Ok(_) => Some(read_text(path).ok_or_else(|| {
+            format!(
+                "cannot read {} as UTF-8 text. Nothing was changed.",
+                path.display()
+            )
+        })?),
     };
-    register_hooks(existing.as_deref(), exe).map_err(|why| {
-        format!(
+    let (bom, text) = match existing.as_deref().map(|text| text.strip_prefix(BOM)) {
+        Some(Some(rest)) => (true, Some(rest)),
+        _ => (false, existing.as_deref()),
+    };
+    match register_hooks(text, exe) {
+        Ok(Settings::Updated(text)) if bom => Ok(Settings::Updated(format!("{BOM}{text}"))),
+        Ok(settings) => Ok(settings),
+        Err(why) => Err(format!(
             "cannot register the hooks in {}: {why}. Nothing was changed.",
             path.display()
-        )
-    })
+        )),
+    }
+}
+
+/// The content of the regular file at `path`, if it is UTF-8 and not too large.
+fn read_text(path: &Path) -> Option<String> {
+    String::from_utf8(safe_fs::read_small_regular_file(path, MAX_SETTINGS_BYTES)?).ok()
 }
 
 /// Registers `exe` for every event of [`EVENTS`] in the settings JSON `existing` (`None`: no file yet).
 ///
-/// An event whose matcher groups already contain a Yalper handler (see [`is_yalper_handler`]) keeps it, with
+/// An event whose matcher groups already hold Yalper's registration (see [`is_registration`]) keeps it, with
 /// its command set to `exe`; any other event gets one more matcher group, without a matcher, holding only
 /// Yalper's handler. Every other key, group and handler is kept as it is, in its order. The result is
 /// formatted with 2-space indentation and a trailing newline.
@@ -248,20 +316,22 @@ fn register_hooks(existing: Option<&str>, exe: &str) -> Result<Settings, String>
         };
         let mut found = false;
         for group in groups.iter_mut() {
-            let handlers = match group.as_object_mut().map(|group| group.get_mut("hooks")) {
-                Some(Some(Value::Array(handlers))) => handlers,
-                Some(None) => continue,
-                _ => {
-                    return Err(format!(
-                        "`hooks.{name}` holds an entry that is not a matcher group"
-                    ));
-                }
+            let Value::Object(group) = group else {
+                return Err(format!(
+                    "`hooks.{name}` holds an entry that is not a matcher group"
+                ));
+            };
+            let all = matches_all(group);
+            let handlers = match group.get_mut("hooks") {
+                Some(Value::Array(handlers)) => handlers,
+                None => continue,
+                Some(_) => return Err(format!("`hooks.{name}` holds a group without a hook list")),
             };
             for handler in handlers.iter_mut() {
                 if !handler.is_object() {
                     return Err(format!("`hooks.{name}` holds a hook that is not an object"));
                 }
-                if is_yalper_handler(handler) {
+                if is_registration(all, handler) {
                     found = true;
                     if handler["command"] != exe {
                         handler["command"] = json!(exe);
@@ -283,25 +353,71 @@ fn register_hooks(existing: Option<&str>, exe: &str) -> Result<Settings, String>
     Ok(Settings::Updated(text))
 }
 
-/// Writes `text` to a temporary file next to `path`, then renames it over `path`, so the file is never seen
-/// half written. Creates the parent folder if needed.
-fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
+/// Replaces the file at `path` with `bytes` through a temporary file next to it, renamed over `path` at the
+/// end, so the file is never seen half written. No link is ever followed: whatever is at the temporary path
+/// (a leftover, or a link a repository planted) is removed first, never its target, and the temporary file
+/// is created new. On Unix it is readable only by its owner, or gets the permissions of `existing` (the
+/// replaced file). The temporary file is removed on any error.
+fn replace_file(path: &Path, bytes: &[u8], existing: Option<&fs::Metadata>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".yalper-tmp");
     let temporary = PathBuf::from(temporary);
-    fs::write(&temporary, text)?;
-    fs::rename(&temporary, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temporary);
-    })
+    match fs::remove_file(&temporary) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        // A Windows junction or directory symlink is removed like a folder.
+        Err(_) => fs::remove_dir(&temporary)?,
+        Ok(()) => {}
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&temporary)?;
+    let written = fill(&mut file, bytes, existing);
+    drop(file);
+    written
+        .and_then(|()| fs::rename(&temporary, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&temporary);
+        })
+}
+
+/// Writes `bytes` to the new `file` and, on Unix, gives it the permissions of `existing`.
+fn fill(file: &mut fs::File, bytes: &[u8], existing: Option<&fs::Metadata>) -> io::Result<()> {
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    if let Some(existing) = existing {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = existing.permissions().mode() & 0o777;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(windows)]
+    let _ = existing;
+    Ok(())
 }
 
 /// Appends each line of [`EXCLUDE_LINES`] that the exclude file at `path` does not already have (in any
 /// equivalent form, such as `/.yalper/`), creating the file and its folder if needed. Returns the lines
-/// added.
+/// added. A link at the file or its folder is refused.
 fn add_excludes(path: &Path) -> io::Result<Vec<&'static str>> {
+    let refuse_link =
+        |path: &Path, is_expected: fn(&fs::Metadata) -> bool| match fs::symlink_metadata(path) {
+            Ok(metadata) if !is_expected(&metadata) => Err(io::Error::other(format!(
+                "{} is a link or not what git creates there",
+                path.display()
+            ))),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    if let Some(info) = path.parent() {
+        refuse_link(info, fs::Metadata::is_dir)?;
+    }
+    refuse_link(path, fs::Metadata::is_file)?;
+
     let text = match fs::read(path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -340,77 +456,150 @@ fn add_excludes(path: &Path) -> io::Result<Vec<&'static str>> {
 
 /// What is at `.yalper/` before init changes anything.
 enum Existing {
-    Missing,
-    /// `yalper init` created it for this repository, and its event log and snapshot store belong to it.
+    /// Nothing, or an empty folder (git never creates one, so a clone cannot plant it).
+    Missing { empty_dir: bool },
+    /// `yalper init` created it for this repository, and the event log and snapshot store it has belong to
+    /// it.
     Usable(YalperDir),
-    /// Anything else, with the reason.
+    /// It was not created by `yalper init` for this repository, or holds contents created for another
+    /// `.yalper/`. The reason is given.
     Unusable(String),
 }
 
-/// Looks at `path`, the `.yalper/` of the repository at `root`. An existing one is usable only if
-/// `yalper init` created it for this repository (matching init tokens) and its event log and snapshot store
-/// carry the same token; a missing event log or store is created then.
+/// Looks at `path`, the `.yalper/` of the repository at `root`, without changing anything. A folder the hook
+/// would refuse for another reason than its origin (another owner, writable by others) or that cannot be read
+/// is an error: deleting it would not help.
 fn inspect(root: &Path, path: &Path) -> Result<Existing, String> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Existing::Missing),
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
-        Ok(_) => Ok(match adopt(root, path) {
-            Ok(yalper) => Existing::Usable(yalper),
-            Err(why) => Existing::Unusable(why),
-        }),
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Existing::Missing { empty_dir: false });
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.is_dir() {
+        return Ok(Existing::Unusable(
+            "it is not a folder (it is a file or a link)".to_owned(),
+        ));
     }
+    let empty = fs::read_dir(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        .next()
+        .is_none();
+    if empty {
+        return Ok(Existing::Missing { empty_dir: true });
+    }
+    let yalper = match repo::open_yalper_dir(root, path) {
+        Ok(yalper) => yalper,
+        Err(refusal @ Refusal::TokenMismatch) => {
+            return Ok(Existing::Unusable(refusal.to_string()));
+        }
+        Err(refusal) => {
+            let hint = match refusal {
+                Refusal::WritableByOthers => " Run `chmod 700 .yalper` to make it private.",
+                _ => "",
+            };
+            return Err(format!(
+                "Yalper cannot use {}: {refusal}.{hint}",
+                path.display()
+            ));
+        }
+    };
+    Ok(match check_contents(&yalper)? {
+        Some(why) => Existing::Unusable(why),
+        None => Existing::Usable(yalper),
+    })
 }
 
-/// Opens the existing `.yalper/` at `path` if `yalper init` created it for the repository at `root`, and
-/// makes sure its event log and snapshot store belong to it (creating them if they are missing).
-fn adopt(root: &Path, path: &Path) -> Result<YalperDir, String> {
-    let dir = OwnedDir::open(path).map_err(|error| error.to_string())?;
-    let token = repo::init_token(root, &dir).ok_or_else(|| {
-        "it was not created by `yalper init` for this repository (its init token is missing or different)"
-            .to_owned()
-    })?;
-    let yalper = YalperDir { dir, token };
-    create_contents(&yalper)?;
-    Ok(yalper)
+/// Opens the event log and the snapshot store of `yalper` that exist, and returns why they cannot be used
+/// if they were created for another `.yalper/`. Other failures are errors.
+fn check_contents(yalper: &YalperDir) -> Result<Option<String>, String> {
+    let exists = |name: &str| fs::symlink_metadata(yalper.dir.path().join(name));
+    if let Ok(metadata) = exists(DATABASE_FILE) {
+        if !metadata.is_file() {
+            return Ok(Some(format!("its {DATABASE_FILE} is not a regular file")));
+        }
+        match Store::open(&yalper.dir, &yalper.token) {
+            Ok(_) => {}
+            Err(error @ (store::Error::ForeignDatabase | store::Error::UnexpectedSchema)) => {
+                return Ok(Some(error.to_string()));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    if let Ok(metadata) = exists(SNAPSHOTS_DIR) {
+        if !metadata.is_dir() {
+            return Ok(Some(format!("its {SNAPSHOTS_DIR} is not a folder")));
+        }
+        match ShadowStore::open(&yalper.dir, &yalper.token) {
+            Ok(_) => {}
+            Err(error @ snapshot::Error::UnexpectedLayout(_)) => {
+                return Ok(Some(error.to_string()));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
 }
 
-/// Creates `.yalper/` at `path` (on Unix readable only by its owner) with a new init token written to it and
-/// to `git_dir`, then its event log and snapshot store.
-fn create_yalper_dir(path: &Path, git_dir: &Path) -> Result<YalperDir, String> {
+/// Creates `.yalper/` at `path` (on Unix accessible only by its owner), or uses the empty folder there, and
+/// writes a new init token to it and to `git_dir`.
+fn create_yalper_dir(path: &Path, git_dir: &Path, empty_dir: bool) -> Result<YalperDir, String> {
     let failed = |error: io::Error| format!("cannot create {}: {error}", path.display());
-    #[cfg_attr(windows, allow(unused_mut))]
-    let mut builder = fs::DirBuilder::new();
+    if !empty_dir {
+        #[cfg_attr(windows, allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(path).map_err(failed)?;
+    }
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(path).map_err(failed)?;
+    if empty_dir {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+    }
     let dir = OwnedDir::open(path).map_err(failed)?;
     let token = Token::generate().map_err(failed)?;
     let line = format!("{token}\n");
-    fs::write(git_dir.join(GIT_ID_FILE), &line).map_err(|error| {
-        format!(
-            "cannot write {}: {error}",
-            git_dir.join(GIT_ID_FILE).display()
-        )
-    })?;
+    let git_token = git_dir.join(GIT_ID_FILE);
+    replace_file(&git_token, line.as_bytes(), None)
+        .map_err(|error| format!("cannot write {}: {error}", git_token.display()))?;
     dir.open_file(ID_FILE, Access::ReadWrite)
         .and_then(|mut file| file.write_all(line.as_bytes()))
         .map_err(failed)?;
-    let yalper = YalperDir { dir, token };
-    create_contents(&yalper)?;
-    Ok(yalper)
+    Ok(YalperDir { dir, token })
 }
 
-/// Opens (creating it if missing) the event log and the snapshot store of `yalper`, which fails if either
-/// was created for another init token.
-fn create_contents(yalper: &YalperDir) -> Result<(), String> {
+/// Creates the event log and the snapshot store of `yalper` if they are missing. Returns whether the
+/// snapshot store had to be created.
+fn create_contents(yalper: &YalperDir) -> Result<bool, String> {
     Store::open(&yalper.dir, &yalper.token).map_err(|error| error.to_string())?;
-    let store = match fs::symlink_metadata(yalper.dir.path().join(SNAPSHOTS_DIR)) {
+    match fs::symlink_metadata(yalper.dir.path().join(SNAPSHOTS_DIR)) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            ShadowStore::init(&yalper.dir, &yalper.token)
+            ShadowStore::init(&yalper.dir, &yalper.token).map_err(|error| error.to_string())?;
+            Ok(true)
         }
-        _ => ShadowStore::open(&yalper.dir, &yalper.token),
-    };
-    store.map(drop).map_err(|error| error.to_string())
+        _ => Ok(false),
+    }
+}
+
+/// After the snapshot store was created again, the event log may still name a latest snapshot whose trees
+/// and blobs are gone, and every later snapshot would fail on it. It is forgotten, so the baseline starts
+/// over.
+fn forget_lost_snapshots(yalper: &YalperDir, out: &mut dyn Write) -> Result<(), String> {
+    let store = Store::open(&yalper.dir, &yalper.token).map_err(|error| error.to_string())?;
+    if !store.has_snapshot().map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    let lock = WriterLock::acquire(&yalper.dir, LOCK_TIMEOUT).map_err(|error| error.to_string())?;
+    store
+        .forget_snapshot(&lock)
+        .map_err(|error| error.to_string())?;
+    say(
+        out,
+        "  Snapshot store: missing, created again (earlier snapshots are no longer available)",
+    );
+    Ok(())
 }
 
 /// Deletes whatever is at `path`: a folder with everything in it, or a file or link (never its target).
@@ -454,6 +643,93 @@ fn take_baseline(yalper: &YalperDir, out: &mut dyn Write) -> Result<(), String> 
     Ok(())
 }
 
+/// Lists the commands, other than Yalper's own hook, that Claude Code's project settings files at `root` make
+/// it run: command hooks and command settings such as `statusLine` or `apiKeyHelper`. A cloned repository can
+/// commit them, and they run as soon as the folder is trusted, like Yalper's hook.
+fn list_other_commands(root: &Path, exe: &str, out: &mut dyn Write) {
+    let mut lines = Vec::new();
+    for name in [SHARED_SETTINGS_FILE, SETTINGS_FILE] {
+        let path = root.join(CLAUDE_DIR).join(name);
+        let Some(settings) = read_text(&path).and_then(|text| {
+            serde_json::from_str::<Value>(text.strip_prefix(BOM).unwrap_or(&text)).ok()
+        }) else {
+            continue;
+        };
+        for (setting, command) in other_commands(&settings, exe) {
+            lines.push(format!("    .claude/{name} {setting}: {command}"));
+        }
+    }
+    if !lines.is_empty() {
+        say(
+            out,
+            "  Other commands in Claude Code's settings (they also run once this folder is trusted):",
+        );
+        for line in lines {
+            say(out, &line);
+        }
+    }
+}
+
+/// The commands `settings` makes Claude Code run, except Yalper's registration with `exe`, as (setting,
+/// command line) pairs.
+fn other_commands(settings: &Value, exe: &str) -> Vec<(String, String)> {
+    let mut commands = Vec::new();
+    let hooks = settings.get("hooks").and_then(Value::as_object);
+    for (event, groups) in hooks.into_iter().flatten() {
+        for group in groups.as_array().into_iter().flatten() {
+            let Some(group) = group.as_object() else {
+                continue;
+            };
+            let handlers = group.get("hooks").and_then(Value::as_array);
+            for handler in handlers.into_iter().flatten() {
+                let is_command = handler.get("type").and_then(Value::as_str) == Some("command");
+                let is_ours =
+                    is_registration(matches_all(group), handler) && handler["command"] == exe;
+                if let Some(command) = handler.get("command").and_then(Value::as_str)
+                    && is_command
+                    && !is_ours
+                {
+                    let args = handler.get("args").and_then(Value::as_array);
+                    let line = args
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .fold(command.to_owned(), |line, arg| line + " " + arg);
+                    commands.push((format!("hooks.{event}"), line));
+                }
+            }
+        }
+    }
+    for setting in COMMAND_SETTINGS {
+        if let Some(command) = settings.get(setting).and_then(Value::as_str) {
+            commands.push((setting.to_owned(), command.to_owned()));
+        }
+    }
+    let status_line = settings
+        .get("statusLine")
+        .and_then(|status| status.get("command"));
+    if let Some(command) = status_line.and_then(Value::as_str) {
+        commands.push(("statusLine".to_owned(), command.to_owned()));
+    }
+    for (_, command) in &mut commands {
+        *command = shortened(command);
+    }
+    commands
+}
+
+/// `command` on one line, cut after [`MAX_LISTED_COMMAND_CHARS`] characters.
+fn shortened(command: &str) -> String {
+    let mut line: String = command
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_LISTED_COMMAND_CHARS)
+        .collect();
+    if command.chars().count() > MAX_LISTED_COMMAND_CHARS {
+        line.push_str("...");
+    }
+    line
+}
+
 /// Runs the checks the hook makes before it records (see [`repo::open_yalper_dir`]) and prints a warning if
 /// they fail, for example on a file system that does not keep Unix owners and permissions (WSL's `/mnt/c`,
 /// some network shares), or when the project belongs to another user (a dev container). Returns whether a
@@ -488,6 +764,39 @@ fn warn_if_the_hook_cannot_use(root: &Path, out: &mut dyn Write) -> bool {
         }
     }
     warned
+}
+
+/// Reasons not to register `exe` as it is: Claude Code runs it on every step, so anyone who can replace it
+/// runs code as the user. Warns when it is in the temporary folder, and on Unix when it or one of its parent
+/// folders can be changed by other users (group or world writable, without the sticky bit).
+fn exe_warnings(exe: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_owned());
+    if fs::canonicalize(env::temp_dir()).is_ok_and(|temp| exe.starts_with(temp)) {
+        warnings.push(format!(
+            "the yalper binary is in the temporary folder ({}), which other programs can change or clean \
+             up. Install yalper somewhere permanent and run `yalper init` again.",
+            exe.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open = exe.ancestors().find(|path| {
+            fs::metadata(path).is_ok_and(|metadata| {
+                let mode = metadata.permissions().mode();
+                mode & 0o022 != 0 && mode & 0o1000 == 0
+            })
+        });
+        if let Some(open) = open {
+            warnings.push(format!(
+                "{} can be changed by other users, and Claude Code runs the yalper binary inside it on every \
+                 step. Install yalper in a folder only you can write to and run `yalper init` again.",
+                open.display()
+            ));
+        }
+    }
+    warnings
 }
 
 /// Prints one line of the report. A closed output does not stop init.
@@ -566,6 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn a_yalper_handler_that_does_not_run_on_every_call_is_not_the_registration() {
+        let decoys = [
+            json!({"matcher": "NeverMatches", "hooks": [{"type": "command", "command": EXE, "args": ["hook"]}]}),
+            json!({"hooks": [{"type": "command", "command": EXE, "args": ["hook"], "if": "Bash(x)"}]}),
+            json!({"hooks": [{"type": "command", "command": EXE, "args": ["hook"], "async": true}]}),
+            json!({"hooks": [{"type": "http", "command": EXE, "args": ["hook"]}]}),
+        ];
+        for decoy in decoys {
+            let existing = json!({"hooks": {"Stop": [decoy.clone()]}}).to_string();
+            let settings = updated(Some(&existing), EXE);
+            let groups = settings["hooks"]["Stop"].as_array().unwrap();
+            assert_eq!(groups.len(), 2, "{decoy}");
+            assert_eq!(groups[0], decoy);
+            assert_eq!(groups[1], json!({"hooks": [handler(HookEvent::Stop, EXE)]}));
+        }
+        // The forms `yalper init` accepts as its own.
+        for matcher in [json!("*"), json!("")] {
+            let existing = json!({"hooks": {"Stop": [{"matcher": matcher, "hooks": [
+                {"type": "command", "command": EXE, "args": ["hook"], "async": false}
+            ]}]}})
+            .to_string();
+            let settings = updated(Some(&existing), EXE);
+            assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn other_settings_and_hooks_are_kept_in_order() {
         let existing = r#"{
             "permissions": {"allow": ["Bash(cargo test)"]},
@@ -616,6 +952,23 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_order_mark_is_accepted_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        fs::write(&path, format!("{BOM}{{\"model\": \"x\"}}")).unwrap();
+        let Settings::Updated(text) = registered_settings(&path, EXE).unwrap() else {
+            panic!("expected a change");
+        };
+        let rest = text.strip_prefix(BOM).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(rest).unwrap()["model"], "x");
+        fs::write(&path, &text).unwrap();
+        assert_eq!(
+            registered_settings(&path, EXE).unwrap(),
+            Settings::Unchanged
+        );
+    }
+
+    #[test]
     fn yalper_handlers_are_recognized_by_file_stem_and_first_argument() {
         let handler = |command: &str, args: Value| json!({"type": "command", "command": command, "args": args});
         assert!(is_yalper_handler(&handler(EXE, json!(["hook"]))));
@@ -633,6 +986,37 @@ mod tests {
         assert!(!is_yalper_handler(
             &json!({"type": "command", "command": "yalper hook"})
         ));
+    }
+
+    #[test]
+    fn other_commands_are_every_command_but_the_registration() {
+        let settings = json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [handler(HookEvent::Stop, EXE)]},
+                    {"matcher": "NeverMatches", "hooks": [{"type": "command", "command": "/tmp/yalper", "args": ["hook"]}]},
+                    {"hooks": [{"type": "command", "command": "notify\nme"}, {"type": "prompt", "prompt": "x"}]}
+                ]
+            },
+            "statusLine": {"type": "command", "command": "status.sh"},
+            "apiKeyHelper": "get-key.sh",
+            "model": "x"
+        });
+        let commands = other_commands(&settings, EXE);
+        let expected = [
+            ("hooks.Stop", "/tmp/yalper hook"),
+            ("hooks.Stop", "notify me"),
+            ("apiKeyHelper", "get-key.sh"),
+            ("statusLine", "status.sh"),
+        ]
+        .map(|(setting, command)| (setting.to_owned(), command.to_owned()));
+        assert_eq!(commands, expected);
+        assert_eq!(other_commands(&json!({}), EXE), []);
+        let long = "x".repeat(MAX_LISTED_COMMAND_CHARS + 5);
+        assert_eq!(
+            shortened(&long),
+            "x".repeat(MAX_LISTED_COMMAND_CHARS) + "..."
+        );
     }
 
     #[test]
@@ -655,5 +1039,141 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "# mine\n/.yalper\r\ntarget\n.claude/settings.local.json\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_exclude_file_or_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim");
+        fs::write(&target, "keep me").unwrap();
+        fs::create_dir(dir.path().join("info")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("info").join("exclude")).unwrap();
+        assert!(add_excludes(&dir.path().join("info").join("exclude")).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+
+        let linked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked.path().join("info")).unwrap();
+        assert!(add_excludes(&linked.path().join("info").join("exclude")).is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_file_is_replaced_and_a_leftover_temporary_file_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let temporary = dir.path().join("file.yalper-tmp");
+        fs::write(&temporary, "leftover").unwrap();
+        replace_file(&path, b"new", None).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert!(!temporary.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            let existing = fs::metadata(&path).unwrap();
+            replace_file(&path, b"newer", Some(&existing)).unwrap();
+            assert_eq!(mode(&path), 0o640);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_temporary_path_is_removed_and_its_target_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("settings.json");
+        fs::write(&target, "keep me").unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&target, dir.path().join("settings.local.json.yalper-tmp"))
+            .unwrap();
+        replace_file(&path, b"{}\n", None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+        assert!(!fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_claude_folder_or_settings_file_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join(SETTINGS_FILE);
+        fs::write(&target, "{}").unwrap();
+
+        let linked_folder = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked_folder.path().join(CLAUDE_DIR)).unwrap();
+        let path = linked_folder.path().join(CLAUDE_DIR).join(SETTINGS_FILE);
+        let error = registered_settings(&path, EXE).unwrap_err();
+        assert!(error.contains("not a folder"), "{error}");
+
+        let linked_file = tempfile::tempdir().unwrap();
+        fs::create_dir(linked_file.path().join(CLAUDE_DIR)).unwrap();
+        let path = linked_file.path().join(CLAUDE_DIR).join(SETTINGS_FILE);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let error = registered_settings(&path, EXE).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
+    }
+
+    #[test]
+    fn a_binary_in_the_temporary_folder_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("yalper");
+        fs::write(&exe, "").unwrap();
+        let warnings = exe_warnings(&exe);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("temporary folder")),
+            "{warnings:?}"
+        );
+        let test_binary = env::current_exe().unwrap();
+        assert_eq!(exe_warnings(&test_binary), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_others_can_replace_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        let exe = open.join("yalper");
+        fs::write(&exe, "").unwrap();
+        let warnings = exe_warnings(&exe);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("changed by other users")),
+            "{warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_hook_check_warns_about_a_folder_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let yalper = root.path().join(YALPER_DIR);
+        fs::create_dir(&yalper).unwrap();
+        let token = "0123456789abcdef0123456789abcdef\n";
+        fs::write(root.path().join(".git").join(GIT_ID_FILE), token).unwrap();
+        fs::write(yalper.join(ID_FILE), token).unwrap();
+        fs::set_permissions(&yalper, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut out = Vec::new();
+        assert!(!warn_if_the_hook_cannot_use(root.path(), &mut out));
+        assert!(out.is_empty());
+
+        // What a file system that ignores Unix permissions (WSL's /mnt/c) shows for every folder.
+        fs::set_permissions(&yalper, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(warn_if_the_hook_cannot_use(root.path(), &mut out));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("warning: the hook will not record"), "{text}");
+        assert!(text.contains("other users"), "{text}");
     }
 }

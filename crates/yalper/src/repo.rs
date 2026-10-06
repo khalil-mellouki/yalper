@@ -116,30 +116,46 @@ pub struct YalperDir {
     pub token: Token,
 }
 
+/// Why [`open_yalper_dir`] refuses a `.yalper/` directory.
+#[derive(Debug)]
+pub enum Refusal {
+    /// It is not a real directory owned by the current user (a link, a file, another owner), or cannot be
+    /// opened.
+    NotOwnedDir(io::Error),
+    /// Its group or other users can create, rename or delete entries in it (Unix).
+    WritableByOthers,
+    /// `.yalper/id` and `<git dir>/yalper-id` do not hold the same valid token.
+    TokenMismatch,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotOwnedDir(error) => write!(f, "{error}"),
+            Self::WritableByOthers => {
+                f.write_str("other users can change it (it is group or world writable)")
+            }
+            Self::TokenMismatch => write!(
+                f,
+                "it was not created by `yalper init` for this repository (its {ID_FILE} file does not \
+                 hold the same init token as {GIT_ID_FILE} in the git directory)"
+            ),
+        }
+    }
+}
+
 /// Opens the `.yalper/` directory at `path` for the repository whose work tree is `root`, or says why it
 /// cannot be used. It must be a real directory owned by the current user (see [`OwnedDir`]), on Unix not
 /// writable by its group or other users, and `.yalper/id` and `<git dir>/yalper-id` must be regular files
 /// holding the same valid token. Every caller that opens the event log or the snapshot store of a `.yalper/`
-/// it found on disk goes through this first.
-pub fn open_yalper_dir(root: &Path, path: &Path) -> Result<YalperDir, String> {
-    let dir = OwnedDir::open(path).map_err(|error| error.to_string())?;
-    if dir
-        .is_writable_by_others()
-        .map_err(|error| error.to_string())?
-    {
-        return Err(format!(
-            "{} can be changed by other users (group or world writable)",
-            path.display()
-        ));
+/// it found on disk goes through this first, `yalper init` included.
+pub fn open_yalper_dir(root: &Path, path: &Path) -> Result<YalperDir, Refusal> {
+    let dir = OwnedDir::open(path).map_err(Refusal::NotOwnedDir)?;
+    if dir.is_writable_by_others().map_err(Refusal::NotOwnedDir)? {
+        return Err(Refusal::WritableByOthers);
     }
-    match init_token(root, &dir) {
-        Some(token) => Ok(YalperDir { dir, token }),
-        None => Err(format!(
-            "{} does not hold the same init token as {} in the git directory",
-            path.join(ID_FILE).display(),
-            GIT_ID_FILE
-        )),
-    }
+    let token = init_token(root, &dir).ok_or(Refusal::TokenMismatch)?;
+    Ok(YalperDir { dir, token })
 }
 
 /// The init token of `yalper_dir`, if `.yalper/id` and `<git dir>/yalper-id` of the repository whose work
@@ -220,7 +236,9 @@ mod tests {
             let root = project(Some(TOKEN), Some(TOKEN));
             let yalper = root.path().join(".yalper");
             fs::set_permissions(&yalper, fs::Permissions::from_mode(mode)).unwrap();
-            let error = open_yalper_dir(root.path(), &yalper).unwrap_err();
+            let error = open_yalper_dir(root.path(), &yalper)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("other users"), "{mode:o}: {error}");
             fs::set_permissions(&yalper, fs::Permissions::from_mode(0o750)).unwrap();
             assert!(initialized(root.path()), "{mode:o}");

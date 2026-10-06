@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use yalper::hook::{YALPER_DIR, find_yalper_dir};
 use yalper::init::{EVENTS, is_yalper_handler};
 use yalper::repo::{GIT_ID_FILE, ID_FILE, Token};
+use yalper::snapshot::SNAPSHOTS_DIR;
 use yalper::store::{DATABASE_FILE, Store};
 
 const EXE: &str = env!("CARGO_BIN_EXE_yalper");
@@ -414,23 +415,144 @@ fn recreate_keeps_a_working_yalper_dir() {
 
 #[cfg(unix)]
 #[test]
-fn init_warns_when_the_hook_would_not_use_the_folder() {
+fn a_folder_others_can_write_is_refused_like_the_hook_does_without_suggesting_deletion() {
     use std::os::unix::fs::PermissionsExt;
     let repo = repository();
     let root = repo.path();
     assert_success(&init(root));
-    // What a file system that ignores Unix permissions (WSL's /mnt/c) shows for every folder.
     fs::set_permissions(root.join(YALPER_DIR), fs::Permissions::from_mode(0o777)).unwrap();
 
     let output = init(root);
-    assert!(output.status.success(), "{output:?}");
-    let text = stdout(&output);
-    assert!(text.contains("warning: the hook will not record"), "{text}");
-    assert!(text.contains("other users"), "{text}");
-    assert!(text.contains("chmod 700 .yalper"), "{text}");
-    assert!(!text.contains("now recorded"), "{text}");
+    assert!(!output.status.success(), "{output:?}");
+    let message = stderr(&output);
+    assert!(message.contains("other users"), "{message}");
+    assert!(message.contains("chmod 700 .yalper"), "{message}");
+    assert!(!message.contains("--recreate"), "{message}");
     assert!(find_yalper_dir([root.to_path_buf()]).is_none());
 
     fs::set_permissions(root.join(YALPER_DIR), fs::Permissions::from_mode(0o700)).unwrap();
     assert_success(&init(root));
+}
+
+#[test]
+fn a_database_from_a_newer_yalper_is_an_error_without_suggesting_deletion() {
+    let repo = repository();
+    let root = repo.path();
+    assert_success(&init(root));
+    rusqlite::Connection::open(root.join(YALPER_DIR).join(DATABASE_FILE))
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+
+    let output = init(root);
+    assert!(!output.status.success(), "{output:?}");
+    let message = stderr(&output);
+    assert!(message.contains("update Yalper"), "{message}");
+    assert!(!message.contains("--recreate"), "{message}");
+}
+
+#[test]
+fn an_empty_yalper_dir_is_used_like_a_missing_one() {
+    let repo = repository();
+    let root = repo.path();
+    fs::create_dir(root.join(YALPER_DIR)).unwrap();
+    let output = init(root);
+    assert_success(&output);
+    assert!(stdout(&output).contains(".yalper/: created"));
+    assert!(find_yalper_dir([root.to_path_buf()]).is_some());
+}
+
+#[test]
+fn a_lost_snapshot_store_is_created_again_and_recording_works() {
+    let repo = repository();
+    let root = repo.path();
+    assert_success(&init(root));
+    fs::remove_dir_all(root.join(YALPER_DIR).join(SNAPSHOTS_DIR)).unwrap();
+
+    let output = init(root);
+    assert_success(&output);
+    let text = stdout(&output);
+    assert!(
+        text.contains("Snapshot store: missing, created again"),
+        "{text}"
+    );
+    assert!(text.contains("Baseline snapshot: 1 file"), "{text}");
+
+    fs::write(root.join("main.rs"), "fn main() { println!(); }\n").unwrap();
+    let payload = json!({
+        "session_id": "s1",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": root.join("main.rs")},
+        "tool_response": {},
+    });
+    let mut hook = Command::new(EXE)
+        .arg("hook")
+        .current_dir(root)
+        .env("CLAUDE_PROJECT_DIR", root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut hook.stdin.take().unwrap(),
+        payload.to_string().as_bytes(),
+    )
+    .unwrap();
+    assert!(hook.wait_with_output().unwrap().status.success());
+
+    assert!(!root.join(YALPER_DIR).join("errors.log").exists());
+    let found = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let events = Store::open(&found.dir, &found.token)
+        .unwrap()
+        .events("s1")
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].tree_id.is_some());
+    assert_eq!(events[0].files_changed, Some(1));
+}
+
+#[test]
+fn other_commands_in_the_project_settings_are_listed() {
+    let repo = repository();
+    let root = repo.path();
+    fs::create_dir(root.join(".claude")).unwrap();
+    let shared = json!({
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "./guard.sh"}]}]},
+        "statusLine": {"type": "command", "command": "~/bin/status"}
+    });
+    fs::write(
+        root.join(".claude").join("settings.json"),
+        shared.to_string(),
+    )
+    .unwrap();
+    let local = json!({"apiKeyHelper": "get-key.sh"});
+    fs::write(settings_path(root), local.to_string()).unwrap();
+
+    let output = init(root);
+    assert_success(&output);
+    let text = stdout(&output);
+    assert!(
+        text.contains("they also run once this folder is trusted"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".claude/settings.json hooks.PreToolUse: ./guard.sh"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".claude/settings.json statusLine: ~/bin/status"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".claude/settings.local.json apiKeyHelper: get-key.sh"),
+        "{text}"
+    );
+    assert!(!text.contains(EXE), "{text}");
+
+    // Yalper's own registration alone lists nothing.
+    let plain = repository();
+    let text = stdout(&init(plain.path()));
+    assert!(!text.contains("Other commands"), "{text}");
 }

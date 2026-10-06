@@ -94,8 +94,10 @@ impl OwnedDir {
     }
 
     /// Whether users other than the owner can create, rename or delete entries in this directory: on Unix,
-    /// its group or world write bit is set. Windows: always false (access is governed by ACLs, which a
-    /// cloned repository cannot set).
+    /// its group or world write bit is set.
+    ///
+    /// Windows: always false. Access there is governed by ACLs, which Yalper does not inspect (a cloned
+    /// repository cannot set them, and a folder under the user's profile is private by default).
     pub fn is_writable_by_others(&self) -> io::Result<bool> {
         #[cfg(unix)]
         return Ok(rustix::fs::fstat(&self.handle)?.st_mode & 0o022 != 0);

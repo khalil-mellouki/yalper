@@ -496,6 +496,16 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+
+    /// Forgets the latest snapshot and the whole stat cache, so the next snapshot starts over from the empty
+    /// tree. For a snapshot store that had to be created again: the old trees and blobs are gone.
+    pub fn forget_snapshot(&self, _lock: &WriterLock) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM latest_snapshot", [])?;
+        transaction.execute("DELETE FROM file_cache", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 /// A stat cache row, or `None` if a value has an unexpected type.
@@ -923,8 +933,19 @@ mod tests {
         let store = Store::open(&owned, &token()).unwrap();
         assert!(!store.has_snapshot().unwrap());
         let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
-        store.save_snapshot(&lock, "tree", &[], &[], true).unwrap();
+        store
+            .save_snapshot(&lock, "tree", &[cached("a.rs", "aa")], &[], true)
+            .unwrap();
         assert!(store.has_snapshot().unwrap());
+
+        store.forget_snapshot(&lock).unwrap();
+        assert!(!store.has_snapshot().unwrap());
+        assert_eq!(store.file_cache().unwrap(), None);
+        let rows: u32 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
