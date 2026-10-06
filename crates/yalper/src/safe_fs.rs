@@ -114,6 +114,9 @@ impl OwnedDir {
         #[cfg(unix)]
         let is_file =
             match rustix::fs::statat(&self.handle, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                // No link left: the file was deleted between the name lookup and the stat (SQLite deletes its
+                // rollback journal while another process checks it), so it is missing.
+                Ok(stat) if stat.st_nlink == 0 => return Ok(()),
                 Ok(stat) => {
                     rustix::fs::FileType::from_raw_mode(stat.st_mode)
                         == rustix::fs::FileType::RegularFile
