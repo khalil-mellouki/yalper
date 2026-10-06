@@ -7,7 +7,6 @@
 
 mod input;
 
-use std::any::Any;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -38,17 +37,17 @@ pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MESSAGE_CHARS: usize = 2000;
 const MAX_EVENT_CHARS: usize = 64;
 
-/// The panic message and location, saved by the panic hook because `catch_unwind` only returns the payload.
+/// Where the last panic happened, saved by the panic hook because `catch_unwind` only returns the payload.
 static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
-/// Replaces the process-wide panic hook with one that prints nothing and keeps the message for
-/// [`run`] to log. Only the `yalper` binary calls this, so tests and other callers keep their own hook.
+/// Replaces the process-wide panic hook with one that prints nothing and keeps the panic's location for
+/// [`run`] to log. The panic message is not kept: it could quote payload text, and the error log is not
+/// redacted. Only the `yalper` binary calls this, so tests and other callers keep their own hook.
 pub fn silence_panics() {
     panic::set_hook(Box::new(|info| {
-        let message = panic_text(info.payload());
         let text = match info.location() {
-            Some(location) => format!("panic at {location}: {message}"),
-            None => format!("panic: {message}"),
+            Some(location) => format!("panic at {location}"),
+            None => "panic".to_owned(),
         };
         if let Ok(mut slot) = LAST_PANIC.lock() {
             *slot = Some(text);
@@ -63,24 +62,16 @@ pub fn run(stdin: &mut dyn Read) {
     let error = match panic::catch_unwind(AssertUnwindSafe(|| handle(stdin, &mut call))) {
         Ok(Ok(())) => return,
         Ok(Err(error)) => error,
-        Err(payload) => LAST_PANIC
+        Err(_) => LAST_PANIC
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
-            .unwrap_or_else(|| format!("panic: {}", panic_text(payload.as_ref()))),
+            .unwrap_or_else(|| "panic".to_owned()),
     };
     if let Some(dir) = &call.yalper_dir {
         // Nowhere is left to report a failure to write the error log, so it is ignored.
         let _ = append_error(dir, call.event, &error, ERRORS_LOG_MAX_BYTES);
     }
-}
-
-fn panic_text(payload: &(dyn Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload")
 }
 
 /// What is known about the current call, kept outside `catch_unwind` so errors can still be logged.
@@ -128,10 +119,14 @@ fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
 
     #[cfg(debug_assertions)]
     if env::var_os("YALPER_TEST_PANIC").is_some() {
-        panic!("forced by YALPER_TEST_PANIC");
+        // Quotes payload text, like a bug could: the message must not reach the error log.
+        panic!(
+            "forced by YALPER_TEST_PANIC in session {}",
+            input.session_id
+        );
     }
 
-    record::record(dir, &input)
+    record::record(dir, input)
 }
 
 /// Reads `reader` to the end, but keeps at most `limit` bytes. A longer input is drained (so the writer

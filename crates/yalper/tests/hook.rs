@@ -103,7 +103,7 @@ fn fixtures_cover_the_six_registered_events() {
     }
 
     let windows_path = inputs.iter().find_map(|input| {
-        input.tool_input.as_ref()?["file_path"]
+        input.tool_input()?["file_path"]
             .as_str()
             .filter(|path| path.starts_with("C:\\"))
     });
@@ -213,7 +213,7 @@ fn read_only_yalper_dir_still_exits_zero() {
 // The forced panic only exists in debug builds, so this test cannot run against a release binary.
 #[cfg(debug_assertions)]
 #[test]
-fn panic_is_caught_logged_as_one_line_and_exits_zero() {
+fn panic_is_caught_logged_as_one_line_without_its_message_and_exits_zero() {
     let project = project();
     let stdin = fs::read(&fixtures()[0]).unwrap();
     let output = Hook {
@@ -227,10 +227,10 @@ fn panic_is_caught_logged_as_one_line_and_exits_zero() {
     let lines = error_lines(project.path());
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("panic at "), "{lines:?}");
-    assert!(
-        lines[0].contains("forced by YALPER_TEST_PANIC"),
-        "{lines:?}"
-    );
+    assert!(lines[0].contains("hook.rs"), "{lines:?}");
+    // The message quotes the session id, and the log only gets the location.
+    assert!(!lines[0].contains("forced by"), "{lines:?}");
+    assert!(!lines[0].contains("00893aaf"), "{lines:?}");
 }
 
 #[test]

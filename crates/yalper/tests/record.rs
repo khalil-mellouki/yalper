@@ -7,7 +7,7 @@ use std::process::Command;
 
 use gix::ObjectId;
 use yalper::hook::{ERRORS_LOG, HookInput, YALPER_DIR, find_yalper_dir};
-use yalper::record::record;
+use yalper::record::{record, session_stand_in};
 use yalper::safe_fs::OwnedDir;
 use yalper::snapshot::{self, SNAPSHOTS_DIR, ShadowStore};
 use yalper::store::{LOCK_TIMEOUT, Store, WriterLock};
@@ -76,18 +76,18 @@ fn fixtures_in_order_record_every_step_with_its_snapshot() {
 
     // The developer edits a file before starting Claude Code, and another one before the first prompt.
     fs::write(root.join("README.md"), "# Demo project\n").unwrap();
-    record(&dir, &fixture("session_start.json")).unwrap();
+    record(&dir, fixture("session_start.json")).unwrap();
     fs::write(root.join("notes.txt"), "try factorial\n").unwrap();
-    record(&dir, &fixture("user_prompt_submit.json")).unwrap();
+    record(&dir, fixture("user_prompt_submit.json")).unwrap();
     // The Write tool writes its file, then its PostToolUse hook runs.
     let factorial = "pub fn factorial(n: u64) -> u64 {\n    (1..=n).product()\n}\n";
     fs::write(root.join("src/factorial.rs"), factorial).unwrap();
-    record(&dir, &fixture("post_tool_use_write_windows.json")).unwrap();
+    record(&dir, fixture("post_tool_use_write_windows.json")).unwrap();
     rewrite_with_a_child_process(root);
-    record(&dir, &fixture("post_tool_use_bash_subagent.json")).unwrap();
-    record(&dir, &fixture("post_tool_use_failure.json")).unwrap();
-    record(&dir, &fixture("stop.json")).unwrap();
-    record(&dir, &fixture("session_end.json")).unwrap();
+    record(&dir, fixture("post_tool_use_bash_subagent.json")).unwrap();
+    record(&dir, fixture("post_tool_use_failure.json")).unwrap();
+    record(&dir, fixture("stop.json")).unwrap();
+    record(&dir, fixture("session_end.json")).unwrap();
 
     assert!(!root.join(YALPER_DIR).join(ERRORS_LOG).exists());
     let store = Store::open(&dir).unwrap();
@@ -208,8 +208,8 @@ fn an_event_of_an_unknown_session_creates_it_and_a_resume_reopens_it() {
     let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
 
     // Yalper was set up in the middle of a session: its first event is a tool call.
-    record(&dir, &fixture("post_tool_use_failure.json")).unwrap();
-    record(&dir, &fixture("session_end.json")).unwrap();
+    record(&dir, fixture("post_tool_use_failure.json")).unwrap();
+    record(&dir, fixture("session_end.json")).unwrap();
     let store = Store::open(&dir).unwrap();
     let session = &store.sessions().unwrap()[0];
     assert_eq!(session.source, None);
@@ -218,7 +218,7 @@ fn an_event_of_an_unknown_session_creates_it_and_a_resume_reopens_it() {
     let mut resume = fixture("session_start.json");
     resume.source = Some("resume".to_owned());
     resume.raw["source"] = "resume".into();
-    record(&dir, &resume).unwrap();
+    record(&dir, resume).unwrap();
     let session = &store.sessions().unwrap()[0];
     assert_eq!(session.source.as_deref(), Some("resume"));
     assert_eq!(
@@ -247,6 +247,25 @@ fn events_yalper_does_not_register_for_are_ignored() {
     let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
     let mut input = fixture("stop.json");
     input.event = yalper::hook::HookEvent::Other("PostToolBatch".to_owned());
-    record(&dir, &input).unwrap();
+    record(&dir, input).unwrap();
     assert_eq!(Store::open(&dir).unwrap().sessions().unwrap(), []);
+}
+
+#[test]
+fn a_session_id_that_redaction_changes_is_stored_as_its_hash() {
+    let project = common::project();
+    let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
+    let secret_id = format!("ghp_{}", "L4k8J2h6G1f5D9s3A7p0".repeat(2).split_at(36).0);
+    for name in ["session_start.json", "stop.json"] {
+        let mut input = fixture(name);
+        input.session_id = secret_id.clone();
+        input.raw["session_id"] = secret_id.clone().into();
+        record(&dir, input).unwrap();
+    }
+
+    let store = Store::open(&dir).unwrap();
+    let sessions = store.sessions().unwrap();
+    assert_eq!(sessions.len(), 1, "both events belong to one session");
+    assert_eq!(sessions[0].id, session_stand_in(&secret_id));
+    assert_eq!(store.events(&sessions[0].id).unwrap().len(), 2);
 }
