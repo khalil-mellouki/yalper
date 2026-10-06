@@ -830,8 +830,9 @@ fn is_hidden_format(c: char) -> bool {
             | '\u{17B4}'..='\u{17B5}'
             | '\u{3164}'
             | '\u{FFA0}'
-            // Variation selectors.
-            | '\u{FE00}'..='\u{FE0F}'
+            // Variation selectors, except the text and emoji presentation selectors U+FE0E and U+FE0F, which
+            // follow emoji in ordinary text and hide nothing.
+            | '\u{FE00}'..='\u{FE0D}'
             | '\u{E0100}'..='\u{E01EF}'
     )
 }
@@ -1137,7 +1138,7 @@ mod tests {
             '\u{206F}',
             '\u{3164}',
             '\u{FE00}',
-            '\u{FE0F}',
+            '\u{FE0D}',
             '\u{FFA0}',
             '\u{FFFB}',
             '\u{1D173}',
@@ -1149,8 +1150,8 @@ mod tests {
                 format!("<U+{:04X}>", u32::from(c))
             );
         }
-        // Kept: the emoji joiner, accents, other scripts.
-        let kept = "\u{1F469}\u{200D}\u{1F4BB} é 日本 שלום";
+        // Kept: the emoji joiner, the emoji and text presentation selectors, accents, other scripts.
+        let kept = "\u{1F469}\u{200D}\u{1F4BB} \u{2764}\u{FE0F} \u{2764}\u{FE0E} é 日本 שלום";
         assert_eq!(printable(kept), kept);
     }
 
