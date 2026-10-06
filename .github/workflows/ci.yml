@@ -41,6 +41,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  bench:
+    name: Hook latency (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run hook latency benchmark (report only)
+        shell: bash
+        run: |
+          cargo bench --locked --bench hook_latency | tee bench.txt
+          grep '^hook_latency' bench.txt >> "$GITHUB_STEP_SUMMARY"
+
   deny:
     name: Licenses and advisories
     runs-on: ubuntu-latest
