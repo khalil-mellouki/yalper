@@ -10,7 +10,7 @@ use std::fmt;
 use std::fs::{self, Metadata};
 use std::io::{self, Read};
 use std::path::{Component, Path};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,9 +35,9 @@ const RACY_WINDOW: Duration = Duration::from_secs(2);
 /// help, and more only cost time to start.
 const WALK_THREADS: usize = 4;
 
-/// Entries the walk can get ahead of the thread that stores them. A changed file carries its content (at most
+/// Changed files the walk can read ahead of the thread that stores them. Each carries its content (at most
 /// [`MAX_FILE_BYTES`]), so this bounds memory when many files changed at once.
-const QUEUED_ENTRIES: usize = 16;
+const QUEUED_CONTENTS: usize = 16;
 
 /// The result of [`snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +49,7 @@ pub struct Snapshot {
     pub changed: Vec<String>,
     /// Files and directories left out of the snapshot or kept as they were, sorted by path.
     pub skipped: Vec<Skipped>,
-    /// How many times a file was read: files the stat cache knew to be unchanged are not read, and a changed
-    /// file that the walk hashed is read a second time to be stored.
+    /// How many files were read. Files the stat cache knew to be unchanged are not read.
     pub files_read: usize,
 }
 
@@ -95,6 +94,9 @@ pub enum SkipReason {
     /// Could not be read, for example a file locked by another process on Windows or a directory without
     /// read permission: it keeps what the previous snapshot had (for a directory, everything inside it).
     Unreadable(String),
+    /// An ignore file (`.gitignore` or `info/exclude`) whose rules are not used, so the files it would ignore
+    /// are snapshotted. The file itself is snapshotted like any other.
+    IgnoreFileNotUsed(String),
 }
 
 impl fmt::Display for Skipped {
@@ -112,6 +114,9 @@ impl fmt::Display for Skipped {
             SkipReason::InvalidPath(reason) => write!(f, "{path:?} not snapshotted: {reason}"),
             SkipReason::Unreadable(error) => {
                 write!(f, "{path:?} kept from the previous snapshot: {error}")
+            }
+            SkipReason::IgnoreFileNotUsed(reason) => {
+                write!(f, "{path:?} not used as an ignore file: {reason}")
             }
         }
     }
@@ -139,7 +144,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
     let start_over = previous.is_none();
     let (base, cache) =
         previous.unwrap_or_else(|| (ObjectId::empty_tree(gix::hash::Kind::Sha1), HashMap::new()));
-    let excludes = Excludes::new(root);
+    let excludes = Arc::new(Excludes::new(root));
 
     let mut shadow = None;
     let mut snapshot = Snapshot {
@@ -156,10 +161,13 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
     let mut kept_prefixes = Vec::new();
 
     thread::scope(|scope| -> Result<()> {
-        let (sender, receiver) = mpsc::sync_channel(QUEUED_ENTRIES);
-        let (cache, excludes) = (&cache, &excludes);
-        scope.spawn(move || walk(root, cache, excludes, sender));
-        // If this loop stops early, dropping `receiver` makes the walk stop too.
+        let (sender, receiver) = mpsc::channel();
+        // The walk takes a permit before it sends a changed file's content, and gets it back once the content
+        // is stored here.
+        let (permits, taken_permits) = mpsc::sync_channel(QUEUED_CONTENTS);
+        let (cache, walk_excludes) = (&cache, Arc::clone(&excludes));
+        scope.spawn(move || walk(root, cache, walk_excludes, sender, permits));
+        // If this loop stops early, dropping the receivers makes the walk stop too.
         for walked in receiver {
             let (file, check) = match walked {
                 Walked::File(file, check) => (file, check),
@@ -182,6 +190,8 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
                     (oid, len)
                 }
                 Check::Changed { bytes } => {
+                    // Sent before the content, so it is already there.
+                    let _ = taken_permits.recv();
                     snapshot.files_read += 1;
                     let oid = open_once(&mut shadow, yalper_dir)?.write_blob(&bytes)?;
                     changes.push(Change::Upsert {
@@ -209,6 +219,13 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
         }
         Ok(())
     })?;
+
+    for (path, reason) in excludes.refused() {
+        snapshot.skipped.push(Skipped {
+            path: relative_path(root, &path).unwrap_or_else(|lossy| lossy),
+            reason: SkipReason::IgnoreFileNotUsed(reason),
+        });
+    }
 
     let mut removed = Vec::new();
     for path in cache.keys() {
@@ -335,14 +352,16 @@ enum Check {
 
 /// Sends every file and symlink of the project that is not ignored, with its size, mtime and kind, to
 /// `sender`, using parallel threads. Files the stat cache cannot vouch for are read and hashed in those
-/// threads; only changed contents are sent. `sender` holds few entries, so memory stays bounded whatever
-/// the size of the project.
+/// threads, and only changed contents are sent, each after taking one of the bounded `permits`, so memory
+/// stays bounded whatever the size of the project.
 fn walk(
     root: &Path,
     cache: &HashMap<String, Cached>,
-    excludes: &Excludes,
-    sender: mpsc::SyncSender<Walked>,
+    excludes: Arc<Excludes>,
+    sender: mpsc::Sender<Walked>,
+    permits: mpsc::SyncSender<()>,
 ) {
+    let filter_excludes = Arc::clone(&excludes);
     WalkBuilder::new(root)
         // Dotfiles are code too. Ignore files are read by `Excludes`, not by the walker (see there), and
         // never above the project, as git does.
@@ -353,21 +372,32 @@ fn walk(
         .git_exclude(false)
         .git_global(false)
         .follow_links(false)
-        // At any depth: nested repositories and submodules have their own `.git`.
-        .filter_entry(|entry| {
+        // Runs before an entry is queued, so an ignored directory is never listed. Its parent was visited
+        // first, so the parent's `.gitignore` is known.
+        .filter_entry(move |entry| {
             let name = entry.file_name();
-            !(name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(YALPER_DIR))
+            // At any depth: nested repositories and submodules have their own `.git`.
+            let never = name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(YALPER_DIR);
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            !never && !filter_excludes.is_ignored(entry.path(), is_dir)
         })
         .threads(WALK_THREADS)
         .build_parallel()
         .run(|| {
-            let sender = sender.clone();
+            let (sender, permits, excludes) = (sender.clone(), permits.clone(), &excludes);
             Box::new(move |entry| {
                 let (walked, state) = visit(root, cache, excludes, entry);
-                match walked.map(|walked| sender.send(walked)) {
+                let Some(walked) = walked else {
+                    return state;
+                };
+                let permit = match &walked {
+                    Walked::File(_, Check::Changed { .. }) => permits.send(()),
+                    _ => Ok(()),
+                };
+                match permit.and_then(|()| sender.send(walked).map_err(|_| mpsc::SendError(()))) {
+                    Ok(()) => state,
                     // The snapshot stopped early: so does the walk.
-                    Some(Err(_)) => WalkState::Quit,
-                    _ => state,
+                    Err(_) => WalkState::Quit,
                 }
             })
         });
@@ -391,9 +421,6 @@ fn visit(
     if entry.depth() == 0 {
         excludes.add_dir(entry.path());
         return (None, WalkState::Continue);
-    }
-    if excludes.is_ignored(entry.path(), file_type.is_dir()) {
-        return (None, WalkState::Skip);
     }
     let skip = |path: String, reason| {
         let skipped = Skipped { path, reason };
@@ -608,7 +635,7 @@ fn link_bytes(target: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::excludes::MAX_IGNORE_FILE_BYTES;
+    use crate::snapshot::excludes::MAX_IGNORE_BYTES;
     use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
 
@@ -1236,13 +1263,45 @@ mod tests {
     fn an_oversized_gitignore_is_not_used() {
         let project = Project::new();
         let mut huge = "*.txt\n".to_owned();
-        while huge.len() as u64 <= MAX_IGNORE_FILE_BYTES {
+        while huge.len() as u64 <= MAX_IGNORE_BYTES {
             huge.push_str("# padding to make the file larger than the limit\n");
         }
         project.write(".gitignore", &huge);
         project.write("kept.txt", "kept");
         let snapshot = project.snapshot();
         assert_eq!(paths(&project, &snapshot), [".gitignore", "kept.txt"]);
+        assert_eq!(snapshot.skipped.len(), 1, "{:?}", snapshot.skipped);
+        assert_eq!(snapshot.skipped[0].path, ".gitignore");
+        let problems = snapshot.problems().unwrap();
+        assert!(
+            problems.contains("not used as an ignore file") && problems.contains("bytes"),
+            "{problems}"
+        );
+    }
+
+    #[test]
+    fn ignore_files_share_a_pattern_budget() {
+        let project = Project::new();
+        // Each file weighs 600 (300 patterns of weight 2): the root's fits, then the subdirectory's does not.
+        let rules = |extra: &str| -> String {
+            let mut rules: String = (0..299).map(|i| format!("x{i}*\n")).collect();
+            rules.push_str(extra);
+            rules
+        };
+        project.write(".gitignore", &rules("*.log\n"));
+        project.write("sub/.gitignore", &rules("*.tmp\n"));
+        project.write("a.log", "x");
+        project.write("sub/b.log", "x");
+        project.write("sub/c.tmp", "x");
+        let snapshot = project.snapshot();
+        assert_eq!(
+            paths(&project, &snapshot),
+            [".gitignore", "sub/.gitignore", "sub/c.tmp"]
+        );
+        assert_eq!(snapshot.skipped.len(), 1, "{:?}", snapshot.skipped);
+        assert_eq!(snapshot.skipped[0].path, "sub/.gitignore");
+        let problems = snapshot.problems().unwrap();
+        assert!(problems.contains("pattern weight"), "{problems}");
     }
 
     #[test]
@@ -1386,5 +1445,136 @@ mod tests {
         );
         assert!(line.ends_with("; and 2 more"), "{line}");
         assert!(!line.contains("big.bin"), "{line}");
+    }
+
+    /// The files git lists as untracked and not ignored, sorted.
+    fn git_sees(project: &Project) -> Vec<String> {
+        let output = git(
+            project.root(),
+            &["ls-files", "-z", "--others", "--exclude-standard"],
+        );
+        let mut paths: Vec<String> = output
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Checks that the snapshot holds exactly the files git does not ignore.
+    fn same_as_git(case: &str, setup: impl Fn(&Project)) {
+        let project = Project::new();
+        setup(&project);
+        let snapshot = project.snapshot();
+        let ours: Vec<String> = project.files(snapshot.tree_id).into_keys().collect();
+        assert_eq!(ours, git_sees(&project), "case {case}");
+    }
+
+    #[test]
+    fn ignore_rules_match_git() {
+        same_as_git("byte order mark", |p| {
+            p.write(".gitignore", "\u{feff}node_modules/\n*.tmp\n");
+            p.write("node_modules/x/index.js", "x");
+            p.write("a.tmp", "x");
+            p.write("a.rs", "x");
+        });
+        same_as_git("directory only, anchored, middle slash", |p| {
+            p.write(".gitignore", "foo/\n/rootonly.txt\na/b\ndoc/frotz/\n");
+            p.write("foo", "a file named foo");
+            p.write("x/foo/in.txt", "x");
+            p.write("rootonly.txt", "x");
+            p.write("sub/rootonly.txt", "x");
+            p.write("a/b", "x");
+            p.write("x/a/b", "x");
+            p.write("doc/frotz/f.txt", "x");
+            p.write("x/doc/frotz/f.txt", "x");
+        });
+        same_as_git("double stars", |p| {
+            let rules = "**/deep.txt\ndocs/**/*.tmp\nlib/**\n!lib/keep.txt\n**/foo/bar\nabc/**/\n";
+            p.write(".gitignore", rules);
+            p.write("a/b/c/deep.txt", "x");
+            p.write("deep.txt", "x");
+            p.write("docs/x.tmp", "x");
+            p.write("docs/a/b/x.tmp", "x");
+            p.write("lib/keep.txt", "x");
+            p.write("lib/other.txt", "x");
+            p.write("lib/sub/keep.txt", "x");
+            p.write("z/foo/bar", "x");
+            p.write("foo/bar", "x");
+            p.write("abc/file.txt", "x");
+            p.write("abc/d/file.txt", "x");
+        });
+        same_as_git("no re-include inside an ignored directory", |p| {
+            p.write(
+                ".gitignore",
+                "ign/\n!ign/keep.txt\nstar/*\n!star/keep.txt\n",
+            );
+            p.write("ign/keep.txt", "x");
+            p.write("ign/other.txt", "x");
+            p.write("star/keep.txt", "x");
+            p.write("star/other.txt", "x");
+            p.write("star/d/keep.txt", "x");
+            p.write("ign2/.gitignore", "!*\n");
+            p.write("ign2/keep.txt", "x");
+            p.write("x/.gitignore", "../ign2/\n");
+        });
+        same_as_git("spaces, escapes, CRLF and comments", |p| {
+            let rules =
+                "trail.txt   \r\n\\#hash.txt\r\n\\!bang.txt\r\ncrlf.txt\r\n# comment.txt\r\n";
+            p.write(".gitignore", rules);
+            p.write("trail.txt", "x");
+            p.write("#hash.txt", "x");
+            p.write("!bang.txt", "x");
+            p.write("crlf.txt", "x");
+            p.write("comment.txt", "x");
+        });
+        same_as_git("ranges", |p| {
+            // POSIX classes such as `[[:digit:]]` are a known difference (see `excludes`).
+            p.write(".gitignore", "[a-c]x.txt\n[!a]y.txt\n");
+            p.write("bx.txt", "x");
+            p.write("dx.txt", "x");
+            p.write("ay.txt", "x");
+            p.write("by.txt", "x");
+        });
+        same_as_git("letter case", |p| {
+            p.write(".gitignore", "*.LOG\nBuild/\nSecret.txt\n");
+            p.write("x.log", "x");
+            p.write("build/out.txt", "x");
+            p.write("secret.txt", "x");
+            p.write("kept.txt", "x");
+        });
+        same_as_git("info/exclude and .gitignore precedence", |p| {
+            let exclude = p.root().join(".git/info/exclude");
+            fs::write(&exclude, ".yalper/\ny.txt\n!x.txt\n*.ex\n").unwrap();
+            p.write(".gitignore", "x.txt\n!y.txt\n");
+            p.write("sub/.gitignore", "!*.ex\n");
+            p.write("x.txt", "x");
+            p.write("y.txt", "x");
+            p.write("a.ex", "x");
+            p.write("sub/b.ex", "x");
+        });
+        same_as_git("patterns relative to a subdirectory", |p| {
+            p.write("sub/.gitignore", "/x\ny/z.txt\n*.o\n");
+            p.write("x", "x");
+            p.write("sub/x", "x");
+            p.write("sub/q/x", "x");
+            p.write("sub/y/z.txt", "x");
+            p.write("y/z.txt", "x");
+            p.write("sub/deeper/m.o", "x");
+            p.write("m.o", "x");
+        });
+        same_as_git("everything but directories and sources", |p| {
+            p.write(".gitignore", "*\n!*/\n!*.rs\n");
+            p.write("a.rs", "x");
+            p.write("a.txt", "x");
+            p.write("d/b.rs", "x");
+            p.write("d/b.txt", "x");
+        });
+        same_as_git("directory pattern and a file of that name", |p| {
+            p.write(".gitignore", "cache/\n");
+            p.write("a/cache/x", "x");
+            p.write("b/cache", "x");
+        });
     }
 }
