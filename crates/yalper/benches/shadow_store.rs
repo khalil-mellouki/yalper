@@ -1,5 +1,5 @@
 //! Measures the shadow store work of one agent step: open the store, write 3 changed files as blobs, build
-//! the new tree from the previous one, and list the changed paths.
+//! the new tree from the previous one, then (reported separately) list the changed paths.
 //!
 //! The store starts with a snapshot of 1,000 files in 111 directories, like the project of the hook latency
 //! benchmark. Run with `cargo bench --bench shadow_store`. Set `YALPER_BENCH_CALLS` to change the number of
@@ -26,8 +26,9 @@ fn content(index: usize, version: usize) -> Vec<u8> {
         .into_bytes()
 }
 
-/// One step: returns the new tree and how long the step took.
-fn step(dir: &OwnedDir, tree: gix::ObjectId, step: usize) -> (gix::ObjectId, Duration) {
+/// One step: returns the new tree, the time to build it (open, blobs, tree), and the time including the
+/// changed paths listing.
+fn step(dir: &OwnedDir, tree: gix::ObjectId, step: usize) -> (gix::ObjectId, Duration, Duration) {
     let start = Instant::now();
     let store = ShadowStore::open(dir).unwrap();
     let changes: Vec<Change> = (0..CHANGED_PER_STEP)
@@ -41,14 +42,28 @@ fn step(dir: &OwnedDir, tree: gix::ObjectId, step: usize) -> (gix::ObjectId, Dur
         })
         .collect();
     let new_tree = store.edit_tree(tree, &changes).unwrap();
+    let built = start.elapsed();
     let changed = store.changed_paths(tree, new_tree).unwrap();
-    let elapsed = start.elapsed();
+    let with_diff = start.elapsed();
     assert_eq!(changed.modified.len(), CHANGED_PER_STEP);
-    (new_tree, elapsed)
+    (new_tree, built, with_diff)
 }
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+/// Median and p90 of `times`, in milliseconds.
+fn summary(times: &mut [Duration]) -> String {
+    times.sort();
+    let steps = times.len();
+    let median = if steps % 2 == 1 {
+        millis(times[steps / 2])
+    } else {
+        (millis(times[steps / 2 - 1]) + millis(times[steps / 2])) / 2.0
+    };
+    let p90 = millis(times[(steps * 9).div_ceil(10) - 1]);
+    format!("median {median:.2} ms, p90 {p90:.2} ms")
 }
 
 fn main() {
@@ -74,27 +89,19 @@ fn main() {
     for index in 0..WARMUP_STEPS {
         tree = step(&dir, tree, index).0;
     }
-    let mut times: Vec<Duration> = (0..steps)
-        .map(|index| {
-            let (new_tree, elapsed) = step(&dir, tree, WARMUP_STEPS + index);
-            tree = new_tree;
-            elapsed
-        })
-        .collect();
-    times.sort();
+    let (mut built, mut with_diff) = (Vec::new(), Vec::new());
+    for index in 0..steps {
+        let (new_tree, build_time, diff_time) = step(&dir, tree, WARMUP_STEPS + index);
+        tree = new_tree;
+        built.push(build_time);
+        with_diff.push(diff_time);
+    }
 
-    let median = if steps % 2 == 1 {
-        millis(times[steps / 2])
-    } else {
-        (millis(times[steps / 2 - 1]) + millis(times[steps / 2])) / 2.0
-    };
-    let p90 = millis(times[(steps * 9).div_ceil(10) - 1]);
     println!(
-        "shadow_store ({os}, {FILES} files, {CHANGED_PER_STEP} changed per step, {steps} steps, open + \
-         write blobs + edit tree + changed paths): median {median:.2} ms, p90 {p90:.2} ms, min {min:.2} ms, \
-         max {max:.2} ms",
+        "shadow_store ({os}, {FILES} files, {CHANGED_PER_STEP} changed per step, {steps} steps): open + write \
+         blobs + edit tree: {built}; with changed paths: {with_diff}",
         os = env::consts::OS,
-        min = millis(times[0]),
-        max = millis(times[steps - 1]),
+        built = summary(&mut built),
+        with_diff = summary(&mut with_diff),
     );
 }

@@ -13,15 +13,34 @@ use std::fmt;
 use std::fs;
 use std::io;
 
-use gix::ObjectId;
-use gix::bstr::BStr;
+use gix::bstr::{BStr, ByteSlice};
+use gix::error::ErrorExt;
 use gix::objs::tree::EntryKind;
+use gix::objs::{Find, FindExt};
 use gix::validate::path::component;
+use gix::{ObjectId, oid};
 
 use crate::safe_fs::OwnedDir;
 
 /// The shadow repository inside `.yalper/`.
 pub const SNAPSHOTS_DIR: &str = "snapshots.git";
+
+/// The store's whole `config`: written by [`ShadowStore::init`] and required byte for byte by
+/// [`ShadowStore::open`]. Snapshots are only referenced from the event log, never from refs, so automatic gc
+/// is off and unreachable objects never expire: running `git gc` on the store cannot delete a snapshot.
+const STORE_CONFIG: &str = "[core]\n\
+                            \trepositoryformatversion = 0\n\
+                            \tbare = true\n\
+                            [gc]\n\
+                            \tauto = 0\n\
+                            \tpruneExpire = never\n";
+
+/// `HEAD` holds one line like `ref: refs/heads/main`; anything larger was not written by Yalper.
+const MAX_HEAD_BYTES: u64 = 256;
+
+/// The most memory gix may allocate for one object, the same cap as for a hook payload. Files over 10 MiB are
+/// never snapshotted, so a larger object can only come from corruption.
+const ALLOC_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Path rules for names stored in trees: git's defaults for the platform (`core.protectNTFS` everywhere,
 /// `core.protectHFS` on macOS, Windows names on Windows). They are fixed here rather than read from the
@@ -180,23 +199,32 @@ impl ShadowStore {
             gix::create::Options::default(),
             gix::open::Options::isolated(),
         )?;
+        // A fixed config instead of the probed one (its file system settings only matter for a work tree), and
+        // no ref directories: `open` requires `refs/` to be empty.
+        fs::write(path.join("config"), STORE_CONFIG)?;
+        fs::remove_dir(path.join("refs").join("heads"))?;
+        fs::remove_dir(path.join("refs").join("tags"))?;
         Self::open(yalper_dir)
     }
 
     /// Opens the store in `yalper_dir`.
     ///
-    /// The store must be a real directory (on Unix owned by the current user), and contain no link in
-    /// `objects/`, no alternates and no `commondir` file: any of these could send writes or reads to another
-    /// repository, such as the user's own `.git`. Remaining gap, outside the threat model: another process of
-    /// the same user could plant such a link after these checks.
+    /// Before gix reads anything, the layout must be exactly what [`init`](Self::init) and object writes
+    /// produce: a real directory (on Unix owned by the current user), Yalper's own `config`, a small `HEAD`,
+    /// no refs, packs, alternates or `commondir`, and no link in `objects/`. Links, alternates and `commondir`
+    /// could send writes or reads to another repository, such as the user's own `.git`; refs could replace
+    /// objects. Every object read is also checked against its id, see [`Verified`]. Remaining gap, outside the
+    /// threat model: another process of the same user could change the store after these checks.
     pub fn open(yalper_dir: &OwnedDir) -> Result<Self> {
         let dir = OwnedDir::open(&yalper_dir.path().join(SNAPSHOTS_DIR))?;
         check_layout(&dir)?;
         let options = gix::open::Options::isolated()
             .open_path_as_is(true)
-            // Ownership was checked by `OwnedDir` (Unix). Asking gix to check it again costs time, mostly on
-            // Windows, and with isolated options trust only decides whether the store's own config is used.
-            .with(gix::sec::Trust::Full);
+            // Full trust skips gix's own ownership check (slow on Windows; `OwnedDir` checks ownership on
+            // Unix) and its reduced-trust defaults. Of those, only the allocation limit matters for this store
+            // (its config is Yalper's own, compared above), so it is set explicitly.
+            .with(gix::sec::Trust::Full)
+            .config_overrides([format!("gitoxide.objects.allocLimit={ALLOC_LIMIT_BYTES}")]);
         let mut repo = gix::open_opts(dir.path(), options)?;
         // Every new blob or tree is first looked up and not found. By default each miss rescans the store's
         // pack directory, which this store never has (measured: 22 ms instead of 15 ms per 3-file step on
@@ -216,12 +244,16 @@ impl ShadowStore {
     }
 
     /// Builds the tree that results from applying `changes` to the tree `base`, writes it, and returns its
-    /// id. Only the trees on the paths of the changes are rewritten.
+    /// id. Only the trees on the paths of the changes are rewritten, and no change at all returns `base`
+    /// without reading anything.
     ///
     /// Removals are applied before additions, so a file replaced by a directory of the same name (or the
     /// reverse) can be given in any order. Every path is checked before anything is written, and every
     /// blob must already be in the store.
     pub fn edit_tree(&self, base: ObjectId, changes: &[Change]) -> Result<ObjectId> {
+        if changes.is_empty() {
+            return Ok(base);
+        }
         for change in changes {
             match change {
                 Change::Upsert { path, kind, blob } => {
@@ -237,7 +269,13 @@ impl ShadowStore {
         // gix's checked editor validates every entry of each rewritten tree and looks up every object they
         // point to, one file system access per entry: slow for large directories. The plain editor is used
         // instead, and only the changed paths are checked, above.
-        let mut editor = self.repo.edit_tree(base)?.detach();
+        let objects = self.verified();
+        let mut buffer = Vec::new();
+        let root = objects
+            .find_tree(&base, &mut buffer)
+            .map_err(gix::Error::from)?;
+        let mut editor =
+            gix::objs::tree::Editor::new(root.into(), &objects, self.repo.object_hash());
         for change in changes {
             if let Change::Remove { path } = change {
                 editor.remove(path.split('/')).map_err(gix::Error::from)?;
@@ -255,16 +293,23 @@ impl ShadowStore {
     }
 
     /// The files added, modified and deleted between the trees `old` and `new`. Directories are not listed,
-    /// only the files in them.
+    /// only the files in them. Every path is checked like a new one (see [`validate_path`]), so a tree that
+    /// Yalper could not have written is refused.
     pub fn changed_paths(&self, old: ObjectId, new: ObjectId) -> Result<ChangedPaths> {
-        let old = self.repo.find_tree(old)?;
-        let new = self.repo.find_tree(new)?;
+        let objects = self.verified();
+        let (mut old_buffer, mut new_buffer) = (Vec::new(), Vec::new());
+        let old = objects
+            .find_tree_iter(&old, &mut old_buffer)
+            .map_err(gix::Error::from)?;
+        let new = objects
+            .find_tree_iter(&new, &mut new_buffer)
+            .map_err(gix::Error::from)?;
         let mut recorder = gix::diff::tree::Recorder::default();
         gix::diff::tree(
-            gix::objs::TreeRefIter::from_bytes(&old.data, self.repo.object_hash()),
-            gix::objs::TreeRefIter::from_bytes(&new.data, self.repo.object_hash()),
+            old,
+            new,
             gix::diff::tree::State::default(),
-            &self.repo.objects,
+            objects,
             &mut recorder,
         )
         .map_err(|error| Error::Git(gix::Error::from_error(error)))?;
@@ -272,21 +317,35 @@ impl ShadowStore {
         let mut changed = ChangedPaths::default();
         for change in recorder.records {
             use gix::diff::tree::recorder::Change::{Addition, Deletion, Modification};
-            let (list, path) = match change {
+            let (list, entry_mode, path) = match change {
                 Addition {
                     entry_mode, path, ..
-                } if !entry_mode.is_tree() => (&mut changed.added, path),
+                } => (&mut changed.added, entry_mode, path),
                 Deletion {
                     entry_mode, path, ..
-                } if !entry_mode.is_tree() => (&mut changed.deleted, path),
+                } => (&mut changed.deleted, entry_mode, path),
                 // A file and a directory of the same name are different entries in git's sort order, so a
                 // file replaced by a directory shows as a deletion plus additions, never as a modification.
                 Modification {
                     entry_mode, path, ..
-                } if !entry_mode.is_tree() => (&mut changed.modified, path),
-                _ => continue,
+                } => (&mut changed.modified, entry_mode, path),
             };
-            list.push(path.to_string());
+            if entry_mode.is_tree() {
+                continue;
+            }
+            let Ok(path) = path.to_str() else {
+                return Err(Error::InvalidPath {
+                    path: path.to_str_lossy().into_owned(),
+                    reason: "not valid UTF-8".to_owned(),
+                });
+            };
+            let kind = if entry_mode.is_link() {
+                FileKind::Symlink
+            } else {
+                FileKind::Regular
+            };
+            validate_path(path, kind)?;
+            list.push(path.to_owned());
         }
         for list in [
             &mut changed.added,
@@ -297,50 +356,116 @@ impl ShadowStore {
         }
         Ok(changed)
     }
+
+    fn verified(&self) -> Verified<'_> {
+        Verified(&self.repo.objects)
+    }
 }
 
-/// Checks that `path` can be stored in a tree as a file of `kind`: relative, `/`-separated, with no empty,
-/// `.`, `..` or `.git` component and no name the platform's file system treats specially (see
+/// Object reads that recompute each object's hash and refuse one that does not match its id, so a corrupted
+/// or planted object cannot change what a snapshot contains. A tree cannot contain its own id, so this also
+/// rules out cycles. Used for every tree read; blobs are not read on the recording path.
+#[derive(Clone, Copy)]
+struct Verified<'a>(&'a gix::OdbHandle);
+
+impl Find for Verified<'_> {
+    fn try_find<'a>(
+        &self,
+        id: &oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> gix::ExnResult<Option<gix::objs::Data<'a>>> {
+        // git knows the empty tree without storing it.
+        if id.is_empty_tree() {
+            buffer.clear();
+            return Ok(Some(gix::objs::Data {
+                kind: gix::objs::Kind::Tree,
+                object_hash: id.kind(),
+                data: buffer,
+            }));
+        }
+        let Some(data) = self.0.try_find(id, buffer)? else {
+            return Ok(None);
+        };
+        let actual =
+            gix::objs::compute_hash(id.kind(), data.kind, data.data).map_err(gix::Exn::erased)?;
+        if actual != id {
+            return Err(gix::error::corruption(format!(
+                "object {id} does not match its id ({actual})"
+            ))
+            .raise_erased());
+        }
+        Ok(Some(data))
+    }
+}
+
+/// Checks that `path` can be stored in a tree as a file of `kind`: relative, `/`-separated, with no NUL byte,
+/// no empty, `.`, `..` or `.git` component and no name the platform's file system treats specially (see
 /// [`PATH_RULES`]).
 pub fn validate_path(path: &str, kind: FileKind) -> Result<()> {
+    let invalid = |reason: String| Error::InvalidPath {
+        path: path.to_owned(),
+        reason,
+    };
+    // A NUL ends a name in git's tree format, so it would silently cut the path.
+    if path.contains('\0') {
+        return Err(invalid("contains a NUL byte".to_owned()));
+    }
     let mut components = path.split('/').peekable();
     while let Some(name) = components.next() {
         let mode = (components.peek().is_none() && kind == FileKind::Symlink)
             .then_some(component::Mode::Symlink);
         if let Err(error) = gix::validate::path::component(BStr::new(name), mode, PATH_RULES) {
-            return Err(Error::InvalidPath {
-                path: path.to_owned(),
-                reason: error.to_string(),
-            });
+            return Err(invalid(error.to_string()));
         }
     }
     Ok(())
 }
 
-/// See [`ShadowStore::open`].
+/// See [`ShadowStore::open`]. A few metadata reads, three short directory listings and one read of `config`.
 fn check_layout(dir: &OwnedDir) -> Result<()> {
     let root = dir.path();
-    for unexpected in ["commondir", "objects/info/alternates"] {
-        match fs::symlink_metadata(root.join(unexpected)) {
+    let unexpected = |what: &str| Err(Error::UnexpectedLayout(what.to_owned()));
+    for name in ["commondir", "packed-refs", "objects/info/alternates"] {
+        match fs::symlink_metadata(root.join(name)) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(_) => return Err(Error::UnexpectedLayout(format!("`{unexpected}`"))),
+            Ok(_) => return unexpected(&format!("`{name}`")),
             Err(error) => return Err(error.into()),
         }
     }
+
+    let config = fs::symlink_metadata(root.join("config"))?;
+    if !config.is_file()
+        || config.len() != STORE_CONFIG.len() as u64
+        || fs::read(root.join("config"))? != STORE_CONFIG.as_bytes()
+    {
+        return unexpected("a `config` Yalper did not write");
+    }
+    let head = fs::symlink_metadata(root.join("HEAD"))?;
+    if !head.is_file() || head.len() > MAX_HEAD_BYTES {
+        return unexpected("a `HEAD` Yalper did not write");
+    }
+
+    // Yalper writes no refs and no packs. A ref (for example under `refs/replace/`) could make git tools
+    // show other objects; packs are not checked like loose objects.
+    for name in ["refs", "objects/pack"] {
+        let path = root.join(name);
+        if !fs::symlink_metadata(&path)?.is_dir() || fs::read_dir(&path)?.next().is_some() {
+            return unexpected(&format!("a `{name}` that is not an empty directory"));
+        }
+    }
+
     let objects = root.join("objects");
     if !fs::symlink_metadata(&objects)?.is_dir() {
-        return Err(Error::UnexpectedLayout(
-            "an `objects` that is not a directory".to_owned(),
-        ));
+        return unexpected("an `objects` that is not a directory");
     }
     // One listing of at most 258 entries; the type comes with the listing on Windows, Linux and macOS.
     for entry in fs::read_dir(&objects)? {
         let entry = entry?;
         if entry.file_type()?.is_symlink() {
-            return Err(Error::UnexpectedLayout(format!(
+            return unexpected(&format!(
                 "a link at `objects/{}`",
                 entry.file_name().to_string_lossy()
-            )));
+            ));
         }
     }
     Ok(())
@@ -607,6 +732,8 @@ mod tests {
             ".git/hooks/pre-commit",
             "sub/.GIT/config",
             "GIT~1/config",
+            "nul\0byte",
+            "dir/nul\0",
         ] {
             let changes = [
                 Change::Upsert {
@@ -874,5 +1001,285 @@ mod tests {
             home.path().join("child-passed").exists(),
             "the child test did not run"
         );
+    }
+
+    #[test]
+    fn no_change_returns_the_base_without_reading_it() {
+        let (dir, store) = new_store();
+        let unknown = ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(store.edit_tree(unknown, &[]).unwrap(), unknown);
+        assert!(loose_objects(&dir.path().join(SNAPSHOTS_DIR)).is_empty());
+    }
+
+    /// Writes `data` as an object of `kind` under `id`, whatever its real hash, the way a corrupted or
+    /// planted store could hold it. An object already stored under `id` is replaced.
+    fn plant(
+        store_dir: &Path,
+        store: &ShadowStore,
+        kind: gix::objs::Kind,
+        data: &[u8],
+        id: ObjectId,
+    ) {
+        use gix::objs::Write;
+        let hex = id.to_string();
+        let path = store_dir.join("objects").join(&hex[..2]).join(&hex[2..]);
+        if path.exists() {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions).unwrap();
+            fs::remove_file(&path).unwrap();
+        }
+        store
+            .repo
+            .objects
+            .write_buf_with_known_id(kind, data, id)
+            .unwrap();
+        assert!(path.exists());
+    }
+
+    fn tree_bytes(entries: Vec<gix::objs::tree::Entry>) -> Vec<u8> {
+        use gix::objs::WriteTo;
+        let mut bytes = Vec::new();
+        gix::objs::Tree { entries }.write_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_planted_tree_is_refused() {
+        let (dir, store) = new_store();
+        let store_dir = dir.path().join(SNAPSHOTS_DIR);
+        let honest = from_scratch(&store, &[("dir/x.txt", Regular, "x")]);
+        let evil = from_scratch(&store, &[("evil.txt", Regular, "evil")]);
+        let evil_data = store.repo.find_object(evil).unwrap().data.clone();
+
+        // The id of the next snapshot, predicted and taken before Yalper writes it.
+        let (_other_dir, other) = new_store();
+        let predicted = from_scratch(&other, &[("next.txt", Regular, "next")]);
+        plant(
+            &store_dir,
+            &store,
+            gix::objs::Kind::Tree,
+            &evil_data,
+            predicted,
+        );
+        let next = upserts(&store, &[("next.txt", Regular, "next")]);
+        assert!(store.changed_paths(honest, predicted).is_err());
+        assert!(store.edit_tree(predicted, &next).is_err());
+
+        // A subtree of an honest snapshot replaced in place: `dir` holds what a root with `x.txt` holds.
+        let subtree = from_scratch(&store, &[("x.txt", Regular, "x")]);
+        plant(
+            &store_dir,
+            &store,
+            gix::objs::Kind::Tree,
+            &evil_data,
+            subtree,
+        );
+        let error = store.changed_paths(store.empty_tree(), honest).unwrap_err();
+        assert!(
+            error.to_string().contains("does not match its id"),
+            "{error}"
+        );
+        let more = upserts(&store, &[("dir/y.txt", Regular, "y")]);
+        assert!(store.edit_tree(honest, &more).is_err());
+    }
+
+    #[test]
+    fn a_tree_containing_itself_is_refused_without_hanging() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (dir, store) = new_store();
+            let id = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+            let data = tree_bytes(vec![gix::objs::tree::Entry {
+                mode: EntryKind::Tree.into(),
+                filename: "loop".into(),
+                oid: id,
+            }]);
+            plant(
+                &dir.path().join(SNAPSHOTS_DIR),
+                &store,
+                gix::objs::Kind::Tree,
+                &data,
+                id,
+            );
+            let blob = store.write_blob(b"x").unwrap();
+            let change = Change::Upsert {
+                path: "loop/loop/x".to_owned(),
+                kind: Regular,
+                blob,
+            };
+            let refused = store.changed_paths(store.empty_tree(), id).is_err()
+                && store.edit_tree(id, &[change]).is_err();
+            sender.send(refused).unwrap();
+        });
+        let refused = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("reading a tree that contains itself did not finish");
+        assert!(refused);
+    }
+
+    #[test]
+    fn a_correctly_hashed_tree_with_an_invalid_name_is_refused() {
+        let (_dir, store) = new_store();
+        let blob = store.write_blob(b"x").unwrap();
+        for name in ["..", ".git", "a\\..\\b"] {
+            if name.contains('\\') && !cfg!(windows) {
+                // A backslash is an ordinary character outside Windows.
+                continue;
+            }
+            let tree = gix::objs::Tree {
+                entries: vec![gix::objs::tree::Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: name.into(),
+                    oid: blob,
+                }],
+            };
+            // gix writes any tree it is given; `edit_tree` would have refused this name.
+            let id = store.repo.write_object(&tree).unwrap().detach();
+            let error = store.changed_paths(store.empty_tree(), id).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidPath { .. }),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_store_with_contents_yalper_does_not_write_is_refused() {
+        const BLOB_ID: &str = "ce013625030ba8dba906f756967f9e9ca394464a";
+        type Tamper = fn(&Path);
+        let cases: [(&str, Tamper); 8] = [
+            ("changed config", |store| {
+                let config = store.join("config");
+                let text = fs::read_to_string(&config).unwrap();
+                fs::write(config, text.replace("never", "now")).unwrap();
+            }),
+            ("longer config", |store| {
+                let config = store.join("config");
+                let text = fs::read_to_string(&config).unwrap();
+                fs::write(config, text + "[core]\n\tfsmonitor = true\n").unwrap();
+            }),
+            ("config directory", |store| {
+                fs::remove_file(store.join("config")).unwrap();
+                fs::create_dir(store.join("config")).unwrap();
+            }),
+            ("large HEAD", |store| {
+                fs::write(
+                    store.join("HEAD"),
+                    "ref: refs/heads/".to_owned() + &"x".repeat(300),
+                )
+                .unwrap();
+            }),
+            ("packed-refs", |store| {
+                fs::write(
+                    store.join("packed-refs"),
+                    format!("{BLOB_ID} refs/heads/main\n"),
+                )
+                .unwrap();
+            }),
+            ("replace ref", |store| {
+                let replace = store.join("refs").join("replace");
+                fs::create_dir(&replace).unwrap();
+                fs::write(replace.join(BLOB_ID), format!("{BLOB_ID}\n")).unwrap();
+            }),
+            ("branch", |store| {
+                fs::create_dir(store.join("refs").join("heads")).unwrap();
+                fs::write(store.join("refs").join("heads").join("main"), BLOB_ID).unwrap();
+            }),
+            ("pack", |store| {
+                let pack = store.join("objects").join("pack");
+                fs::write(pack.join("pack-1.pack"), "PACK").unwrap();
+            }),
+        ];
+        for (name, tamper) in cases {
+            let (dir, store) = new_store();
+            drop(store);
+            tamper(&dir.path().join(SNAPSHOTS_DIR));
+            let owned = OwnedDir::open(dir.path()).unwrap();
+            let error = ShadowStore::open(&owned).unwrap_err();
+            assert!(
+                matches!(error, Error::UnexpectedLayout(_)),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_is_refused() {
+        let (dir, store) = new_store();
+        drop(store);
+        let store_dir = dir.path().join(SNAPSHOTS_DIR);
+        let outside = tempfile::tempdir().unwrap();
+        fs::rename(store_dir.join("config"), outside.path().join("config")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("config"), store_dir.join("config"))
+            .unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let error = ShadowStore::open(&owned).unwrap_err();
+        assert!(matches!(error, Error::UnexpectedLayout(_)), "{error}");
+    }
+
+    #[test]
+    fn the_store_keeps_snapshots_from_gc_and_limits_allocations() {
+        let (dir, store) = new_store();
+        let config = fs::read_to_string(dir.path().join(SNAPSHOTS_DIR).join("config")).unwrap();
+        assert_eq!(config, STORE_CONFIG);
+        let config = store.repo.config_snapshot();
+        assert_eq!(config.integer("gc.auto"), Some(0));
+        assert_eq!(
+            config.string("gc.pruneExpire").unwrap().to_string(),
+            "never"
+        );
+        assert_eq!(
+            config.integer("gitoxide.objects.allocLimit"),
+            Some(ALLOC_LIMIT_BYTES as i64)
+        );
+    }
+
+    #[test]
+    fn git_fsck_finds_the_store_clean() {
+        let (dir, store) = new_store();
+        // Names around git's tree order, where a directory sorts as if its name ended with `/`.
+        let first = from_scratch(
+            &store,
+            &[
+                ("a-b", Regular, "1"),
+                ("a.txt", Regular, "2"),
+                ("a/inner", Regular, "3"),
+                ("a0", Regular, "4"),
+                ("link", Symlink, "a.txt"),
+                ("run.sh", Executable, "5"),
+                ("becomes_dir", Regular, "6"),
+                ("becomes_file/inner", Regular, "7"),
+            ],
+        );
+        let mut changes = upserts(
+            &store,
+            &[
+                ("becomes_dir/inner", Regular, "8"),
+                ("becomes_file", Regular, "9"),
+                ("a/b-c/deep", Regular, "10"),
+            ],
+        );
+        changes.extend(["becomes_dir", "becomes_file/inner"].map(remove));
+        let second = store.edit_tree(first, &changes).unwrap();
+        assert_ne!(first, second);
+
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(dir.path().join(SNAPSHOTS_DIR))
+            .args(["fsck", "--strict", "--no-dangling", "--no-progress"])
+            .output()
+            .expect("git must be installed to run this test");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{text}");
+        for line in text.lines() {
+            assert!(line.starts_with("notice:"), "{text}");
+        }
     }
 }
