@@ -1,0 +1,35 @@
+# Yalper's own secret rules, for secrets that the vendored gitleaks rules
+# (third_party/gitleaks/gitleaks.toml, kept unchanged) do not catch in hook payloads.
+#
+# Same format as gitleaks: `id`, `description`, `regex` (RE2 syntax, compiled with Unicode off),
+# optional `secretGroup` and `entropy`, and `keywords` (lowercase; the rule only runs when one occurs).
+# One extra key: `lettersOnlyAllowlist = true` skips a secret made only of letters, `_`, `.` and `-`,
+# like gitleaks' allowlist on `generic-api-key`. `build.rs` appends these rules to gitleaks' rules.
+
+[[rules]]
+id = "yalper-private-key-partial"
+description = "A private key block cut off before its END line (for example by `head -n 7 id_rsa`): masked from the BEGIN line to the END line or the end of the text."
+regex = '''(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[ \t]*(?:\r?\n|(?:\\r)?\\n)(?s:.)*?(?:-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----|\z)'''
+keywords = ["-----begin"]
+
+[[rules]]
+id = "yalper-url-password"
+description = "The password in a URL's user info, as in postgres://admin:password@db or redis://:password@cache. Only the password is masked."
+regex = '''(?i)\b[a-z][a-z0-9+.-]{1,30}://[^\s:/?#@'"\x60]*:([^\s/?#@'"\x60]{1,256})@'''
+keywords = ["://"]
+
+[[rules]]
+id = "yalper-password-assignment"
+description = "A value assigned to a name containing pass or pwd (DB_PASS=, DB_PWD=), which generic-api-key only matches as password or passwd. Same shape and checks as generic-api-key."
+regex = '''(?i)[\w.-]{0,50}?(?:pass|pwd)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)'''
+entropy = 3.5
+keywords = ["pass", "pwd"]
+lettersOnlyAllowlist = true
+
+[[rules]]
+id = "yalper-bearer-token"
+description = "A token after Bearer, as in an Authorization header."
+regex = '''(?i)\bbearer[ \t]+([\w.~+/-]{10,}=*)'''
+entropy = 3
+keywords = ["bearer"]
+lettersOnlyAllowlist = true

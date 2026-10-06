@@ -23,7 +23,7 @@ ignore = "0.4"
 rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
 # The engine behind the `regex` crate, used directly to tune how secret rules compile. Unicode is off for
 # them, like in Go RE2, so the Unicode tables are not needed.
-regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "perf-inline"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "perf-inline", "perf-literal"] }
 serde_json = "1"
 tempfile = "3"
 # Build time only: reads the vendored gitleaks rules into a Rust table.
