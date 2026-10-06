@@ -211,8 +211,10 @@ mod tests {
         root
     }
 
+    /// The directory found, canonical so that it compares equal on macOS, where temporary directories are
+    /// reached through a symlink.
     fn found(starts: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-        find_yalper_dir(starts).map(|dir| dir.path().to_path_buf())
+        find_yalper_dir(starts).map(|dir| fs::canonicalize(dir.path()).unwrap())
     }
 
     #[test]
@@ -220,7 +222,10 @@ mod tests {
         let root = project();
         let deep = root.path().join("a").join("b");
         fs::create_dir_all(&deep).unwrap();
-        assert_eq!(found([deep]), Some(root.path().join(YALPER_DIR)));
+        assert_eq!(
+            found([deep]),
+            Some(fs::canonicalize(root.path().join(YALPER_DIR)).unwrap())
+        );
     }
 
     #[test]
@@ -230,7 +235,7 @@ mod tests {
         fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
         assert_eq!(
             found([root.path().to_path_buf()]),
-            Some(root.path().join(YALPER_DIR))
+            Some(fs::canonicalize(root.path().join(YALPER_DIR)).unwrap())
         );
     }
 
@@ -240,7 +245,10 @@ mod tests {
         let second = project();
         let third = project();
         let starts = [first.path(), second.path(), third.path()].map(Path::to_path_buf);
-        assert_eq!(found(starts), Some(second.path().join(YALPER_DIR)));
+        assert_eq!(
+            found(starts),
+            Some(fs::canonicalize(second.path().join(YALPER_DIR)).unwrap())
+        );
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! The event log: one SQLite database per project, `.yalper/yalper.db`.
 //!
 //! Hook processes can run at the same time (parallel tool calls), so every write is made while holding the
-//! [`WriterLock`], and the database is opened after taking it. SQLite runs in WAL mode, so readers such as
-//! `yalper log` never take the lock and are not blocked by a writer.
+//! [`WriterLock`], taken after opening the store. SQLite runs in WAL mode, so readers such as `yalper log`
+//! never take the lock (except for a moment if the database still has to be created) and are not blocked by
+//! a writer.
 
 mod lock;
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 
-use crate::safe_fs::{Access, OwnedDir};
+use crate::safe_fs::{self, Access, OwnedDir};
 
 pub use lock::{LOCK_FILE, LOCK_TIMEOUT, WriterLock};
 
@@ -132,6 +133,9 @@ pub enum Error {
         found: u32,
         known: u32,
     },
+    /// The database holds tables, indexes, triggers or views that Yalper did not create, for example a
+    /// crafted `yalper.db` committed to a repository.
+    UnexpectedSchema,
 }
 
 impl fmt::Display for Error {
@@ -144,6 +148,11 @@ impl fmt::Display for Error {
                 "the database has schema version {found}, but this Yalper only knows up to version \
                  {known}: update Yalper"
             ),
+            Self::UnexpectedSchema => write!(
+                f,
+                "the database contains tables, indexes, triggers or views Yalper did not create, so \
+                 it is not used"
+            ),
         }
     }
 }
@@ -153,7 +162,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
-            Self::NewerSchema { .. } => None,
+            Self::NewerSchema { .. } | Self::UnexpectedSchema => None,
         }
     }
 }
@@ -177,36 +186,62 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Store {
     conn: Connection,
     wal_path: PathBuf,
+    /// Yalper's own handle on the database file. On Windows it keeps the file from being renamed or
+    /// deleted while the store is open, see [`OwnedDir::open_file`].
+    _database: File,
 }
 
 impl Store {
-    /// Opens the database in `dir`, creating it and bringing its schema up to date if needed. Writers must
-    /// hold the [`WriterLock`] while calling this and while writing.
+    /// Opens the database in `dir`, creating it and bringing its schema up to date if needed.
+    ///
+    /// Creating or migrating takes the [`WriterLock`] for a moment, so a writer opens the store first and
+    /// takes the lock after: opening while this process already holds the lock would wait for itself.
     pub fn open(dir: &OwnedDir) -> Result<Self> {
-        // SQLite opens its files by path. Creating the database here checks it through a handle, and links
-        // planted in place of its other files are refused (SQLite refuses them itself on Unix, but follows
-        // them on Windows).
-        dir.open_file(DATABASE_FILE, Access::ReadWrite)?;
+        // SQLite opens its files by path, so they are checked first: the database through a handle that is
+        // kept open, the journal and WAL files by name. SQLite then refuses a symlink anywhere in the path
+        // (Unix; `dir.path()` is canonical) and the handle is compared with the file SQLite reached.
+        // Remaining gap, outside the threat model: another process of the same user could swap a file
+        // between these checks and SQLite's own opens. On Windows the open handles stop renames and
+        // deletes; the journal and WAL files are only checked by name.
+        let database = dir.open_file(DATABASE_FILE, Access::ReadWrite)?;
         for name in DATABASE_SIDE_FILES {
             dir.check_regular_or_missing(name)?;
         }
+        let path = dir.path().join(DATABASE_FILE);
         let mut conn = Connection::open_with_flags(
-            dir.path().join(DATABASE_FILE),
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        // A database that is already in WAL mode stays so without taking a write lock. On a file system
-        // without WAL support (network shares) SQLite keeps its default mode, which still works.
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        safe_fs::check_same_file(&database, &path)?;
+
+        // A repository could commit a crafted database: no schema changes outside SQL, and no functions
+        // with side effects from the schema.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
         // Every hook is a new process, so each close is the last connection's close, where SQLite would
         // copy the WAL into the database and delete it: about 4 ms per hook on Windows, half of the
         // database time (measured). The WAL is kept instead and emptied only once it grows, see `drop`.
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        migrate(&mut conn, MIGRATIONS)?;
+        conn.busy_timeout(LOCK_TIMEOUT)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        if user_version(&conn)? != schema_version(MIGRATIONS) {
+            // Switching a new database to WAL fails at once (SQLITE_BUSY) when several processes try it
+            // together, so creation and migrations happen one process at a time.
+            let _lock = WriterLock::acquire(dir, LOCK_TIMEOUT)?;
+            // On a file system without WAL support (network shares) SQLite keeps its default mode, which
+            // still works.
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+            migrate(&mut conn, MIGRATIONS)?;
+        }
+        check_schema(&conn)?;
         Ok(Self {
             conn,
             wal_path: dir.path().join(WAL_FILE),
+            _database: database,
         })
     }
 
@@ -359,10 +394,10 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
     })
 }
 
-/// Runs the migrations the database has not had yet, each at most once, even when several processes open
-/// a new database at the same time.
+/// Runs the migrations the database has not had yet, all in one transaction. The caller holds the
+/// [`WriterLock`], so no other process migrates at the same time.
 fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
-    let known = u32::try_from(migrations.len()).expect("fewer than 4 billion migrations");
+    let known = schema_version(migrations);
     let found = user_version(conn)?;
     if found == known {
         return Ok(());
@@ -371,8 +406,6 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
         return Err(Error::NewerSchema { found, known });
     }
     let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // Another process may have migrated between the first read and the write lock.
-    let found = user_version(&transaction)?;
     for (version, sql) in (1..).zip(migrations).skip(found as usize) {
         transaction.execute_batch(sql)?;
         transaction.pragma_update(None, "user_version", version)?;
@@ -381,8 +414,34 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn schema_version(migrations: &[&str]) -> u32 {
+    u32::try_from(migrations.len()).expect("fewer than 4 billion migrations")
+}
+
 fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+/// Refuses a database whose tables, indexes, triggers and views differ in any way from the ones
+/// [`MIGRATIONS`] create, compared with a fresh in-memory copy.
+fn check_schema(conn: &Connection) -> Result<()> {
+    let mut expected = Connection::open_in_memory()?;
+    migrate(&mut expected, MIGRATIONS)?;
+    if schema(conn)? == schema(&expected)? {
+        Ok(())
+    } else {
+        Err(Error::UnexpectedSchema)
+    }
+}
+
+type SchemaRow = (String, String, String, Option<String>);
+
+fn schema(conn: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
+    conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect()
 }
 
 #[cfg(test)]
@@ -408,19 +467,6 @@ mod tests {
             payload: json!({"tool_input": {"command": "cargo test"}, "step": step}),
         }
     }
-
-    fn schema(store: &Store) -> Vec<(String, String)> {
-        let mut statement = store
-            .conn
-            .prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
-            .unwrap();
-        statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap()
-    }
-
     #[test]
     fn the_schema_is_created_on_first_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -428,10 +474,15 @@ mod tests {
         let store = Store::open(&owned).unwrap();
 
         assert_eq!(user_version(&store.conn).unwrap(), 1);
-        let names: Vec<String> = schema(&store).into_iter().map(|(name, _)| name).collect();
+        let names: Vec<String> = schema(&store.conn)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, sql)| sql.is_some())
+            .map(|(_, name, _, _)| name)
+            .collect();
         assert_eq!(
             names,
-            ["events", "events_session_step", "file_cache", "sessions"]
+            ["events_session_step", "events", "file_cache", "sessions"]
         );
         let mode: String = store
             .conn
@@ -448,6 +499,77 @@ mod tests {
             .pragma_query_value(None, "synchronous", |row| row.get(0))
             .unwrap();
         assert_eq!(synchronous, 1, "NORMAL");
+        let busy_timeout_ms: u32 = store
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout_ms, 3000);
+        let config = |option| store.conn.db_config(option).unwrap();
+        assert!(config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE));
+        assert!(!config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA));
+        assert!(config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE));
+    }
+
+    #[test]
+    fn many_processes_can_create_the_database_at_once() {
+        const OPENERS: usize = 8;
+        for _ in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let start = std::sync::Barrier::new(OPENERS);
+            thread::scope(|scope| {
+                let openers: Vec<_> = (0..OPENERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let owned = OwnedDir::open(dir.path()).unwrap();
+                            start.wait();
+                            Store::open(&owned).map(|store| store.sessions().unwrap().len())
+                        })
+                    })
+                    .collect();
+                for opener in openers {
+                    assert_eq!(opener.join().unwrap().unwrap(), 0);
+                }
+            });
+        }
+    }
+
+    /// Opens the database behind Yalper's back, the way a crafted file in a repository could be made.
+    fn tamper(dir: &tempfile::TempDir, sql: &str) {
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        drop(Store::open(&owned).unwrap());
+        Connection::open(dir.path().join(DATABASE_FILE))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_database_with_a_trigger_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        tamper(
+            &dir,
+            "CREATE TRIGGER wipe AFTER INSERT ON events BEGIN DELETE FROM sessions; END;",
+        );
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        assert!(matches!(Store::open(&owned), Err(Error::UnexpectedSchema)));
+    }
+
+    #[test]
+    fn a_database_with_an_extra_view_or_changed_table_is_refused() {
+        for sql in [
+            "CREATE VIEW extra AS SELECT 1;",
+            "CREATE TABLE extra (x);",
+            "ALTER TABLE events ADD COLUMN extra TEXT DEFAULT 'x';",
+            "DROP INDEX events_session_step;",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            tamper(&dir, sql);
+            let owned = OwnedDir::open(dir.path()).unwrap();
+            assert!(
+                matches!(Store::open(&owned), Err(Error::UnexpectedSchema)),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -457,11 +579,11 @@ mod tests {
         let store = Store::open(&owned).unwrap();
         store.upsert_session(&Session::new("s1", 1)).unwrap();
         store.insert_event(&event("s1", 1)).unwrap();
-        let before = schema(&store);
+        let before = schema(&store.conn).unwrap();
         drop(store);
 
         let store = Store::open(&owned).unwrap();
-        assert_eq!(schema(&store), before);
+        assert_eq!(schema(&store.conn).unwrap(), before);
         assert_eq!(user_version(&store.conn).unwrap(), 1);
         assert_eq!(store.events("s1").unwrap(), [event("s1", 1)]);
     }
@@ -614,7 +736,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let owned = OwnedDir::open(dir.path()).unwrap();
-            let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
             let store = Store::open(&owned).unwrap();
             store.upsert_session(&Session::new("even", 1)).unwrap();
             store.upsert_session(&Session::new("odd", 2)).unwrap();
@@ -626,10 +747,10 @@ mod tests {
                 scope.spawn(move || {
                     let session = if writer % 2 == 0 { "even" } else { "odd" };
                     for _ in 0..EVENTS_PER_WRITER {
-                        // What each hook process does: lock, open, number the step, insert.
+                        // What each hook process does: open, lock, number the step, insert.
                         let owned = OwnedDir::open(path).unwrap();
-                        let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
                         let store = Store::open(&owned).unwrap();
+                        let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
                         let step = store.next_step(session).unwrap();
                         store.insert_event(&event(session, step)).unwrap();
                     }
@@ -662,8 +783,8 @@ mod tests {
     fn a_reader_is_not_blocked_by_a_writer() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
         let writer = Store::open(&owned).unwrap();
+        let _lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
         writer.upsert_session(&Session::new("s1", 1)).unwrap();
         writer.insert_event(&event("s1", 1)).unwrap();
         // The writer holds the lock and an open write transaction with an uncommitted step.
@@ -708,6 +829,33 @@ mod tests {
         fs::create_dir(dir.path().join(DATABASE_FILE)).unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
         assert!(matches!(Store::open(&owned), Err(Error::Io(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_reached_through_a_symlink_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(real.join(".yalper")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let owned = OwnedDir::open(&link.join(".yalper")).unwrap();
+        let store = Store::open(&owned).unwrap();
+        store.upsert_session(&Session::new("s1", 1)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_into_the_path_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let yalper = project.path().join(".yalper");
+        fs::create_dir(&yalper).unwrap();
+        let owned = OwnedDir::open(&yalper).unwrap();
+        // After the directory was checked, it is moved away and a symlink to it takes its place.
+        let moved = project.path().join("moved");
+        fs::rename(&yalper, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &yalper).unwrap();
+        assert!(Store::open(&owned).is_err());
     }
 
     #[test]

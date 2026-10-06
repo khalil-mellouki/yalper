@@ -4,10 +4,13 @@
 //! file outside the project. Yalper writes only inside a real directory owned by the current user, and only
 //! to regular files.
 //!
-//! Every check is made on an open handle, never on a path that is opened afterwards, so a link swapped in
-//! between the check and the open is refused too. The directory is held open while it is used: on Unix
-//! files are opened relative to that handle (`openat`), and on Windows the handle does not allow the
-//! directory to be renamed or deleted, so its path keeps naming the directory that was checked.
+//! Files Yalper opens itself are checked on the open handle, never on a path that is opened afterwards. The
+//! directory is held open while it is used: on Unix those files are opened relative to that handle
+//! (`openat`), and on Windows the directory and file handles do not allow renaming or deleting, so their
+//! paths keep naming what was checked.
+//!
+//! SQLite opens its own files by path. For those, see [`OwnedDir::check_regular_or_missing`],
+//! [`check_same_file`], and `Store::open`.
 
 use std::fs::File;
 use std::io;
@@ -35,12 +38,23 @@ pub struct OwnedDir {
 impl OwnedDir {
     /// Opens `path` if it is a real directory owned by the current user. A symlink (or a Windows junction,
     /// which the standard library also reports as a symlink) is refused without being followed.
+    ///
+    /// On Unix, [`path`](Self::path) is canonical: the parent is resolved, so that the path SQLite reopens
+    /// contains no symlink (SQLite is told to refuse any).
     pub fn open(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use rustix::fs::{Mode, OFlags};
+            // Resolving the parent, not `path` itself, keeps a `.yalper` symlink visible to O_NOFOLLOW.
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(io::Error::other(format!(
+                    "{} has no parent directory",
+                    path.display()
+                )));
+            };
+            let path = std::fs::canonicalize(parent)?.join(name);
             let handle = rustix::fs::open(
-                path,
+                &path,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?;
@@ -50,10 +64,7 @@ impl OwnedDir {
                     path.display()
                 )));
             }
-            Ok(Self {
-                path: path.to_owned(),
-                handle,
-            })
+            Ok(Self { path, handle })
         }
         #[cfg(windows)]
         {
@@ -83,17 +94,22 @@ impl OwnedDir {
     }
 
     /// Opens the file `name` inside this directory, creating it if it is missing. Anything other than a
-    /// regular file (a symlink, a directory, a FIFO) is refused before a single byte is read or written.
+    /// regular file (a symlink, a directory, a FIFO) is refused before a single byte is read or written, and
+    /// so is, on Unix, a file with a second hard link (writing to it would change the other file too).
+    ///
+    /// Windows: the standard library does not expose the hard link count, so a hard-linked file is
+    /// accepted. A clone cannot create hard links, so only another local process could plant one.
     pub fn open_file(&self, name: &str, access: Access) -> io::Result<File> {
         let file = self.open_entry(name, access)?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || hard_link_count(&metadata) != 1 {
             return Err(self.not_a_regular_file(name));
         }
         Ok(file)
     }
 
-    /// Checks that `name` inside this directory is a regular file or does not exist, for files that another
-    /// library opens by path (SQLite's database, journal and WAL files).
+    /// Checks that `name` inside this directory does not exist, or is a regular file (on Unix with no other
+    /// hard link), for files that another library opens by path (SQLite's journal and WAL files).
     pub fn check_regular_or_missing(&self, name: &str) -> io::Result<()> {
         #[cfg(unix)]
         let is_file =
@@ -101,6 +117,7 @@ impl OwnedDir {
                 Ok(stat) => {
                     rustix::fs::FileType::from_raw_mode(stat.st_mode)
                         == rustix::fs::FileType::RegularFile
+                        && stat.st_nlink == 1
                 }
                 Err(rustix::io::Errno::NOENT) => return Ok(()),
                 Err(error) => return Err(error.into()),
@@ -137,6 +154,9 @@ impl OwnedDir {
         let mut options = File::options();
         options
             .create(true)
+            // No FILE_SHARE_DELETE: while the file is open nobody can rename or delete it, so its path keeps
+            // naming this file (SQLite reopens the database by path).
+            .share_mode(windows::FILE_SHARE_READ | windows::FILE_SHARE_WRITE)
             .custom_flags(windows::FILE_FLAG_OPEN_REPARSE_POINT);
         match access {
             Access::Append => options.append(true),
@@ -147,10 +167,43 @@ impl OwnedDir {
 
     fn not_a_regular_file(&self, name: &str) -> io::Error {
         io::Error::other(format!(
-            "{} is not a regular file",
+            "{} is not a regular file with a single link",
             self.path.join(name).display()
         ))
     }
+}
+
+/// Checks that `path` still names the same file as the open `file` (Unix: same device and inode), for a
+/// file that another library has just reopened by path.
+///
+/// Windows: the standard library does not expose file ids, so this check always passes. There the open
+/// `file` does not allow its path to be renamed or deleted (see [`OwnedDir::open_file`]), which keeps the
+/// path on the same file instead.
+pub fn check_same_file(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (open, named) = (file.metadata()?, std::fs::symlink_metadata(path)?);
+        if (open.dev(), open.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::other(format!(
+                "{} was replaced while it was being opened",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(windows)]
+    let _ = (file, path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hard_link_count(metadata: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(metadata)
+}
+
+#[cfg(windows)]
+fn hard_link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
 }
 
 /// Win32 constants, defined here instead of adding a crate for four numbers.
@@ -174,7 +227,69 @@ mod tests {
     fn a_real_directory_is_opened() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        assert_eq!(owned.path(), dir.path());
+        assert_eq!(
+            fs::canonicalize(owned.path()).unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_is_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(dir.path()).unwrap().join("real");
+        fs::create_dir_all(real.join(".yalper")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let owned = OwnedDir::open(&link.join(".yalper")).unwrap();
+        assert_eq!(owned.path(), real.join(".yalper"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_file_is_refused_and_the_other_file_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.txt");
+        fs::write(&other, "keep me").unwrap();
+        fs::hard_link(&other, dir.path().join("log")).unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        for access in [Access::Append, Access::ReadWrite] {
+            assert!(owned.open_file("log", access).is_err());
+        }
+        assert!(owned.check_regular_or_missing("log").is_err());
+        assert_eq!(fs::read_to_string(&other).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn the_same_file_passes_the_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let file = owned.open_file("db", Access::ReadWrite).unwrap();
+        check_same_file(&file, &owned.path().join("db")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_fails_the_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let file = owned.open_file("db", Access::ReadWrite).unwrap();
+        fs::write(dir.path().join("new"), "").unwrap();
+        fs::rename(dir.path().join("new"), dir.path().join("db")).unwrap();
+        assert!(check_same_file(&file, &owned.path().join("db")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_file_cannot_be_swapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let file = owned.open_file("db", Access::ReadWrite).unwrap();
+        fs::write(dir.path().join("new"), "").unwrap();
+        assert!(fs::rename(dir.path().join("new"), dir.path().join("db")).is_err());
+        assert!(fs::remove_file(dir.path().join("db")).is_err());
+        drop(file);
+        fs::rename(dir.path().join("new"), dir.path().join("db")).unwrap();
     }
 
     #[test]
