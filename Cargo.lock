@@ -650,6 +650,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-imara-diff"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "305657ad44356151d73c145f567c25b24fdf2466bfb3e90727e1d5461a4e9748"
+dependencies = [
+ "bstr",
+ "hashbrown 0.16.1",
+]
+
+[[package]]
 name = "gix-lock"
 version = "25.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1759,6 +1769,7 @@ dependencies = [
  "clap",
  "getrandom",
  "gix",
+ "gix-imara-diff",
  "ignore",
  "insta",
  "jiff",

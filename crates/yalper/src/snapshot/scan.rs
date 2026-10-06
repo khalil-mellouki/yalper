@@ -48,6 +48,10 @@ pub const MAX_DEPTH: usize = 256;
 pub struct Snapshot {
     /// The tree of the working tree after this step. Unchanged files keep the tree of the previous snapshot.
     pub tree_id: ObjectId,
+    /// The tree this snapshot was built from: the previous snapshot, or the empty tree when the stat cache
+    /// could not be used and the snapshot started over. `changed` lists the files that differ between it
+    /// and `tree_id`.
+    pub base_tree_id: ObjectId,
     /// Files added, modified (content, executable bit or file/symlink kind) or removed since the previous
     /// snapshot, sorted. Its length is the step's number of files changed.
     pub changed: Vec<String>,
@@ -159,6 +163,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
     let mut shadow = None;
     let mut snapshot = Snapshot {
         tree_id: base,
+        base_tree_id: base,
         changed: Vec::new(),
         skipped: Vec::new(),
         files_read: 0,
@@ -1485,6 +1490,7 @@ mod tests {
         let unreadable = || SkipReason::Unreadable("denied".to_owned());
         let mut snapshot = Snapshot {
             tree_id: ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            base_tree_id: ObjectId::empty_tree(gix::hash::Kind::Sha1),
             changed: Vec::new(),
             skipped: vec![skipped("big.bin", SkipReason::TooLarge(MAX_FILE_BYTES + 1))],
             files_read: 0,

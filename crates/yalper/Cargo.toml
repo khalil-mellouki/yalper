@@ -16,6 +16,7 @@ aho-corasick.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 gix.workspace = true
+gix-imara-diff.workspace = true
 ignore.workspace = true
 jiff.workspace = true
 regex-automata.workspace = true

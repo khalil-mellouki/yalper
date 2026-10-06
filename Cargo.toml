@@ -19,6 +19,8 @@ getrandom = "0.4"
 # Only SHA-1 object hashing: Yalper writes blobs and trees and diffs trees, and needs none of the other
 # features (network, index, worktree, blob diff, parallelism).
 gix = { version = "0.88", default-features = false, features = ["sha1"] }
+# Line diffs for `yalper show`: the diff engine gix uses, without the gix features that would come with it.
+gix-imara-diff = { version = "0.3", features = ["unified_diff"] }
 # ripgrep's directory walker: `.gitignore`, `.git/info/exclude` and global excludes, in parallel threads.
 ignore = "0.4"
 # Snapshot tests: compares command output with the expected text kept in the test.

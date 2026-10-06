@@ -1,0 +1,29 @@
+{
+  "session_id": "00893aaf-19fa-41d2-8238-13269b9b3ca0",
+  "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-project/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+  "cwd": "/home/dev/project",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Find callers",
+    "prompt": "Find every caller of old_name in src/.",
+    "subagent_type": "Explore"
+  },
+  "tool_response": {
+    "status": "completed",
+    "prompt": "Find every caller of old_name in src/.",
+    "content": [
+      {
+        "type": "text",
+        "text": "Found 2 callers of old_name: src/main.rs:4 and src/cli.rs:17."
+      }
+    ],
+    "totalDurationMs": 5210,
+    "totalTokens": 18342,
+    "totalToolUseCount": 3
+  },
+  "tool_use_id": "toolu_01JKL012",
+  "duration_ms": 5214
+}

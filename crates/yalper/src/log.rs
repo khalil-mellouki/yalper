@@ -37,7 +37,7 @@ const MAX_ID_CHARS: usize = 64;
 const MAX_EARLIER_SESSIONS: usize = 5;
 
 /// Marks text left out of a value that was cut.
-const ELLIPSIS: &str = "...";
+pub(crate) const ELLIPSIS: &str = "...";
 
 /// The keys of a tool's input that summarize the call, most telling first: the first one present is shown.
 const SUMMARY_KEYS: [&str; 10] = [
@@ -76,7 +76,7 @@ pub fn log(
     time_zone: &TimeZone,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let yalper = find(start)?;
+    let yalper = find(start, "yalper log")?;
     // Tool paths are absolute. The project root is tried as found from `start` and as `.yalper/` was opened
     // (canonical on Unix), since the agent may have reached the project either way.
     let roots: Vec<String> = [repo::find_root(start), yalper.dir.path().parent()]
@@ -127,19 +127,20 @@ pub fn log(
     Ok(())
 }
 
-const NOTHING_RECORDED: &str = "No sessions recorded yet. Sessions are recorded while Claude Code runs in \
+pub(crate) const NOTHING_RECORDED: &str = "No sessions recorded yet. Sessions are recorded while Claude Code runs in \
      this project. If one already ran, check that Yalper's hooks are registered (run `yalper init`), that \
      this folder is trusted in Claude Code, and that hooks are not disabled in Claude Code's settings.";
 
 /// The `.yalper/` directory of the project around `start`, found the way the hook finds it, so the same
-/// checks apply (see [`hook::find_yalper_dir`]). When there is none, says why.
-fn find(start: &Path) -> Result<YalperDir, String> {
+/// checks apply (see [`hook::find_yalper_dir`]). When there is none, says why, naming `command` (such as
+/// `yalper log`) as what to run inside a project set up with `yalper init`.
+pub(crate) fn find(start: &Path, command: &str) -> Result<YalperDir, String> {
     if let Some(yalper) = hook::find_yalper_dir([start.to_path_buf()]) {
         return Ok(yalper);
     }
     let root = repo::find_root(start).ok_or_else(|| {
         format!(
-            "{} is not inside a git repository. Run `yalper log` inside a project set up with `yalper init`.",
+            "{} is not inside a git repository. Run `{command}` inside a project set up with `yalper init`.",
             start.display()
         )
     })?;
@@ -163,7 +164,7 @@ fn find(start: &Path) -> Result<YalperDir, String> {
 }
 
 /// The session `prefix` names: the one with exactly that id, or else the only one whose id starts with it.
-fn find_session<'a>(
+pub(crate) fn find_session<'a>(
     sessions: &'a [Session],
     prefix: &str,
     id_chars: usize,
@@ -317,7 +318,7 @@ impl StepRow {
 }
 
 /// What a step did: its tool's name, or the kind of step.
-fn action(event: &Event) -> String {
+pub(crate) fn action(event: &Event) -> String {
     match HookEvent::from_name(&event.kind) {
         HookEvent::SessionStart => "start".to_owned(),
         HookEvent::UserPromptSubmit => "prompt".to_owned(),
@@ -345,7 +346,7 @@ fn tool_label(name: &str) -> String {
 }
 
 /// Whether the hook records a snapshot with this kind of step (see `record::record`).
-fn takes_snapshot(kind: &str) -> bool {
+pub(crate) fn takes_snapshot(kind: &str) -> bool {
     matches!(
         HookEvent::from_name(kind),
         HookEvent::SessionStart
@@ -400,7 +401,7 @@ fn tool_summary(input: Option<&Value>, roots: &[String], max: usize) -> Option<S
 /// `path` relative to the first of `roots` it is inside, with `/` as separator, or `path` itself when it is
 /// outside all of them. Either separator is accepted in both, and on Windows letter case is ignored, so the
 /// result does not depend on how the agent wrote the path.
-fn relative_path(path: &str, roots: &[String]) -> String {
+pub(crate) fn relative_path(path: &str, roots: &[String]) -> String {
     let normalized = path.replace('\\', "/");
     for root in roots {
         let root = root.replace('\\', "/");
@@ -436,7 +437,7 @@ fn first_line(text: &str, max: usize) -> String {
 
 /// `text` cut to `max` characters, ending with an ellipsis when something was left out: part of `text`, or
 /// more text after it (`more`).
-fn cut_end(text: &str, max: usize, more: bool) -> String {
+pub(crate) fn cut_end(text: &str, max: usize, more: bool) -> String {
     if !more && text.chars().count() <= max {
         return text.to_owned();
     }
@@ -462,7 +463,7 @@ fn cut_start(text: &str, max: usize) -> String {
 }
 
 /// The first `chars` characters of a session id, made printable.
-fn short_id(id: &str, chars: usize) -> String {
+pub(crate) fn short_id(id: &str, chars: usize) -> String {
     let mut shown: String = id.chars().take(chars).collect();
     if chars >= MAX_ID_CHARS && id.chars().nth(chars).is_some() {
         shown.push_str(ELLIPSIS);
@@ -472,7 +473,7 @@ fn short_id(id: &str, chars: usize) -> String {
 
 /// How many characters of the session ids make them all look different, at least [`SHORT_ID_CHARS`] and at
 /// most [`MAX_ID_CHARS`] (ids that only differ later look the same, and the work stays bounded).
-fn short_id_chars(ids: &[&str]) -> usize {
+pub(crate) fn short_id_chars(ids: &[&str]) -> usize {
     let longest = ids
         .iter()
         .map(|id| id.chars().take(MAX_ID_CHARS).count())
@@ -488,13 +489,13 @@ fn short_id_chars(ids: &[&str]) -> usize {
 }
 
 /// The local date and time of a timestamp in milliseconds, if it is in the range of dates jiff supports.
-fn local_time(ms: i64, time_zone: &TimeZone) -> Option<DateTime> {
+pub(crate) fn local_time(ms: i64, time_zone: &TimeZone) -> Option<DateTime> {
     Timestamp::from_millisecond(ms)
         .ok()
         .map(|timestamp| time_zone.to_datetime(timestamp))
 }
 
-fn plural(count: usize) -> &'static str {
+pub(crate) fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
