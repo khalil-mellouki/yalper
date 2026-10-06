@@ -126,6 +126,10 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
         forget_lost_snapshots(&yalper, out)?;
     }
     take_baseline(&yalper, out)?;
+    // Temporary files left by hooks stopped at their deadline; nothing to report.
+    if let Ok(shadow) = ShadowStore::open(&yalper.dir, &yalper.token) {
+        shadow.remove_stale_temp_files();
+    }
     drop(yalper);
     say(
         out,

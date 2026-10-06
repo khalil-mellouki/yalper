@@ -93,6 +93,17 @@ impl OwnedDir {
         &self.path
     }
 
+    /// Another handle to the same directory, for a thread that outlives the borrow of this one.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            path: self.path.clone(),
+            #[cfg(unix)]
+            handle: self.handle.try_clone()?,
+            #[cfg(windows)]
+            _handle: self._handle.try_clone()?,
+        })
+    }
+
     /// Checks that [`path`](Self::path) still names this directory, not a link or another folder put in its
     /// place. Unix: same device and inode as the held handle. Windows: the held handle stops the folder from
     /// being renamed or deleted, so the path is only checked to be a real folder.

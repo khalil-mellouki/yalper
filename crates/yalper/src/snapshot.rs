@@ -17,6 +17,7 @@ mod scan;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use gix::bstr::{BStr, ByteSlice};
 use gix::error::ErrorExt;
@@ -28,7 +29,9 @@ use gix::{ObjectId, oid};
 use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 
-pub use scan::{MAX_FILE_BYTES, SkipReason, Skipped, Snapshot, snapshot};
+pub use scan::{
+    Base, MAX_FILE_BYTES, Pending, SkipReason, Skipped, Snapshot, remember_failure, snapshot, take,
+};
 
 /// The shadow repository inside `.yalper/`.
 pub const SNAPSHOTS_DIR: &str = "snapshots.git";
@@ -53,6 +56,12 @@ fn store_config(token: &Token) -> String {
 
 /// `HEAD` holds one line like `ref: refs/heads/main`; anything larger was not written by Yalper.
 const MAX_HEAD_BYTES: u64 = 256;
+
+/// The most new trees of one snapshot written in parallel, one thread each (see [`ShadowStore::edit_tree`]).
+const MAX_PARALLEL_TREE_WRITES: usize = 8;
+
+/// Leftover temporary object files older than this are deleted by [`ShadowStore::remove_stale_temp_files`].
+const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// The most memory gix may allocate for one object, the same cap as for a hook payload. Files over 10 MiB are
 /// never snapshotted, so a larger object can only come from corruption.
@@ -151,8 +160,12 @@ pub enum Error {
     /// not used.
     UnexpectedLayout(String),
     /// The ignore files of the project go over the budget for one snapshot, so no snapshot is taken (see
-    /// `snapshot::excludes`).
-    IgnoreRulesOverBudget(String),
+    /// `snapshot::excludes`). `remember` is what to save so the next snapshots fail at once while the ignore
+    /// files stay the same (see [`scan::remember_failure`]); `None` when this failure was such a fast one.
+    IgnoreRulesOverBudget {
+        reason: String,
+        remember: Option<String>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -165,7 +178,9 @@ impl fmt::Display for Error {
                 write!(f, "cannot store the path {path:?} in a snapshot: {reason}")
             }
             Self::MissingObject(id) => write!(f, "the snapshot store has no object {id}"),
-            Self::IgnoreRulesOverBudget(why) => write!(f, "ignore rules exceed the budget: {why}"),
+            Self::IgnoreRulesOverBudget { reason, .. } => {
+                write!(f, "ignore rules exceed the budget: {reason}")
+            }
             Self::UnexpectedLayout(what) => write!(
                 f,
                 "the snapshot store contains {what}, which Yalper does not create, so it is not used"
@@ -183,7 +198,7 @@ impl std::error::Error for Error {
             Self::InvalidPath { .. }
             | Self::MissingObject(_)
             | Self::UnexpectedLayout(_)
-            | Self::IgnoreRulesOverBudget(_) => None,
+            | Self::IgnoreRulesOverBudget { .. } => None,
         }
     }
 }
@@ -212,7 +227,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct ShadowStore {
     repo: gix::Repository,
     /// Held open: on Windows it keeps the store from being renamed or replaced while in use.
-    _dir: OwnedDir,
+    dir: OwnedDir,
 }
 
 impl fmt::Debug for ShadowStore {
@@ -278,14 +293,94 @@ impl ShadowStore {
         // pack directory, which this store never has (measured: 22 ms instead of 15 ms per 3-file step on
         // Windows). Loose objects are still found.
         repo.objects.refresh_never();
-        Ok(Self { repo, _dir: dir })
+        Ok(Self { repo, dir })
     }
 
     /// Stores `bytes` as a blob and returns its id. Content already in the store is not written again.
     pub fn write_blob(&self, bytes: &[u8]) -> Result<ObjectId> {
-        Ok(self.repo.write_blob(bytes)?.detach())
+        self.write_object(gix::objs::Kind::Blob, bytes)
     }
 
+    /// Writes `data` as a loose object of `kind`, unless the store already has it, and returns its id.
+    ///
+    /// gix's own writer streams into a temporary file in `objects/`, then moves it into place and makes it
+    /// read-only, about 2 ms per object on Windows (measured). Here the object is compressed in memory and
+    /// written with one call to a temporary file next to its final name, then renamed into place (see
+    /// [`persist`]): about 1 ms.
+    fn write_object(&self, kind: gix::objs::Kind, data: &[u8]) -> Result<ObjectId> {
+        let (id, new) = self.prepare(kind, data)?;
+        if let Some(new) = new {
+            persist(&self.objects_dir(), &new)?;
+        }
+        Ok(id)
+    }
+
+    /// The id of `data` as an object of `kind` and, unless the store already has it, the object compressed
+    /// for [`persist`].
+    fn prepare(&self, kind: gix::objs::Kind, data: &[u8]) -> Result<(ObjectId, Option<NewObject>)> {
+        use std::io::Write as _;
+        let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, kind, data)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if self.repo.has_object(id) {
+            return Ok((id, None));
+        }
+        let mut zlib = gix::zlib::stream::deflate::Write::new(
+            Vec::with_capacity(data.len() / 2 + 64),
+            gix::zlib::Compression::BEST_SPEED,
+        );
+        zlib.write_all(&gix::objs::encode::loose_header(kind, data.len() as u64))?;
+        zlib.write_all(data)?;
+        zlib.flush()?;
+        let compressed = zlib.into_inner();
+        Ok((id, Some(NewObject { id, compressed })))
+    }
+
+    fn objects_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("objects")
+    }
+
+    /// Deletes the temporary object files (`objects/xx/tmp_obj_*`) older than an hour: left by hooks stopped
+    /// at their deadline or killed while writing. Returns how many were deleted. Errors are ignored: a file
+    /// that cannot be deleted now can be deleted another time.
+    pub fn remove_stale_temp_files(&self) -> usize {
+        let Ok(fan_outs) = fs::read_dir(self.objects_dir()) else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for fan_out in fan_outs.flatten() {
+            let name = fan_out.file_name();
+            let is_fan_out = name.len() == 2
+                && name
+                    .to_str()
+                    .is_some_and(|name| name.bytes().all(|b| b.is_ascii_hexdigit()));
+            // A link is never followed.
+            if !is_fan_out || !fan_out.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(fan_out.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let stale = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("tmp_obj_"))
+                    && entry.metadata().is_ok_and(|metadata| {
+                        metadata.is_file()
+                            && metadata
+                                .modified()
+                                .ok()
+                                .and_then(|modified| now.duration_since(modified).ok())
+                                .is_some_and(|age| age >= STALE_TEMP_FILE_AGE)
+                    });
+                if stale && fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
     /// The id of the tree with no entries, the base of the first snapshot.
     pub fn empty_tree(&self) -> ObjectId {
         ObjectId::empty_tree(self.repo.object_hash())
@@ -336,7 +431,48 @@ impl ShadowStore {
                     .map_err(gix::Error::from)?;
             }
         }
-        let tree = editor.write(|tree| self.repo.write_object(tree).map(|id| id.detach()))?;
+        // Each id is known as soon as its tree is encoded, so the new trees are written together at the end: in
+        // parallel when there are only a few, as in a usual step (creating a file on Windows is mostly waiting;
+        // measured: 4.6 instead of 5.8 ms for 3 trees), one by one otherwise (a new folder hierarchy).
+        let mut bytes = Vec::new();
+        let mut new_trees = Vec::new();
+        let tree = editor.write(|tree| {
+            use gix::objs::WriteTo;
+            bytes.clear();
+            tree.write_to(&mut bytes)?;
+            let (id, new) = self.prepare(gix::objs::Kind::Tree, &bytes)?;
+            new_trees.extend(new);
+            Ok::<_, Error>(id)
+        })?;
+        let objects = self.objects_dir();
+        if new_trees.len() > MAX_PARALLEL_TREE_WRITES {
+            for new in &new_trees {
+                persist(&objects, new)?;
+            }
+            return Ok(tree);
+        }
+        std::thread::scope(|scope| {
+            let mut results = Vec::new();
+            let mut writers = Vec::new();
+            for new in new_trees.iter().skip(1) {
+                match std::thread::Builder::new().spawn_scoped(scope, || persist(&objects, new)) {
+                    Ok(writer) => writers.push(writer),
+                    // No thread available: written here.
+                    Err(_) => results.push(persist(&objects, new)),
+                }
+            }
+            if let Some(first) = new_trees.first() {
+                results.push(persist(&objects, first));
+            }
+            for writer in writers {
+                results.push(
+                    writer
+                        .join()
+                        .unwrap_or_else(|_| Err(io::Error::other("writing a tree failed"))),
+                );
+            }
+            results.into_iter().collect::<io::Result<()>>()
+        })?;
         Ok(tree)
     }
 
@@ -637,6 +773,97 @@ pub fn validate_path(path: &str, kind: FileKind) -> Result<()> {
     Ok(())
 }
 
+/// A new loose object, compressed, see [`ShadowStore::prepare`].
+struct NewObject {
+    id: ObjectId,
+    compressed: Vec<u8>,
+}
+
+/// Writes `object` into the object directory `objects`: to a temporary file next to its final name, then
+/// renamed into place. The rename keeps a hook stopped at its deadline from leaving a partial object under a
+/// final name, which later writes of the same content would trust. Like git, the object's directory is created
+/// on demand. A temporary file left by a stopped hook is never reused (its name has random bits, and a taken
+/// name is skipped) and is deleted by `yalper init` once it is an hour old (see
+/// [`ShadowStore::remove_stale_temp_files`]).
+fn persist(objects: &Path, object: &NewObject) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
+    const ATTEMPTS: usize = 8;
+
+    let hex = object.id.to_string();
+    let fan_out = objects.join(&hex[..2]);
+    // Checked right before use: the store's layout was checked when it was opened, but the directory could
+    // have been created since, and an object must never be written through a link.
+    match fs::symlink_metadata(&fan_out) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "objects/{} is not a directory",
+                &hex[..2]
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(&fan_out) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        },
+        Err(error) => return Err(error),
+    }
+    let mut attempt = 0;
+    let (mut file, temp) = loop {
+        let temp = fan_out.join(format!(
+            "tmp_obj_{:016x}_{}",
+            temp_file_prefix(),
+            TEMP_FILES.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create_object_file(&temp) {
+            Ok(file) => break (file, temp),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists && attempt + 1 < ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(&object.compressed);
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    let path = fan_out.join(&hex[2..]);
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        // On Windows, an object being read cannot be replaced, and it already holds this content.
+        if fs::symlink_metadata(&path).is_err() {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Random bits for the names of this process's temporary object files, so that a process never runs into a
+/// file left by an earlier one (process ids are reused).
+fn temp_file_prefix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // The standard library seeds each `RandomState` from the operating system's random number generator.
+    *PREFIX.get_or_init(|| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    })
+}
+/// Creates a new file for a loose object at `path`, read-only for everyone on Unix as git makes its objects.
+fn create_object_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o444);
+    options.open(path)
+}
+
 /// See [`ShadowStore::open`]. A few metadata reads, three short directory listings and one read of `config`.
 fn check_layout(dir: &OwnedDir, expected_config: &str) -> Result<()> {
     let root = dir.path();
@@ -749,6 +976,69 @@ mod tests {
         }
         objects.sort();
         objects
+    }
+
+    #[test]
+    fn many_new_directories_are_written_one_by_one() {
+        let (dir, store) = new_store();
+        // 40 new directories two levels deep: 81 new trees in one edit, more than are written in parallel.
+        let files: Vec<(String, FileKind, String)> = (0..40)
+            .map(|index| (format!("d{index}/sub/f.txt"), Regular, format!("{index}")))
+            .collect();
+        let files: Vec<(&str, FileKind, &str)> = files
+            .iter()
+            .map(|(path, kind, content)| (path.as_str(), *kind, content.as_str()))
+            .collect();
+        let tree = from_scratch(&store, &files);
+        assert_eq!(
+            store
+                .changed_paths(store.empty_tree(), tree)
+                .unwrap()
+                .added
+                .len(),
+            40
+        );
+        assert_eq!(
+            loose_objects(&dir.path().join(SNAPSHOTS_DIR)).len(),
+            40 + 81
+        );
+    }
+
+    #[test]
+    fn stale_temporary_object_files_are_deleted() {
+        let (dir, store) = new_store();
+        let fan_out = dir.path().join(SNAPSHOTS_DIR).join("objects").join("ab");
+        fs::create_dir(&fan_out).unwrap();
+        let old = fan_out.join("tmp_obj_0123_7");
+        let fresh = fan_out.join("tmp_obj_0123_8");
+        let object = fan_out.join("cdef0123456789abcdef0123456789abcdef01");
+        for path in [&old, &fresh, &object] {
+            fs::write(path, "x").unwrap();
+        }
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for path in [&old, &object] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+        assert_eq!(store.remove_stale_temp_files(), 1);
+        assert!(!old.exists() && fresh.exists() && object.exists());
+    }
+
+    #[test]
+    fn an_object_directory_that_is_a_link_is_never_written_through() {
+        let (dir, store) = new_store();
+        let outside = tempfile::tempdir().unwrap();
+        // The blob of "hello\n" goes to `objects/ce`.
+        link_dir(
+            outside.path(),
+            &dir.path().join(SNAPSHOTS_DIR).join("objects").join("ce"),
+        );
+        assert!(store.write_blob(b"hello\n").is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     #[test]

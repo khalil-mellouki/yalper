@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+use super::scan::nanos_since_epoch;
 use crate::{repo, safe_fs};
 
 /// The most bytes one ignore file may have. A larger one is refused (it counts as absent).
@@ -94,6 +95,8 @@ pub(super) struct Excludes {
     budget: Mutex<Budget>,
     /// Ignore files that exist but are not used, with the reason.
     refused: Mutex<Vec<(PathBuf, String)>>,
+    /// See [`seen`](Self::seen).
+    seen: Mutex<Vec<(PathBuf, u64, i64)>>,
     exceeded: AtomicBool,
 }
 
@@ -113,6 +116,7 @@ impl Excludes {
                 weight: MAX_IGNORE_WEIGHT,
             }),
             refused: Mutex::new(Vec::new()),
+            seen: Mutex::new(Vec::new()),
             exceeded: AtomicBool::new(false),
         };
         if let Some(dir) = repo::git_common_dir(root) {
@@ -176,15 +180,16 @@ impl Excludes {
         self.exceeded.load(Ordering::Relaxed)
     }
 
-    /// If the budget was exceeded, why. No file is named: which file the total ran out at depends on the
-    /// order of the walk.
-    pub fn budget_error(&self) -> Option<String> {
-        self.exceeded().then(|| {
-            format!(
-                "the project's .gitignore and info/exclude files go over the budget of {MAX_IGNORE_WEIGHT} \
-                 pattern weight or {MAX_IGNORE_BYTES} bytes per snapshot"
-            )
-        })
+    /// Every ignore file found (used, refused, or over the budget): path, size and mtime in nanoseconds since
+    /// the Unix epoch.
+    pub fn seen(&self) -> Vec<(PathBuf, u64, i64)> {
+        let mut seen = self
+            .seen
+            .lock()
+            .map(|seen| seen.clone())
+            .unwrap_or_default();
+        seen.sort();
+        seen
     }
 
     /// The rules of the ignore file at `file`, relative to `dir`. Empty if the file is missing, and also if
@@ -209,6 +214,9 @@ impl Excludes {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Gitignore::empty()),
             Err(error) => return Err(refused(error.to_string())),
         };
+        if let (Ok(mut seen), Ok(mtime)) = (self.seen.lock(), metadata.modified()) {
+            seen.push((file.to_owned(), metadata.len(), nanos_since_epoch(mtime)));
+        }
         if metadata.file_type().is_symlink() {
             return Err(refused(
                 "it is a link, which git does not follow either".to_owned(),
@@ -258,6 +266,15 @@ impl Excludes {
         budget.weight -= weight;
         Ok(())
     }
+}
+
+/// Why a snapshot fails when the ignore files go over the budget. No file is named: which file the total ran
+/// out at depends on the order of the walk.
+pub fn over_budget_reason() -> String {
+    format!(
+        "the project's .gitignore and info/exclude files go over the budget of {MAX_IGNORE_WEIGHT} pattern \
+         weight or {MAX_IGNORE_BYTES} bytes per snapshot"
+    )
 }
 
 /// What a pattern costs to compile, in units of about 10 µs on the user's machine (see

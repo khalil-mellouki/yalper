@@ -7,7 +7,7 @@ use std::process::Command;
 
 use gix::ObjectId;
 use yalper::hook::{ERRORS_LOG, HookInput, YALPER_DIR, find_yalper_dir};
-use yalper::record::{record, session_stand_in};
+use yalper::record::{record, record_until, session_stand_in};
 use yalper::repo::YalperDir;
 use yalper::snapshot::{self, SNAPSHOTS_DIR, ShadowStore};
 use yalper::store::{LOCK_TIMEOUT, Store, WriterLock};
@@ -280,4 +280,53 @@ fn a_session_id_that_redaction_changes_is_stored_as_its_hash() {
     assert_eq!(sessions.len(), 1, "both events belong to one session");
     assert_eq!(sessions[0].id, session_stand_in(&secret_id));
     assert_eq!(store.events(&sessions[0].id).unwrap().len(), 2);
+}
+
+#[test]
+fn snapshots_that_keep_missing_the_deadline_are_counted_and_explained_once() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    let dir = common::init(root);
+
+    // A deadline that has already passed: every snapshot is abandoned, and every step still recorded.
+    let lines: Vec<String> = (0..4)
+        .map(|_| {
+            record_until(
+                &dir,
+                fixture("post_tool_use_bash_subagent.json"),
+                std::time::Instant::now(),
+            )
+            .unwrap_err()
+        })
+        .collect();
+    for (index, line) in lines.iter().enumerate() {
+        assert!(
+            line.contains("recorded without a snapshot: abandoned")
+                && line.contains(&format!("({} in a row)", index + 1)),
+            "{line}"
+        );
+    }
+    let advice = "Snapshots keep missing the deadline";
+    assert!(!lines[1].contains(advice) && lines[2].contains(advice) && !lines[3].contains(advice));
+    assert!(lines[2].contains(".gitignore"), "{}", lines[2]);
+
+    // A snapshot in time ends the count.
+    record(&dir, fixture("post_tool_use_bash_subagent.json")).unwrap();
+    let error = record_until(
+        &dir,
+        fixture("post_tool_use_bash_subagent.json"),
+        std::time::Instant::now(),
+    )
+    .unwrap_err();
+    assert!(error.contains("(1 in a row)"), "{error}");
+    let store = Store::open(&dir.dir, &dir.token).unwrap();
+    let session = &store.sessions().unwrap()[0];
+    let events = store.events(&session.id).unwrap();
+    assert_eq!(events.len(), 6);
+    let trees: Vec<bool> = events.iter().map(|event| event.tree_id.is_some()).collect();
+    assert_eq!(trees, [false, false, false, false, true, false]);
+    // The step in time has every change since the last snapshot.
+    assert_eq!(events[4].files_changed, Some(1));
 }

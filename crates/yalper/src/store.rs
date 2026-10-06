@@ -1,17 +1,19 @@
 //! The event log: one SQLite database per project, `.yalper/yalper.db`.
 //!
-//! Hook processes can run at the same time (parallel tool calls), so every write is made while holding the
+//! Hook processes can run at the same time (parallel tool calls). Each records its step in one write transaction
+//! ([`Store::write_transaction`]), which SQLite runs one at a time, and a hook that saves a snapshot also holds the
 //! [`WriterLock`], taken after opening the store. SQLite runs in WAL mode, so readers such as `yalper log`
 //! never take the lock (except for a moment if the database still has to be created) and are not blocked by
 //! a writer.
 
 mod lock;
 
+use std::cell::Cell;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
@@ -30,6 +32,14 @@ const WAL_FILE: &str = "yalper.db-wal";
 
 /// Files SQLite creates next to the database while it works.
 const DATABASE_SIDE_FILES: [&str; 3] = [WAL_FILE, "yalper.db-shm", "yalper.db-journal"];
+
+/// Long reads and writes check the deadline (see [`Store::set_deadline`]) once per this many rows: about 4 ms
+/// of work on the user's machine.
+const ROWS_PER_DEADLINE_CHECK: usize = 4096;
+
+/// The shortest a writer waits for another one under a deadline (see [`Store::write_transaction`]): Yalper's
+/// own write transactions take milliseconds, so a step is not dropped because the deadline already passed.
+const MIN_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// When the WAL is larger than this as a connection closes, it is copied into the database and emptied.
 const WAL_TRUNCATE_BYTES: u64 = 256 * 1024;
@@ -204,6 +214,8 @@ pub enum Error {
         found: u32,
         known: u32,
     },
+    /// The deadline set with [`Store::set_deadline`] passed during a long read or write.
+    DeadlinePassed,
 }
 
 impl fmt::Display for Error {
@@ -230,6 +242,10 @@ impl fmt::Display for Error {
                 f,
                 "the database is missing or empty: run `yalper init` first"
             ),
+            Self::DeadlinePassed => write!(
+                f,
+                "the deadline passed while reading or writing the stat cache"
+            ),
             Self::OlderSchema { found, known } => write!(
                 f,
                 "the database has schema version {found}, older than this Yalper's version {known}: run \
@@ -248,7 +264,8 @@ impl std::error::Error for Error {
             | Self::UnexpectedSchema
             | Self::ForeignDatabase
             | Self::MissingSchema
-            | Self::OlderSchema { .. } => None,
+            | Self::OlderSchema { .. }
+            | Self::DeadlinePassed => None,
         }
     }
 }
@@ -274,6 +291,8 @@ pub struct Store {
     /// The WAL to empty once it is large, when the store closes. `None` for a reader, which writes nothing.
     wal_path: Option<PathBuf>,
     token: Token,
+    /// See [`set_deadline`](Self::set_deadline).
+    deadline: Cell<Option<Instant>>,
     /// See [`OwnedDir::guard_path`]: on Windows it keeps the database file from being renamed or deleted.
     _database: PathGuard,
 }
@@ -304,6 +323,7 @@ impl Store {
             conn,
             wal_path: Some(dir.path().join(WAL_FILE)),
             token: token.clone(),
+            deadline: Cell::new(None),
             _database: database,
         })
     }
@@ -341,8 +361,28 @@ impl Store {
             conn,
             wal_path: None,
             token: token.clone(),
+            deadline: Cell::new(None),
             _database: database,
         })
+    }
+
+    /// Makes the reads and writes that can be long (the stat cache) fail with [`Error::DeadlinePassed`] once `deadline`
+    /// passes, and keeps [`write_transaction`](Self::write_transaction) from waiting for other writers much past it.
+    /// `None` (the default) removes the deadline.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        self.deadline.set(deadline);
+    }
+
+    /// Fails with [`Error::DeadlinePassed`] if the deadline passed. Called every [`ROWS_PER_DEADLINE_CHECK`] rows.
+    fn check_deadline(&self, rows: usize) -> Result<()> {
+        match self.deadline.get() {
+            Some(deadline)
+                if rows.is_multiple_of(ROWS_PER_DEADLINE_CHECK) && Instant::now() >= deadline =>
+            {
+                Err(Error::DeadlinePassed)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The init token this database belongs to.
@@ -400,7 +440,8 @@ impl Store {
         Ok(())
     }
 
-    /// The number the next step of `session_id` gets. Only meaningful while holding the [`WriterLock`].
+    /// The number the next step of `session_id` gets. Only meaningful inside a
+    /// [`write_transaction`](Self::write_transaction) that then inserts the step.
     pub fn next_step(&self, session_id: &str) -> Result<u32> {
         let step = self
             .conn
@@ -519,17 +560,97 @@ impl Store {
         let Some(Some(tree_id)) = tree_id else {
             return Ok(None);
         };
-        let files: Option<Vec<CachedFile>> = self
+        let mut statement = self
             .conn
-            .prepare_cached("SELECT path, size, mtime_ns, mode, oid, racy FROM file_cache")?
-            .query_map([], cached_file_from_row)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(files.map(|files| FileCache { tree_id, files }))
+            .prepare_cached("SELECT path, size, mtime_ns, mode, oid, racy FROM file_cache")?;
+        let mut rows = statement.query([])?;
+        let mut files = Vec::new();
+        while let Some(row) = rows.next()? {
+            if let Err(error) = self.check_deadline(files.len()) {
+                // Freeing a million rows takes a few hundred milliseconds more, and only a hook sets a deadline:
+                // its process exits right after recording the step, which frees them at once.
+                std::mem::forget(files);
+                return Err(error);
+            }
+            match cached_file_from_row(row)? {
+                Some(file) => files.push(file),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(FileCache { tree_id, files }))
+    }
+
+    /// Runs `write` in one write transaction, committed if it returns `Ok` and rolled back otherwise. The
+    /// transaction starts with `BEGIN IMMEDIATE`, so it waits for (at most the busy timeout) and then excludes
+    /// every other writer: a step number read with [`next_step`](Self::next_step) inside it stays free until
+    /// the step is inserted, with or without the [`WriterLock`].
+    pub fn write_transaction<T>(&self, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Some(deadline) = self.deadline.get() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.conn
+                .busy_timeout(left.clamp(MIN_BUSY_TIMEOUT, LOCK_TIMEOUT))?;
+        }
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // Dropping the transaction on an error rolls it back.
+        let value = write()?;
+        transaction.commit()?;
+        Ok(value)
+    }
+
+    /// Runs `write` inside the current transaction so that, if it fails, only its own changes are undone
+    /// (an SQLite savepoint) and the transaction can go on.
+    pub fn with_savepoint<T>(&self, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT partial")?;
+        match write() {
+            Ok(value) => {
+                self.conn.execute_batch("RELEASE partial")?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO partial; RELEASE partial")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// A value of the `meta` table, or `None` if it is missing or not text.
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .conn
+            .prepare_cached("SELECT value FROM meta WHERE key = ?1")?
+            .query_row([key], |row| {
+                Ok(row.get_ref(0)?.as_str().ok().map(str::to_owned))
+            })
+            .optional()?;
+        Ok(value.flatten())
+    }
+
+    /// Sets (`Some`) or deletes (`None`) a value of the `meta` table. The init token cannot be changed.
+    pub fn set_meta(&self, key: &str, value: Option<&str>) -> Result<()> {
+        if key == INIT_TOKEN_KEY {
+            return Err(Error::Io(io::Error::other(
+                "the init token cannot be changed",
+            )));
+        }
+        match value {
+            Some(value) => self
+                .conn
+                .prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")?
+                .execute([key, value])?,
+            None => self
+                .conn
+                .prepare_cached("DELETE FROM meta WHERE key = ?1")?
+                .execute([key])?,
+        };
+        Ok(())
     }
 
     /// Saves a new latest snapshot and brings the stat cache in line with it, in one transaction: `changed`
     /// rows are added or replaced and `removed` paths deleted. With `replace_all`, every other row is deleted
-    /// first. Taking the [`WriterLock`] makes sure no other process saves a snapshot at the same time.
+    /// first. Taking the [`WriterLock`] makes sure no other process saves a snapshot at the same time. Called
+    /// inside [`write_transaction`](Self::write_transaction), it becomes part of that transaction.
     pub fn save_snapshot(
         &self,
         _lock: &WriterLock,
@@ -538,16 +659,30 @@ impl Store {
         removed: &[String],
         replace_all: bool,
     ) -> Result<()> {
-        let transaction = self.conn.unchecked_transaction()?;
+        if !self.conn.is_autocommit() {
+            return self.save_snapshot_rows(tree_id, changed, removed, replace_all);
+        }
+        self.write_transaction(|| self.save_snapshot_rows(tree_id, changed, removed, replace_all))
+    }
+
+    fn save_snapshot_rows(
+        &self,
+        tree_id: &str,
+        changed: &[CachedFile],
+        removed: &[String],
+        replace_all: bool,
+    ) -> Result<()> {
+        let conn = &self.conn;
         if replace_all {
-            transaction.execute("DELETE FROM file_cache", [])?;
+            conn.execute("DELETE FROM file_cache", [])?;
         }
         {
-            let mut upsert = transaction.prepare_cached(
+            let mut upsert = conn.prepare_cached(
                 "INSERT OR REPLACE INTO file_cache (path, size, mtime_ns, mode, oid, racy)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for file in changed {
+            for (index, file) in changed.iter().enumerate() {
+                self.check_deadline(index)?;
                 upsert.execute(params![
                     file.path,
                     file.size,
@@ -557,18 +692,16 @@ impl Store {
                     file.racy
                 ])?;
             }
-            let mut delete =
-                transaction.prepare_cached("DELETE FROM file_cache WHERE path = ?1")?;
-            for path in removed {
+            let mut delete = conn.prepare_cached("DELETE FROM file_cache WHERE path = ?1")?;
+            for (index, path) in removed.iter().enumerate() {
+                self.check_deadline(index)?;
                 delete.execute([path])?;
             }
-            transaction
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO latest_snapshot (id, tree_id) VALUES (1, ?1)",
-                )?
-                .execute([tree_id])?;
+            conn.prepare_cached(
+                "INSERT OR REPLACE INTO latest_snapshot (id, tree_id) VALUES (1, ?1)",
+            )?
+            .execute([tree_id])?;
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -758,12 +891,80 @@ fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
 }
 
+/// What `sqlite_schema` holds once every migration has run: type, name, table and SQL text of each table and
+/// index, sorted by type and name. A test checks that it matches a database built by [`MIGRATIONS`], so a new
+/// migration must update it.
+const EXPECTED_SCHEMA: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "index",
+        "events_session_step",
+        "events",
+        Some("CREATE UNIQUE INDEX events_session_step ON events (session_id, step)"),
+    ),
+    ("index", "sqlite_autoindex_sessions_1", "sessions", None),
+    (
+        "table",
+        "events",
+        "events",
+        Some(
+            "CREATE TABLE events (\n    id            INTEGER PRIMARY KEY,\n    session_id    TEXT NOT NULL \
+             REFERENCES sessions (id),\n    step          INTEGER NOT NULL,\n    ts_ms         INTEGER NOT \
+             NULL,\n    kind          TEXT NOT NULL,\n    tool_name     TEXT,\n    tool_use_id   TEXT,\n    \
+             agent_id      TEXT,\n    success       INTEGER,\n    tree_id       TEXT,\n    files_changed \
+             INTEGER,\n    payload       TEXT NOT NULL\n, base_tree_id TEXT)",
+        ),
+    ),
+    (
+        "table",
+        "file_cache",
+        "file_cache",
+        Some(
+            "CREATE TABLE file_cache (\n    path     TEXT PRIMARY KEY,\n    size     INTEGER NOT NULL,\n    \
+             mtime_ns INTEGER NOT NULL,\n    mode     INTEGER NOT NULL,\n    oid      TEXT NOT NULL,\n    \
+             racy     INTEGER NOT NULL\n) WITHOUT ROWID",
+        ),
+    ),
+    (
+        "table",
+        "latest_snapshot",
+        "latest_snapshot",
+        Some(
+            "CREATE TABLE latest_snapshot (\n    id      INTEGER PRIMARY KEY CHECK (id = 1),\n    tree_id \
+             TEXT NOT NULL\n)",
+        ),
+    ),
+    (
+        "table",
+        "meta",
+        "meta",
+        Some(
+            "CREATE TABLE meta (\n    key   TEXT PRIMARY KEY,\n    value TEXT NOT NULL\n) WITHOUT ROWID",
+        ),
+    ),
+    (
+        "table",
+        "sessions",
+        "sessions",
+        Some(
+            "CREATE TABLE sessions (\n    id              TEXT PRIMARY KEY,\n    started_at_ms   INTEGER NOT \
+             NULL,\n    ended_at_ms     INTEGER,\n    end_reason      TEXT,\n    source          TEXT,\n    \
+             model           TEXT,\n    cwd             TEXT,\n    transcript_path TEXT\n)",
+        ),
+    ),
+];
+
 /// Refuses a database whose tables, indexes, triggers and views differ in any way from the ones
-/// [`MIGRATIONS`] create, compared with a fresh in-memory copy.
+/// [`MIGRATIONS`] create (see [`EXPECTED_SCHEMA`]).
 fn check_schema(conn: &Connection) -> Result<()> {
-    let mut expected = Connection::open_in_memory()?;
-    migrate(&mut expected, MIGRATIONS, None)?;
-    if schema(conn)? == schema(&expected)? {
+    let found = schema(conn)?;
+    let matches = found.len() == EXPECTED_SCHEMA.len()
+        && found
+            .iter()
+            .zip(EXPECTED_SCHEMA)
+            .all(|((kind, name, table, sql), expected)| {
+                (kind.as_str(), name.as_str(), table.as_str(), sql.as_deref()) == *expected
+            });
+    if matches {
         Ok(())
     } else {
         Err(Error::UnexpectedSchema)
@@ -807,6 +1008,109 @@ mod tests {
 
     fn token() -> Token {
         Token::parse("0123456789abcdef0123456789abcdef").unwrap()
+    }
+
+    #[test]
+    fn a_large_stat_cache_is_read_and_saved_only_until_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
+        let rows: Vec<CachedFile> = (0..3 * ROWS_PER_DEADLINE_CHECK)
+            .map(|index| cached(&format!("dir/file{index}.rs"), "aa"))
+            .collect();
+        store
+            .save_snapshot(&lock, "tree", &rows, &[], true)
+            .unwrap();
+
+        store.set_deadline(Some(Instant::now()));
+        assert!(matches!(store.file_cache(), Err(Error::DeadlinePassed)));
+        // Inside a transaction, a savepoint undoes only the failed save, and the step can still be recorded.
+        let more: Vec<CachedFile> = (0..3 * ROWS_PER_DEADLINE_CHECK)
+            .map(|index| cached(&format!("other/file{index}.rs"), "bb"))
+            .collect();
+        store
+            .write_transaction(|| {
+                let saved =
+                    store.with_savepoint(|| store.save_snapshot(&lock, "tree2", &more, &[], true));
+                assert!(matches!(saved, Err(Error::DeadlinePassed)), "{saved:?}");
+                store.upsert_session(&Session::new("s", 1))
+            })
+            .unwrap();
+        assert_eq!(store.sessions().unwrap().len(), 1);
+
+        store.set_deadline(None);
+        let cache = store.file_cache().unwrap().unwrap();
+        assert_eq!(
+            (cache.tree_id.as_str(), cache.files.len()),
+            ("tree", rows.len())
+        );
+        store.set_deadline(Some(Instant::now() + Duration::from_secs(600)));
+        assert_eq!(store.file_cache().unwrap().unwrap().files.len(), rows.len());
+    }
+
+    #[test]
+    fn a_write_transaction_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
+
+        let failed: Result<()> = store.write_transaction(|| {
+            store.upsert_session(&Session::new("s", 1))?;
+            store.set_meta("key", Some("value"))?;
+            store.save_snapshot(&lock, "tree", &[], &[], true)?;
+            store.insert_event(&event("no-such-session", 1))
+        });
+        assert!(matches!(failed, Err(Error::Sqlite(_))), "{failed:?}");
+        assert!(store.sessions().unwrap().is_empty());
+        assert_eq!(store.meta("key").unwrap(), None);
+        assert!(!store.has_snapshot().unwrap());
+
+        let step = store
+            .write_transaction(|| {
+                store.upsert_session(&Session::new("s", 1))?;
+                store.save_snapshot(&lock, "tree", &[], &[], true)?;
+                let step = store.next_step("s")?;
+                store.insert_event(&event("s", step))?;
+                Ok(step)
+            })
+            .unwrap();
+        assert_eq!(step, 1);
+        assert_eq!(store.events("s").unwrap().len(), 1);
+        assert!(store.has_snapshot().unwrap());
+    }
+
+    #[test]
+    fn meta_values_can_be_set_and_removed_but_not_the_init_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        store.set_meta("key", Some("one")).unwrap();
+        store.set_meta("key", Some("two")).unwrap();
+        assert_eq!(store.meta("key").unwrap().as_deref(), Some("two"));
+        store.set_meta("key", None).unwrap();
+        assert_eq!(store.meta("key").unwrap(), None);
+
+        assert!(store.set_meta(INIT_TOKEN_KEY, Some("other")).is_err());
+        assert!(store.set_meta(INIT_TOKEN_KEY, None).is_err());
+        drop(store);
+        Store::open(&owned, &token()).unwrap();
+    }
+
+    #[test]
+    fn the_expected_schema_is_what_the_migrations_create() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn, MIGRATIONS, None).unwrap();
+        let rows = schema(&conn).unwrap();
+        let created: Vec<(&str, &str, &str, Option<&str>)> = rows
+            .iter()
+            .map(|(kind, name, table, sql)| {
+                (kind.as_str(), name.as_str(), table.as_str(), sql.as_deref())
+            })
+            .collect();
+        assert_eq!(created, EXPECTED_SCHEMA);
+        check_schema(&conn).unwrap();
     }
 
     #[test]

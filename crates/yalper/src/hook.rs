@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -58,8 +58,10 @@ pub fn silence_panics() {
 /// Handles one hook call: reads the payload from `stdin` and records it. Never panics and never prints
 /// (once [`silence_panics`] has been called).
 pub fn run(stdin: &mut dyn Read) {
+    // Counted from here: Claude Code is already waiting.
+    let deadline = Instant::now() + record::snapshot_deadline();
     let mut call = Call::default();
-    let error = match panic::catch_unwind(AssertUnwindSafe(|| handle(stdin, &mut call))) {
+    let error = match panic::catch_unwind(AssertUnwindSafe(|| handle(stdin, &mut call, deadline))) {
         Ok(Ok(())) => return,
         Ok(Err(error)) => error,
         Err(_) => LAST_PANIC
@@ -81,7 +83,7 @@ struct Call {
     event: Option<&'static str>,
 }
 
-fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
+fn handle(stdin: &mut dyn Read, call: &mut Call, deadline: Instant) -> Result<(), String> {
     let payload = read_limited(stdin, MAX_PAYLOAD_BYTES).and_then(|bytes| {
         serde_json::from_slice::<Value>(&bytes)
             .map_err(|error| format!("invalid hook input: {error}"))
@@ -126,7 +128,7 @@ fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
         );
     }
 
-    record::record(dir, input)
+    record::record_until(dir, input, deadline)
 }
 
 /// Reads `reader` to the end, but keeps at most `limit` bytes. A longer input is drained (so the writer

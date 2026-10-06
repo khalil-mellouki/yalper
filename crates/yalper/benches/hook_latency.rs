@@ -5,7 +5,9 @@
 //! response, as Claude Code sends it). Each call records the step: redaction, the event log, and a real snapshot
 //! of the project. Prints the median and p90.
 //!
-//! Run with `cargo bench --bench hook_latency`. Set `YALPER_BENCH_CALLS` to change the number of calls.
+//! Run with `cargo bench --bench hook_latency`. Set `YALPER_BENCH_CALLS` to change the number of calls, and
+//! `YALPER_BENCH_MAX_MEDIAN_MS` to fail (exit code 1) when the median is that many milliseconds or more: CI
+//! runs it as a gate with 50 ms, the limit of done criterion 7 of milestone M1.
 
 use std::env;
 use std::fs;
@@ -210,4 +212,17 @@ fn main() {
         min = millis(times[0]),
         max = millis(times[calls - 1]),
     );
+
+    if let Some(limit) = env::var("YALPER_BENCH_MAX_MEDIAN_MS")
+        .ok()
+        .and_then(|limit| limit.parse::<f64>().ok())
+    {
+        if median >= limit {
+            eprintln!(
+                "hook_latency: the median of {median:.1} ms is not under the limit of {limit} ms"
+            );
+            std::process::exit(1);
+        }
+        println!("hook_latency: the median is under the limit of {limit} ms");
+    }
 }

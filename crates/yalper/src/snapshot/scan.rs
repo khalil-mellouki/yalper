@@ -20,7 +20,8 @@ use ignore::{WalkBuilder, WalkState};
 use super::excludes::Excludes;
 use super::{Change, FileKind, Result, ShadowStore, validate_path};
 use crate::hook::YALPER_DIR;
-use crate::safe_fs::{self, OwnedDir};
+use crate::repo::Token;
+use crate::safe_fs::{self, Access, OwnedDir};
 use crate::store::{CachedFile, FileCache, Store, WriterLock};
 
 /// Files larger than this are left out of snapshots.
@@ -28,8 +29,45 @@ pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// A file whose mtime is this close to the start of the scan is read again by the next scan, because a change
 /// made later within the same timestamp tick would leave its size and mtime unchanged (the same idea as git's
-/// "racy" index entries). Two seconds covers file systems with coarse timestamps (FAT).
-const RACY_WINDOW: Duration = Duration::from_secs(2);
+/// "racy" index entries). File systems with sub-second mtimes (NTFS, ext4, APFS) take them from a clock that
+/// advances in ticks of at most about 16 ms (Windows), so a change after the scan started gets an mtime at most
+/// one tick before that start, and a file changed and changed again within one tick has an mtime at most two
+/// ticks before it. 100 ms is three times that. A wider window costs time on every step: each file changed
+/// within it is read again (measured: about 3 ms per step on Windows with 2 s and steps 30 ms apart).
+///
+/// The start of the scan is read from the file system's own clock, like git compares with its index file's
+/// mtime: the scan writes [`SCAN_CLOCK_FILE`] and takes its mtime. A network share, WSL's `/mnt/c` or a Docker
+/// Desktop bind mount can stamp mtimes with a clock that differs from the local one by seconds; the project and
+/// `.yalper/` are stamped by the same one. Only a folder mounted inside the project from another file system
+/// could still be skewed.
+const RACY_WINDOW: Duration = Duration::from_millis(100);
+
+/// The racy window for an mtime that is a whole number of seconds, as file systems that keep whole or even
+/// seconds only (FAT, HFS+, some network shares) give.
+const COARSE_RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether a file with mtime `mtime_ns`, seen by a scan that started at `started_ns`, must be read again by the
+/// next scan (see [`RACY_WINDOW`]).
+fn is_racy(mtime_ns: i64, started_ns: i64) -> bool {
+    let window = if mtime_ns % 1_000_000_000 == 0 {
+        COARSE_RACY_WINDOW
+    } else {
+        RACY_WINDOW
+    };
+    mtime_ns >= started_ns.saturating_sub(window.as_nanos() as i64)
+}
+
+/// The file in `.yalper/` whose mtime gives the start of a scan (see [`RACY_WINDOW`]).
+const SCAN_CLOCK_FILE: &str = "scan-clock";
+
+/// The time on the file system's clock, in nanoseconds since the Unix epoch: the mtime of [`SCAN_CLOCK_FILE`]
+/// right after writing to it.
+fn scan_clock(yalper_dir: &OwnedDir) -> io::Result<i64> {
+    use std::io::Write as _;
+    let mut file = yalper_dir.open_file(SCAN_CLOCK_FILE, Access::ReadWrite)?;
+    file.write_all(b"x")?;
+    Ok(nanos_since_epoch(file.metadata()?.modified()?))
+}
 
 /// Threads of the directory walk. Listing directories is mostly waiting on the file system, so a few threads
 /// help, and more only cost time to start.
@@ -140,36 +178,213 @@ impl fmt::Display for Skipped {
 /// and the user's global excludes do not ignore (see [`Excludes`]), except anything named `.git` or `.yalper`.
 /// Symlinks are stored as symlinks (their target is never read), and on Unix the executable bit is kept.
 ///
-/// The walk runs in its own threads while this thread stores what they found: new file contents go to the
-/// shadow store, which is only opened when something changed (with the init token of `store`). The new tree
-/// and the stat cache are saved together in `store`, under `lock`.
+/// [`take`] followed by [`Pending::save`], under `lock`. A failure because of the ignore rules budget is
+/// remembered (see [`Base`]).
 ///
 /// One file that cannot be taken never fails the snapshot: it is listed in [`Snapshot::skipped`] instead.
 pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Result<Snapshot> {
+    let base = Base::read(store, lock)?;
+    match take(yalper_dir, store.token(), || Some(base)) {
+        Ok(pending) => {
+            pending.save(store, lock)?;
+            Ok(pending.snapshot)
+        }
+        Err(error) => {
+            remember_failure(store, lock, &error)?;
+            Err(error)
+        }
+    }
+}
+
+/// What a snapshot starts from, read from the event log under the writer lock: the latest snapshot with its
+/// stat cache, and whether the previous snapshots failed because the ignore rules go over the budget.
+#[derive(Debug)]
+pub struct Base {
+    cache: Option<FileCache>,
+    over_budget: Option<OverBudget>,
+}
+
+impl Base {
+    pub fn read(store: &Store, _lock: &WriterLock) -> Result<Self> {
+        Ok(Self {
+            cache: store.file_cache()?,
+            over_budget: store
+                .meta(OVER_BUDGET_KEY)?
+                .and_then(|text| OverBudget::parse(&text)),
+        })
+    }
+}
+
+/// A snapshot that [`take`] built and stored in the shadow store, not yet saved as the latest one.
+#[derive(Debug)]
+pub struct Pending {
+    pub snapshot: Snapshot,
+    rows: Vec<CachedFile>,
+    removed: Vec<String>,
+    start_over: bool,
+    clears_over_budget: bool,
+}
+
+impl Pending {
+    /// Saves the snapshot as the latest one with its stat cache rows, under `lock`. Inside
+    /// [`Store::write_transaction`] it is part of that transaction.
+    pub fn save(&self, store: &Store, lock: &WriterLock) -> crate::store::Result<()> {
+        let snapshot = &self.snapshot;
+        if self.start_over
+            || snapshot.tree_id != snapshot.base_tree_id
+            || !self.rows.is_empty()
+            || !self.removed.is_empty()
+        {
+            store.save_snapshot(
+                lock,
+                &snapshot.tree_id.to_string(),
+                &self.rows,
+                &self.removed,
+                self.start_over,
+            )?;
+        }
+        if self.clears_over_budget {
+            store.set_meta(OVER_BUDGET_KEY, None)?;
+        }
+        Ok(())
+    }
+}
+
+/// Saves what the next snapshots need to know about `error`, a failure of [`take`]: the ignore files of a
+/// project over the ignore rules budget, so the next snapshots do not walk it again for nothing.
+pub fn remember_failure(
+    store: &Store,
+    _lock: &WriterLock,
+    error: &super::Error,
+) -> crate::store::Result<()> {
+    if let super::Error::IgnoreRulesOverBudget {
+        remember: Some(marker),
+        ..
+    } = error
+    {
+        store.set_meta(OVER_BUDGET_KEY, Some(marker))?;
+    }
+    Ok(())
+}
+
+/// The `meta` key under which a failure because of the ignore rules budget is remembered.
+const OVER_BUDGET_KEY: &str = "ignore_rules_over_budget";
+
+/// After a failure because of the ignore rules budget, the next snapshots fail at once, without walking the
+/// project, as long as every ignore file that failure read is unchanged and for at most this long. The limit
+/// covers what the check cannot see: a new `.gitignore` that ignores a directory holding many rules, or a
+/// change to the user's global excludes file.
+const OVER_BUDGET_RECHECK: Duration = Duration::from_secs(60);
+
+/// A remembered failure because of the ignore rules budget: when it happened, and the size and mtime of
+/// every ignore file it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverBudget {
+    at_ms: i64,
+    files: Vec<(String, u64, i64)>,
+}
+
+impl OverBudget {
+    fn to_text(&self) -> String {
+        serde_json::json!({ "at_ms": self.at_ms, "files": self.files }).to_string()
+    }
+
+    /// The value as [`to_text`](Self::to_text) writes it, or `None` (as if nothing was remembered).
+    fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let files = value.get("files")?.as_array()?;
+        Some(Self {
+            at_ms: value.get("at_ms")?.as_i64()?,
+            files: files
+                .iter()
+                .map(|file| {
+                    let file = file.as_array()?;
+                    match file.as_slice() {
+                        [path, size, mtime_ns] => Some((
+                            path.as_str()?.to_owned(),
+                            size.as_u64()?,
+                            mtime_ns.as_i64()?,
+                        )),
+                        _ => None,
+                    }
+                })
+                .collect::<Option<_>>()?,
+        })
+    }
+
+    /// Whether the failure is recent and no ignore file it read changed, so a new walk would fail the same
+    /// way.
+    fn still_holds(&self, now_ms: i64) -> bool {
+        let age_ms = now_ms.saturating_sub(self.at_ms);
+        (0..OVER_BUDGET_RECHECK.as_millis() as i64).contains(&age_ms)
+            && self.files.iter().all(|(path, size, mtime_ns)| {
+                fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.len() == *size
+                        && metadata.modified().map(nanos_since_epoch).ok() == Some(*mtime_ns)
+                })
+            })
+    }
+}
+
+/// Walks the project and stores every new or changed file and the new tree in the shadow store (opened with
+/// `token`), starting from the base that `base` returns. Nothing is written to the event log: [`Pending::save`]
+/// does that, so a snapshot that is abandoned (see `record`) leaves the latest snapshot and the stat cache as
+/// they were. Any blobs and trees it already stored stay in the shadow store, which makes a new attempt faster.
+///
+/// The ignore files outside the project tree are read and the shadow store is opened before `base` is called,
+/// so a caller running this on its own thread can read the base (under the writer lock) meanwhile. `base`
+/// returns `None` when the caller gave up. The walk runs in its own threads while this thread stores what they
+/// found.
+pub fn take(
+    yalper_dir: &OwnedDir,
+    token: &Token,
+    base: impl FnOnce() -> Option<Base>,
+) -> Result<Pending> {
     let root = yalper_dir
         .path()
         .parent()
         .ok_or_else(|| io::Error::other("the .yalper directory has no parent"))?;
-    let started = SystemTime::now();
-    let racy_from_ns = nanos_since_epoch(started.checked_sub(RACY_WINDOW).unwrap_or(UNIX_EPOCH));
+    let excludes = Arc::new(Excludes::new(root));
+    let shadow = ShadowStore::open(yalper_dir, token)?;
+    let base =
+        base().ok_or_else(|| io::Error::other("the snapshot was given up before it started"))?;
+    let started_ms = nanos_since_epoch(SystemTime::now()) / 1_000_000;
+    if let Some(over_budget) = &base.over_budget
+        && over_budget.still_holds(started_ms)
+    {
+        return Err(super::Error::IgnoreRulesOverBudget {
+            reason: format!(
+                "{}; the project was not walked again: no ignore file changed since the last attempt",
+                super::excludes::over_budget_reason()
+            ),
+            remember: None,
+        });
+    }
+
+    // The local clock if the file system's cannot be read.
+    let started_ns = scan_clock(yalper_dir).unwrap_or(started_ms.saturating_mul(1_000_000));
 
     // Without a usable cache, the snapshot starts over from the empty tree and every file is read.
-    let previous = store.file_cache()?.and_then(check_cache);
+    let previous = base.cache.and_then(check_cache);
     let start_over = previous.is_none();
-    let (base, cache) =
+    let (base_tree, cache) =
         previous.unwrap_or_else(|| (ObjectId::empty_tree(gix::hash::Kind::Sha1), HashMap::new()));
-    let excludes = Arc::new(Excludes::new(root));
 
-    let mut shadow = None;
-    let mut snapshot = Snapshot {
-        tree_id: base,
-        base_tree_id: base,
-        changed: Vec::new(),
-        skipped: Vec::new(),
-        files_read: 0,
+    let mut pending = Pending {
+        snapshot: Snapshot {
+            tree_id: base_tree,
+            base_tree_id: base_tree,
+            changed: Vec::new(),
+            skipped: Vec::new(),
+            files_read: 0,
+        },
+        rows: Vec::new(),
+        removed: Vec::new(),
+        start_over,
+        clears_over_budget: base.over_budget.is_some(),
     };
+    let snapshot = &mut pending.snapshot;
     let mut changes = Vec::new();
-    let mut updated_rows = Vec::new();
     // Files of this snapshot found by the walk. Under the kept prefixes (unreadable files and directories),
     // what the previous snapshot had stays.
     let mut present = HashSet::new();
@@ -212,7 +427,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
                     // Sent before the content, so it is already there.
                     let _ = taken_permits.recv();
                     snapshot.files_read += 1;
-                    let oid = open_once(&mut shadow, yalper_dir, store)?.write_blob(&bytes)?;
+                    let oid = shadow.write_blob(&bytes)?;
                     changes.push(Change::Upsert {
                         path: file.path.clone(),
                         kind: file.kind,
@@ -229,19 +444,29 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
                 oid,
                 // A length that differs from the size seen by the walk means the file changed while it was
                 // read.
-                racy: file.mtime_ns >= racy_from_ns || len != file.size,
+                racy: is_racy(file.mtime_ns, started_ns) || len != file.size,
             };
             if cached != Some(&row) {
-                updated_rows.push(row.to_cached_file(&file.path));
+                pending.rows.push(row.to_cached_file(&file.path));
             }
             present.insert(file.path);
         }
         Ok(())
     })?;
-
     // Fails before anything is saved: the previous snapshot and the stat cache stay as they were.
-    if let Some(why) = excludes.budget_error() {
-        return Err(super::Error::IgnoreRulesOverBudget(why));
+    if excludes.exceeded() {
+        let marker = OverBudget {
+            at_ms: started_ms,
+            files: excludes
+                .seen()
+                .into_iter()
+                .map(|(path, size, mtime_ns)| (path.to_string_lossy().into_owned(), size, mtime_ns))
+                .collect(),
+        };
+        return Err(super::Error::IgnoreRulesOverBudget {
+            reason: super::excludes::over_budget_reason(),
+            remember: Some(marker.to_text()),
+        });
     }
     for (path, reason) in excludes.refused() {
         snapshot.skipped.push(Skipped {
@@ -250,7 +475,6 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
         });
     }
 
-    let mut removed = Vec::new();
     for path in cache.keys() {
         let kept = || {
             kept_prefixes.iter().any(|prefix| {
@@ -264,38 +488,16 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Resu
         if !present.contains(path) && !kept() {
             changes.push(Change::Remove { path: path.clone() });
             snapshot.changed.push(path.clone());
-            removed.push(path.clone());
+            pending.removed.push(path.clone());
         }
     }
 
-    if !changes.is_empty() {
-        snapshot.tree_id = open_once(&mut shadow, yalper_dir, store)?.edit_tree(base, &changes)?;
-    }
-    if start_over || snapshot.tree_id != base || !updated_rows.is_empty() || !removed.is_empty() {
-        store.save_snapshot(
-            lock,
-            &snapshot.tree_id.to_string(),
-            &updated_rows,
-            &removed,
-            start_over,
-        )?;
-    }
+    snapshot.tree_id = shadow.edit_tree(base_tree, &changes)?;
     snapshot.changed.sort_unstable();
     snapshot
         .skipped
         .sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    Ok(snapshot)
-}
-
-fn open_once<'a>(
-    shadow: &'a mut Option<ShadowStore>,
-    yalper_dir: &OwnedDir,
-    store: &Store,
-) -> Result<&'a ShadowStore> {
-    match shadow {
-        Some(shadow) => Ok(shadow),
-        None => Ok(shadow.insert(ShadowStore::open(yalper_dir, store.token())?)),
-    }
+    Ok(pending)
 }
 
 /// A stat cache entry, checked.
@@ -608,7 +810,7 @@ fn is_executable(_metadata: &Metadata) -> bool {
     false
 }
 
-fn nanos_since_epoch(time: SystemTime) -> i64 {
+pub(super) fn nanos_since_epoch(time: SystemTime) -> i64 {
     let nanos = |duration: Duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX);
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => nanos(after),
@@ -848,7 +1050,9 @@ mod tests {
     #[test]
     fn a_change_within_the_same_mtime_tick_is_detected() {
         let project = Project::new();
-        let now = SystemTime::now();
+        // An mtime the scans are always close to: the file looks changed at the very time each one runs, however
+        // slow the machine.
+        let now = SystemTime::now() + Duration::from_secs(60);
         project.write_at("recent.txt", "aaaa", now);
         let first = project.snapshot();
         let cache = project.store.file_cache().unwrap().unwrap();
@@ -876,6 +1080,35 @@ mod tests {
         let cache = project.store.file_cache().unwrap().unwrap();
         assert!(!cache.files[0].racy, "{cache:?}");
         assert_eq!(project.snapshot().files_read, 0);
+    }
+
+    #[test]
+    fn the_scan_clock_is_the_file_systems() {
+        let project = Project::new();
+        let local = nanos_since_epoch(SystemTime::now());
+        let clock = scan_clock(&project.yalper).unwrap();
+        // On a local disk both clocks agree, up to the file system's timestamp tick.
+        assert!((clock - local).abs() < 5_000_000_000, "{clock} {local}");
+        assert!(scan_clock(&project.yalper).unwrap() >= clock);
+        assert_eq!(
+            fs::read(project.yalper.path().join(SCAN_CLOCK_FILE)).unwrap(),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn whole_second_mtimes_get_the_wider_racy_window() {
+        const MS: i64 = 1_000_000;
+        let started = 1_700_000_000_500 * MS;
+        // Sub-second mtimes: racy within 100 ms of the start, and after it.
+        assert!(is_racy(started - 99 * MS, started));
+        assert!(is_racy(started + 5 * MS, started));
+        assert!(!is_racy(started - 101 * MS, started));
+        // Whole seconds (FAT, HFS+): racy within 2 s.
+        let whole = 1_700_000_000_000 * MS;
+        assert!(is_racy(whole, started));
+        assert!(is_racy(whole - 1_000 * MS, started));
+        assert!(!is_racy(whole - 2_000 * MS, started));
     }
 
     #[test]
@@ -1347,7 +1580,7 @@ mod tests {
         let error = snapshot(&project.yalper, &project.store, &lock).unwrap_err();
         let message = error.to_string();
         assert!(
-            matches!(error, super::super::Error::IgnoreRulesOverBudget(_)),
+            matches!(error, super::super::Error::IgnoreRulesOverBudget { .. }),
             "{message}"
         );
         assert!(
@@ -1361,11 +1594,52 @@ mod tests {
         assert_eq!(project.store.file_cache().unwrap(), before);
         drop(lock);
 
-        // Every step fails the same way until the rules fit again.
+        // Every step fails the same way until the rules fit again, without walking the project again while no
+        // ignore file that the failure read changes.
+        let again = project.snapshot_result().unwrap_err().to_string();
+        assert!(again.contains("not walked again"), "{again}");
+        assert_eq!(project.store.file_cache().unwrap(), before);
+        // The same rules and one more comment line: still over the budget, but a changed file.
+        project.write("sub/.gitignore", &(rules("*.tmp\n") + "# comment\n"));
+        let walked = project.snapshot_result().unwrap_err().to_string();
+        assert!(!walked.contains("not walked again"), "{walked}");
         assert!(project.snapshot_result().is_err());
+
         fs::remove_file(project.root().join("sub/.gitignore")).unwrap();
         let fitting = project.snapshot();
         assert_eq!(fitting.changed, ["new.txt"]);
+        // The failure is forgotten.
+        assert_eq!(project.store.meta(OVER_BUDGET_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn a_remembered_budget_failure_is_checked_again_after_a_minute() {
+        let project = Project::new();
+        project.write(".gitignore", "*.log\n");
+        let gitignore = project.root().join(".gitignore");
+        let metadata = fs::metadata(&gitignore).unwrap();
+        let mtime_ns = nanos_since_epoch(metadata.modified().unwrap());
+        let at_ms = 1_000_000;
+        let marker = OverBudget {
+            at_ms,
+            files: vec![(
+                gitignore.to_string_lossy().into_owned(),
+                metadata.len(),
+                mtime_ns,
+            )],
+        };
+        assert_eq!(OverBudget::parse(&marker.to_text()), Some(marker.clone()));
+        assert_eq!(OverBudget::parse("{\"at_ms\": 1}"), None);
+
+        assert!(marker.still_holds(at_ms));
+        assert!(marker.still_holds(at_ms + 59_999));
+        assert!(!marker.still_holds(at_ms + 60_000));
+        // The clock went back.
+        assert!(!marker.still_holds(at_ms - 1));
+        project.write(".gitignore", "*.log\n*.tmp\n");
+        assert!(!marker.still_holds(at_ms));
+        fs::remove_file(&gitignore).unwrap();
+        assert!(!marker.still_holds(at_ms));
     }
 
     #[test]
