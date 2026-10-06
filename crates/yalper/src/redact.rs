@@ -85,6 +85,8 @@ struct Rule {
     entropy: f64,
     /// gitleaks' allowlist `^[a-zA-Z_.-]+$`: a secret made only of these is a plain identifier.
     letters_only_allowlist: bool,
+    /// A secret that [`looks_like_code`] is not one.
+    code_allowlist: bool,
     /// The capture groups are alternatives for the secret (Yalper rules): the first non-empty one is masked.
     alternative_groups: bool,
 }
@@ -517,6 +519,7 @@ fn find_secrets(text: &str, deadline: Instant) -> Result<Vec<Secret>, Expired> {
             if secret.is_empty()
                 || (rule.entropy > 0.0 && shannon_entropy(secret_bytes) < rule.entropy)
                 || (rule.letters_only_allowlist && is_letters_only(secret_bytes))
+                || (rule.code_allowlist && looks_like_code(secret_bytes))
             {
                 continue;
             }
@@ -549,6 +552,58 @@ fn is_letters_only(secret: &[u8]) -> bool {
     secret
         .iter()
         .all(|&byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// Whether a value assigned to a password-like name is code rather than a password, once trailing `,` and
+/// `;` are removed: a member access (`process.env.DB_PASSWORD`), a variable (`${DB_PASSWORD}`,
+/// `$DB_PASSWORD`), a call without digits (`getPassword()`, `user.getPassword(realm)`, `os.getenv(`), or
+/// a generic type (`Option<String>`). Each shape is narrow, so a password with symbols (which has a digit,
+/// or a character none of them allow) is still masked.
+fn looks_like_code(secret: &[u8]) -> bool {
+    let end = secret
+        .iter()
+        .rposition(|&byte| !matches!(byte, b',' | b';'))
+        .map_or(0, |last| last + 1);
+    let value = &secret[..end];
+    let name_byte = |byte: u8| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'.' | b'$');
+    if is_letters_only(value) {
+        return true;
+    }
+    if let Some(name) = value
+        .strip_prefix(b"${")
+        .and_then(|rest| rest.strip_suffix(b"}"))
+    {
+        return !name.is_empty()
+            && name
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    }
+    if let Some(name) = value.strip_prefix(b"$") {
+        return name
+            .first()
+            .is_some_and(|&byte| byte.is_ascii_uppercase() || byte == b'_')
+            && name
+                .iter()
+                .all(|&byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    }
+    if let Some(open) = value.iter().position(|&byte| byte == b'(') {
+        let (name, rest) = value.split_at(open);
+        let arguments = rest[1..].strip_suffix(b")").unwrap_or(&rest[1..]);
+        return !name.is_empty()
+            && name.iter().all(|&byte| name_byte(byte))
+            && arguments
+                .iter()
+                .all(|&byte| name_byte(byte) || matches!(byte, b',' | b' '));
+    }
+    if let Some(open) = value.iter().position(|&byte| byte == b'<') {
+        let name = &value[..open];
+        return name.first().is_some_and(u8::is_ascii_alphabetic)
+            && name
+                .iter()
+                .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':'))
+            && value.ends_with(b">");
+    }
+    false
 }
 
 /// The automaton over all rule keywords, built on first use.
@@ -1094,6 +1149,24 @@ mod tests {
             assert_eq!(result, "pasted [REDACTED:yalper-private-key-partial]");
         }
 
+        // Header lines before the body: legacy encrypted PEM, and armored PGP (real or escaped newlines).
+        let short: Vec<String> = (0..3).map(|line| fake(ALNUM, 44, 300 + line)).collect();
+        let pem = format!(
+            "-----BEGIN RSA {} KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,{}\n\n{}",
+            "PRIVATE",
+            fake(b"0123456789ABCDEF", 32, 310),
+            short.join("\n")
+        );
+        assert_eq!(redacted(&pem), "[REDACTED:yalper-private-key-partial]");
+        for newline in ["\n", "\\n"] {
+            let pgp = format!(
+                "$ head -4 key.asc{newline}-----BEGIN PGP {} KEY BLOCK-----{newline}Comment: work laptop{newline}{newline}{}",
+                "PRIVATE", short[0]
+            );
+            let result = assert_masked(&pgp, &short[0], "yalper-private-key-partial");
+            assert!(result.starts_with("$ head -4 key.asc"), "{result}");
+        }
+
         // A header in code or in prose, without a key body, leaves the rest of the text alone.
         for text in [
             "if pem.starts_with(\"-----BEGIN RSA PRIVATE KEY-----\") {\n    return Kind::Rsa;\n}\n",
@@ -1114,6 +1187,10 @@ mod tests {
                 "S3cr3t#Pass!word",
             ),
             ("{\"password\": \"Tr0ub4dor&3xyz!Q\"}", "Tr0ub4dor&3xyz!Q"),
+            ("DB_PASSWORD=P@ss(w0rd)!2024xQ\n", "P@ss(w0rd)!2024xQ"),
+            ("password: \"Xk9#mQ2(vL7!pR4z\"\n", "Xk9#mQ2(vL7!pR4z"),
+            ("{\"password\":\"Tr0ub4(dor&3\"}", "Tr0ub4(dor&3"),
+            ("DB_PASSWORD=a1;b2,c3<d4e5f6 next\n", "a1;b2,c3<d4e5f6"),
         ] {
             let result = redacted(text);
             assert!(!result.contains(password), "{result}");
@@ -1133,9 +1210,41 @@ mod tests {
             "password = user.getPassword(realm)",
             "struct Login { password: Option<String>, hash: Vec<u8> }",
             "password: process.env.DB_PASSWORD,",
+            "password = self.password_field;",
+            "export DB_PASSWORD=$DB_PASSWORD_FROM_VAULT",
+            "password = os.getenv(\"DB_PASSWORD\")",
         ] {
             assert_eq!(redact_str(text), None, "{text}");
         }
+    }
+
+    #[test]
+    fn random_passwords_with_symbols_never_leak() {
+        const CHARACTERS: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}?/|~";
+        const COUNT: usize = 3000;
+        let characters = fake(CHARACTERS, 15 * COUNT, 1000);
+        let digits = fake(DIGITS, 2 * COUNT, 2000);
+        let mut leaks = Vec::new();
+        for index in 0..COUNT {
+            // 15 random characters and a digit at a random place, so no password is letters only.
+            let mut password = characters[15 * index..15 * (index + 1)].to_owned();
+            let place = usize::from(digits.as_bytes()[2 * index] - b'0');
+            password.insert_str(place, &digits[2 * index + 1..2 * index + 2]);
+            for text in [
+                format!("DB_PASSWORD={password}\n"),
+                format!("password: \"{password}\"\n"),
+            ] {
+                let result = redacted(&text);
+                // Any 8 characters of the password written raw count as a leak.
+                if (0..=password.len() - 8)
+                    .any(|start| result.contains(&password[start..start + 8]))
+                {
+                    leaks.push(text);
+                }
+            }
+        }
+        assert_eq!(leaks, Vec::<String>::new());
     }
 
     #[test]

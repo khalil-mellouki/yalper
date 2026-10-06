@@ -4,13 +4,14 @@
 # Same format as gitleaks: `id`, `description`, `regex` (RE2 syntax, compiled with Unicode off),
 # optional `secretGroup` and `entropy`, and `keywords` (lowercase; the rule only runs when one occurs).
 # Several capture groups in one rule are alternatives for the secret: the first non-empty one is checked
-# and masked. One extra key: `lettersOnlyAllowlist = true` skips a secret made only of letters, `_`, `.`
-# and `-`, like gitleaks' allowlist on `generic-api-key`. `build.rs` appends these rules to gitleaks'.
+# and masked. Extra keys: `lettersOnlyAllowlist = true` skips a secret made only of letters, `_`, `.`
+# and `-`, like gitleaks' allowlist on `generic-api-key`; `codeAllowlist = true` skips a secret that
+# looks like code (see `looks_like_code` in `src/redact.rs`). `build.rs` appends these rules to gitleaks'.
 
 [[rules]]
 id = "yalper-private-key-partial"
-description = "A private key block cut off before its END line (for example by `head -n 7 id_rsa`): a BEGIN line followed by at least 64 base64 characters (after spaces or real or escaped newlines), masked to the END line or the end of the text."
-regex = '''(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----(?:[ \t]|\r?\n|\\r|\\n)*[A-Z0-9+/=]{64}(?s:.)*?(?:-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----|\z)'''
+description = "A private key block cut off before its END line (for example by `head -n 7 id_rsa`): a BEGIN line, up to 4 header lines (Proc-Type: and DEK-Info: in encrypted PEM, Version: and Comment: in PGP), then at least 40 base64 characters, with spaces or real or escaped newlines in between; masked to the END line or the end of the text."
+regex = '''(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----(?:[ \t]|\r?\n|\\r|\\n)*(?:[A-Z][A-Z0-9-]{0,40}:[^\r\n\\]{0,200}(?:\r?\n|(?:\\r)?\\n)(?:[ \t]|\r?\n|\\r|\\n)*){0,4}[A-Z0-9+/=]{40}(?s:.)*?(?:-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----|\z)'''
 keywords = ["-----begin"]
 
 [[rules]]
@@ -29,11 +30,12 @@ lettersOnlyAllowlist = true
 
 [[rules]]
 id = "yalper-password-value"
-description = "A password with symbols, which the generic rules do not match: a quoted value, or an unquoted run, assigned to a name containing password, passwd, pass or pwd. Values starting with $ (a variable) or containing ( (a call) are skipped."
-regex = '''(?i)(?:passw(?:or)?d|pass|pwd)[\w.-]{0,20}[\s'"]{0,3}(?:=|:{1,3}=|:|=>|\?=)[ \t]*(?:"([^"\r\n$(][^"\r\n(]{7,149})"|'([^'\r\n$(][^'\r\n(]{7,149})'|([^\s'"\x60;,<$(][^\s'"\x60;,<(]{7,149})(?:[\s;,]|\\[nr]|$))'''
+description = "A password with symbols, which the generic rules do not match: a quoted value, or an unquoted run up to the next whitespace, quote or backtick, assigned to a name containing password, passwd, pass or pwd. Values that look like code (a variable, a call, a member access, a generic type) are skipped by codeAllowlist."
+regex = '''(?i)(?:passw(?:or)?d|pass|pwd)[\w.-]{0,20}[\s'"]{0,3}(?:=|:{1,3}=|:|=>|\?=)[ \t]*(?:"([^"\r\n]{8,150})"|'([^'\r\n]{8,150})'|([^\s'"\x60]{8,150})(?:[\s'"\x60]|$))'''
 entropy = 3
 keywords = ["pass", "pwd"]
 lettersOnlyAllowlist = true
+codeAllowlist = true
 
 [[rules]]
 id = "yalper-bearer-token"
