@@ -4,7 +4,6 @@
 use std::fs;
 use std::path::Path;
 use std::process::Output;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use jiff::Timestamp;
@@ -141,13 +140,21 @@ fn recorded_project() -> tempfile::TempDir {
         &dir,
         payload(
             "PostToolUse",
-            json!({"tool_name": "mcp__github__create_pull_request", "tool_input": {"title": "Add factorial"}}),
+            json!({"tool_name": "mcp__github__create_issue", "tool_input": {"title": "Add factorial"}}),
         ),
     );
     record_payload(&dir, fixture("stop.json"));
     record_payload(&dir, fixture("session_end.json"));
     // Starts at 23:59 in the time zone the output is shown in, so the session runs past midnight.
     set_times(root, SESSION, "2026-10-06T21:59:00Z");
+    // The Grep step's snapshot failed: the step is recorded without a tree.
+    rusqlite::Connection::open(root.join(YALPER_DIR).join(DATABASE_FILE))
+        .unwrap()
+        .execute(
+            "UPDATE events SET tree_id = NULL, files_changed = NULL WHERE session_id = ?1 AND step = 5",
+            [SESSION],
+        )
+        .unwrap();
     project
 }
 
@@ -164,20 +171,21 @@ fn the_latest_session_is_listed_with_its_steps() {
     let output = log_output(project.path(), Selection::Latest).unwrap();
     insta::assert_snapshot!(output, @r"
     Session 00893aaf, started 2026-10-06 23:59:00, ended (prompt_input_exit), 10 steps
-      step  time      files  action                    summary
-         1  23:59:00      0  start                     startup
-         2  23:59:20      0  prompt                    Write a function to calculate the factorial of a number...
-         3  23:59:40      1  Write                     src/factorial.rs
+      step  time      files  action               summary
+         1  23:59:00      0  start                startup
+         2  23:59:20      0  prompt               Write a function to calculate the factorial of a number...
+         3  23:59:40      1  Write                src/factorial.rs
       (2026-10-07)
-         4  00:00:00      1  Bash                      sed -i 's/old_name/new_name/g' src/lib.rs
-         5  00:00:20      0  Grep                      fn factorial
-         6  00:00:40      0  Read                      ...ins/rust/lib/rustlib/src/rust/library/core/src/num/mod.rs
-         7  00:01:00      0  Bash                      FAILED npm test
-         8  00:01:20      0  mcp__github__create_p...
-         9  00:01:40         reply                     I added `factorial` in src/factorial.rs. The test suite f...
-        10  00:02:00         end                       prompt_input_exit
+         4  00:00:00      1  Bash                 sed -i 's/old_name/new_name/g' src/lib.rs
+         5  00:00:20      ?  Grep                 fn factorial
+         6  00:00:40      0  Read                 ...ins/rust/lib/rustlib/src/rust/library/core/src/num/mod.rs
+         7  00:01:00      0  Bash                 FAILED npm test
+         8  00:01:20      0  github:create_issue
+         9  00:01:40         reply                I added `factorial` in src/factorial.rs. The test suite f...
+        10  00:02:00         end                  prompt_input_exit
 
-    1 earlier session: `yalper log --all` lists every session, `yalper log --session <id>` shows one.
+    Earlier sessions (`yalper log --session <id>` shows one):
+      Session 0a1b2c3d, started 2026-10-05 10:00:00, not ended, 3 steps
     ");
 }
 
@@ -187,18 +195,18 @@ fn every_session_or_one_chosen_by_id_prefix() {
     let all = log_output(project.path(), Selection::All).unwrap();
     insta::assert_snapshot!(all, @r"
     Session 00893aaf, started 2026-10-06 23:59:00, ended (prompt_input_exit), 10 steps
-      step  time      files  action                    summary
-         1  23:59:00      0  start                     startup
-         2  23:59:20      0  prompt                    Write a function to calculate the factorial of a number...
-         3  23:59:40      1  Write                     src/factorial.rs
+      step  time      files  action               summary
+         1  23:59:00      0  start                startup
+         2  23:59:20      0  prompt               Write a function to calculate the factorial of a number...
+         3  23:59:40      1  Write                src/factorial.rs
       (2026-10-07)
-         4  00:00:00      1  Bash                      sed -i 's/old_name/new_name/g' src/lib.rs
-         5  00:00:20      0  Grep                      fn factorial
-         6  00:00:40      0  Read                      ...ins/rust/lib/rustlib/src/rust/library/core/src/num/mod.rs
-         7  00:01:00      0  Bash                      FAILED npm test
-         8  00:01:20      0  mcp__github__create_p...
-         9  00:01:40         reply                     I added `factorial` in src/factorial.rs. The test suite f...
-        10  00:02:00         end                       prompt_input_exit
+         4  00:00:00      1  Bash                 sed -i 's/old_name/new_name/g' src/lib.rs
+         5  00:00:20      ?  Grep                 fn factorial
+         6  00:00:40      0  Read                 ...ins/rust/lib/rustlib/src/rust/library/core/src/num/mod.rs
+         7  00:01:00      0  Bash                 FAILED npm test
+         8  00:01:20      0  github:create_issue
+         9  00:01:40         reply                I added `factorial` in src/factorial.rs. The test suite f...
+        10  00:02:00         end                  prompt_input_exit
 
     Session 0a1b2c3d, started 2026-10-05 10:00:00, not ended, 3 steps
       step  time      files  action  summary
@@ -275,6 +283,13 @@ fn control_characters_in_stored_rows_never_reach_the_terminal() {
         step(5, "Stop", None, json!({"last_assistant_message": evil})),
         step(6, "SessionEnd", None, json!({"reason": evil})),
         step(7, evil, None, json!({})),
+        // A right-to-left override would show `echo txt.exe` as `echo exe.txt`.
+        step(
+            8,
+            "PostToolUse",
+            Some("Bash\u{202E}"),
+            json!({"tool_input": {"command": "echo \u{202E}txt.exe"}}),
+        ),
     ] {
         store.insert_event(&event).unwrap();
     }
@@ -288,6 +303,9 @@ fn control_characters_in_stored_rows_never_reach_the_terminal() {
         assert!(!has_control_characters(&output), "{output:?}");
         // Every value is still shown: the session id, its end reason, and each step's action or summary.
         assert_eq!(output.matches('X').count(), 10, "{output}");
+        assert!(!output.contains('\u{202E}'), "{output}");
+        assert!(output.contains("Bash<U+202E>"), "{output}");
+        assert!(output.contains("echo <U+202E>txt.exe"), "{output}");
     }
     let error = log_output(project.path(), Selection::Session(format!("{evil}-none"))).unwrap_err();
     assert!(!has_control_characters(&error), "{error:?}");
@@ -297,19 +315,15 @@ fn control_characters_in_stored_rows_never_reach_the_terminal() {
 fn nothing_recorded_yet_says_how_to_check_the_setup() {
     let project = common::project();
     let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
-    // Before the database exists, and once it exists with no session.
-    for _ in 0..2 {
-        let output = common::yalper(project.path(), &["log"]);
-        assert!(output.status.success());
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.starts_with("No sessions recorded yet."), "{stdout}");
-        assert!(stdout.contains("trusted in Claude Code"), "{stdout}");
-        assert!(output.stderr.is_empty());
-        Store::open(&dir.dir, &dir.token).unwrap();
-    }
+    let store = Store::open(&dir.dir, &dir.token).unwrap();
+    let output = common::yalper(project.path(), &["log"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("No sessions recorded yet."), "{stdout}");
+    assert!(stdout.contains("trusted in Claude Code"), "{stdout}");
+    assert!(output.stderr.is_empty());
 
     // A session whose first step is not recorded yet.
-    let store = Store::open(&dir.dir, &dir.token).unwrap();
     store.upsert_session(&Session::new(SESSION, 0)).unwrap();
     let output = log_output(project.path(), Selection::Latest).unwrap();
     insta::assert_snapshot!(output, @r"
@@ -330,6 +344,12 @@ fn a_project_where_yalper_is_not_set_up_gets_a_clear_error() {
     let outside = tempfile::tempdir().unwrap();
     let error = error_of(&common::yalper(outside.path(), &["log"]));
     assert!(error.contains("is not inside a git repository"), "{error}");
+    // Paths in error messages are filtered too.
+    let odd = outside.path().join("txt\u{202E}.exe");
+    fs::create_dir(&odd).unwrap();
+    let error = error_of(&common::yalper(&odd, &["log"]));
+    assert!(error.contains("txt<U+202E>.exe"), "{error}");
+    assert!(!error.contains('\u{202E}'), "{error}");
 
     let repository = common::repository();
     let error = error_of(&common::yalper(repository.path(), &["log"]));
@@ -346,6 +366,46 @@ fn a_project_where_yalper_is_not_set_up_gets_a_clear_error() {
     let error = error_of(&common::yalper(repository.path(), &["log"]));
     assert!(error.contains("Yalper cannot use"), "{error}");
     assert!(error.contains("not created by `yalper init`"), "{error}");
+}
+
+#[test]
+fn a_missing_or_empty_database_is_reported_and_never_created() {
+    let project = common::project();
+    let database = project.path().join(YALPER_DIR).join(DATABASE_FILE);
+    let error = error_of(&common::yalper(project.path(), &["log"]));
+    assert!(error.contains("run `yalper init` first"), "{error}");
+    assert!(!database.exists());
+
+    fs::write(&database, "").unwrap();
+    let error = error_of(&common::yalper(project.path(), &["log"]));
+    assert!(error.contains("run `yalper init` first"), "{error}");
+    assert_eq!(fs::metadata(&database).unwrap().len(), 0);
+}
+
+#[test]
+fn the_default_view_lists_at_most_five_earlier_sessions() {
+    let project = common::project();
+    let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
+    let store = Store::open(&dir.dir, &dir.token).unwrap();
+    for minute in 0..8 {
+        let id = format!("session{minute}-0000");
+        store
+            .upsert_session(&Session::new(id, minute * 60_000))
+            .unwrap();
+    }
+    let output = log_output(project.path(), Selection::Latest).unwrap();
+    insta::assert_snapshot!(output, @r"
+    Session session7, started 1970-01-01 02:07:00, not ended, 0 steps
+      No steps recorded yet.
+
+    Earlier sessions (`yalper log --session <id>` shows one):
+      Session session6, started 1970-01-01 02:06:00, not ended, 0 steps
+      Session session5, started 1970-01-01 02:05:00, not ended, 0 steps
+      Session session4, started 1970-01-01 02:04:00, not ended, 0 steps
+      Session session3, started 1970-01-01 02:03:00, not ended, 0 steps
+      Session session2, started 1970-01-01 02:02:00, not ended, 0 steps
+      2 more (`yalper log --all`)
+    ");
 }
 
 #[test]
@@ -396,22 +456,20 @@ fn listing_works_while_hooks_record() {
     let root = project.path();
     let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
     record_payload(&dir, payload("SessionStart", json!({"source": "startup"})));
-    let done = AtomicBool::new(false);
 
-    let reads = thread::scope(|scope| {
-        scope.spawn(|| {
+    thread::scope(|scope| {
+        // If the writer panics, it finishes and the scope fails the test.
+        let writer = scope.spawn(|| {
             for step in 0..STEPS {
                 fs::write(root.join("file.txt"), step.to_string()).unwrap();
                 let input =
                     json!({"tool_name": "Bash", "tool_input": {"command": format!("echo {step}")}});
                 record_payload(&dir, payload("PostToolUse", input));
             }
-            done.store(true, Ordering::SeqCst);
         });
 
-        let mut reads = 0;
         let mut listed = 0;
-        while !done.load(Ordering::SeqCst) {
+        loop {
             let output = log_output(root, Selection::Latest).unwrap();
             let steps = listed_steps(&output);
             // Every read sees whole steps, numbered from 1 with no gap, and never fewer than before.
@@ -422,12 +480,12 @@ fn listing_works_while_hooks_record() {
             );
             assert!(steps.len() >= listed, "{output}");
             listed = steps.len();
-            reads += 1;
+            if writer.is_finished() {
+                break;
+            }
         }
-        reads
     });
 
-    assert!(reads > 0);
     let output = log_output(root, Selection::Latest).unwrap();
     assert_eq!(listed_steps(&output), (1..=STEPS + 1).collect::<Vec<_>>());
 }

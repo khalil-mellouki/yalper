@@ -187,6 +187,13 @@ pub enum Error {
     /// The database was not created for this `.yalper/`: it has no init token or another one, for example a
     /// `yalper.db` that a pulled commit wrote over the local one.
     ForeignDatabase,
+    /// A reader found no database, or one with no schema yet (see [`Store::open_for_reading`]).
+    MissingSchema,
+    /// A reader found a database with an older schema, which only a writer updates.
+    OlderSchema {
+        found: u32,
+        known: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -209,6 +216,15 @@ impl fmt::Display for Error {
                 "the database was not created by `yalper init` for this .yalper folder (its init token \
                  does not match), so it is not used"
             ),
+            Self::MissingSchema => write!(
+                f,
+                "the database is missing or empty: run `yalper init` first"
+            ),
+            Self::OlderSchema { found, known } => write!(
+                f,
+                "the database has schema version {found}, older than this Yalper's version {known}: run \
+                 `yalper init` to update it"
+            ),
         }
     }
 }
@@ -218,7 +234,11 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
-            Self::NewerSchema { .. } | Self::UnexpectedSchema | Self::ForeignDatabase => None,
+            Self::NewerSchema { .. }
+            | Self::UnexpectedSchema
+            | Self::ForeignDatabase
+            | Self::MissingSchema
+            | Self::OlderSchema { .. } => None,
         }
     }
 }
@@ -241,7 +261,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
-    wal_path: PathBuf,
+    /// The WAL to empty once it is large, when the store closes. `None` for a reader, which writes nothing.
+    wal_path: Option<PathBuf>,
     token: Token,
     /// See [`OwnedDir::guard_path`]: on Windows it keeps the database file from being renamed or deleted.
     _database: PathGuard,
@@ -255,37 +276,7 @@ impl Store {
     /// Creating or migrating takes the [`WriterLock`] for a moment, so a writer opens the store first and
     /// takes the lock after: opening while this process already holds the lock would wait for itself.
     pub fn open(dir: &OwnedDir, token: &Token) -> Result<Self> {
-        // SQLite opens its files by path, so they are checked by name first: anything but a regular file
-        // with a single link is refused. SQLite then refuses a symlink anywhere in the path (Unix;
-        // `dir.path()` is canonical), and the file it reached is compared with the one checked (Unix: device
-        // and inode; Windows: a handle kept open stops renames and deletes).
-        // Remaining gap, outside the threat model: another process of the same user could swap a file
-        // between these checks and SQLite's own opens (and swap it back), or swap the journal and WAL files.
-        let database = dir.guard_path(DATABASE_FILE)?;
-        for name in DATABASE_SIDE_FILES {
-            dir.check_regular_or_missing(name)?;
-        }
-        let mut conn = Connection::open_with_flags(
-            dir.path().join(DATABASE_FILE),
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        dir.check_guarded(DATABASE_FILE, &database)?;
-
-        // A repository could commit a crafted database: no schema changes outside SQL, and no functions
-        // with side effects from the schema.
-        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
-        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
-        // Every hook is a new process, so each close is the last connection's close, where SQLite would
-        // copy the WAL into the database and delete it: about 4 ms per hook on Windows, half of the
-        // database time (measured). The WAL is kept instead and emptied only once it grows, see `drop`.
-        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        conn.busy_timeout(LOCK_TIMEOUT)?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-
+        let (mut conn, database) = connect(dir, OpenFlags::SQLITE_OPEN_CREATE)?;
         if user_version(&conn)? != schema_version(MIGRATIONS) {
             // Switching a new database to WAL fails at once (SQLITE_BUSY) when several processes try it
             // together, so creation and migrations happen one process at a time.
@@ -301,7 +292,44 @@ impl Store {
         }
         Ok(Self {
             conn,
-            wal_path: dir.path().join(WAL_FILE),
+            wal_path: Some(dir.path().join(WAL_FILE)),
+            token: token.clone(),
+            _database: database,
+        })
+    }
+
+    /// Opens the database in `dir` for reading only, for commands such as `yalper log`: it never creates the
+    /// database, migrates it or stores a token, never takes the [`WriterLock`], and writes nothing when it
+    /// closes. A missing or empty database gives [`Error::MissingSchema`], an older schema
+    /// [`Error::OlderSchema`], a newer one [`Error::NewerSchema`]. The schema and token checks of
+    /// [`open`](Self::open) apply. SQLite may still create its empty WAL and shared memory files, as it does
+    /// for any reader of a WAL database.
+    pub fn open_for_reading(dir: &OwnedDir, token: &Token) -> Result<Self> {
+        // On Windows `guard_path` creates a missing file, so a missing database is caught first.
+        match fs::symlink_metadata(dir.path().join(DATABASE_FILE)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::MissingSchema);
+            }
+            _ => {}
+        }
+        let (conn, database) = connect(dir, OpenFlags::empty())?;
+        let (found, known) = (user_version(&conn)?, schema_version(MIGRATIONS));
+        if found == 0 {
+            return Err(Error::MissingSchema);
+        }
+        if found < known {
+            return Err(Error::OlderSchema { found, known });
+        }
+        if found > known {
+            return Err(Error::NewerSchema { found, known });
+        }
+        check_schema(&conn)?;
+        if stored_token(&conn)?.as_deref() != Some(token.as_str()) {
+            return Err(Error::ForeignDatabase);
+        }
+        Ok(Self {
+            conn,
+            wal_path: None,
             token: token.clone(),
             _database: database,
         })
@@ -424,13 +452,25 @@ impl Store {
         Ok(events)
     }
 
+    /// How many steps a session has.
+    pub fn step_count(&self, session_id: &str) -> Result<u32> {
+        let count = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM events WHERE session_id = ?1")?
+            .query_row([session_id], |row| row.get(0))?;
+        Ok(count)
+    }
+
     /// The steps of a session, in order, for a listing: like [`events`](Self::events), but the payload has no
-    /// `tool_response`, the part that can be large and that a listing does not show. A payload that is not
-    /// valid JSON becomes `Value::Null` instead of failing the whole listing.
+    /// tool output and none of the tool input fields that hold file contents (written content, edited
+    /// strings), the parts that can be large and that a listing does not show. A payload that is not valid
+    /// JSON becomes `Value::Null` instead of failing the whole listing.
     pub fn events_without_output(&self, session_id: &str) -> Result<Vec<Event>> {
         let columns = EVENT_COLUMNS.replace(
             "payload",
-            "CASE WHEN json_valid(payload) THEN json_remove(payload, '$.tool_response') END",
+            "CASE WHEN json_valid(payload) THEN json_remove(payload, '$.tool_response',
+                 '$.tool_input.content', '$.tool_input.old_string', '$.tool_input.new_string',
+                 '$.tool_input.edits', '$.tool_input.new_source') END",
         );
         let mut statement = self.conn.prepare(&format!(
             "SELECT {columns} FROM events WHERE session_id = ?1 ORDER BY step"
@@ -532,6 +572,42 @@ impl Store {
     }
 }
 
+/// Opens a connection to the database in `dir`, configured as every store uses it. `create` is
+/// `SQLITE_OPEN_CREATE` to create a missing database, or empty.
+fn connect(dir: &OwnedDir, create: OpenFlags) -> Result<(Connection, PathGuard)> {
+    // SQLite opens its files by path, so they are checked by name first: anything but a regular file with a
+    // single link is refused. SQLite then refuses a symlink anywhere in the path (Unix; `dir.path()` is
+    // canonical), and the file it reached is compared with the one checked (Unix: device and inode; Windows:
+    // a handle kept open stops renames and deletes).
+    // Remaining gap, outside the threat model: another process of the same user could swap a file between
+    // these checks and SQLite's own opens (and swap it back), or swap the journal and WAL files.
+    let database = dir.guard_path(DATABASE_FILE)?;
+    for name in DATABASE_SIDE_FILES {
+        dir.check_regular_or_missing(name)?;
+    }
+    let conn = Connection::open_with_flags(
+        dir.path().join(DATABASE_FILE),
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | create
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    dir.check_guarded(DATABASE_FILE, &database)?;
+
+    // A repository could commit a crafted database: no schema changes outside SQL, and no functions with
+    // side effects from the schema.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    // Every hook is a new process, so each close is the last connection's close, where SQLite would copy the
+    // WAL into the database and delete it: about 4 ms per hook on Windows, half of the database time
+    // (measured). The WAL is kept instead and emptied only once it grows, see `drop`.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    conn.busy_timeout(LOCK_TIMEOUT)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok((conn, database))
+}
+
 /// A stat cache row, or `None` if a value has an unexpected type.
 fn cached_file_from_row(row: &Row<'_>) -> rusqlite::Result<Option<CachedFile>> {
     use rusqlite::types::ValueRef::{Integer, Text};
@@ -573,7 +649,10 @@ impl Drop for Store {
         // WAL, so a WAL that only grew would make every hook slower (measured: about 2 ms more per MiB on
         // Windows). Once it is large, it is copied into the database and emptied. If another process is
         // using the database right now, this is left for a later close instead of waiting.
-        let wal_bytes = fs::symlink_metadata(&self.wal_path).map_or(0, |metadata| metadata.len());
+        let Some(wal_path) = &self.wal_path else {
+            return;
+        };
+        let wal_bytes = fs::symlink_metadata(wal_path).map_or(0, |metadata| metadata.len());
         if wal_bytes > WAL_TRUNCATE_BYTES {
             let _ = self.conn.busy_timeout(Duration::ZERO);
             let _ = self
@@ -1035,8 +1114,15 @@ mod tests {
         let store = Store::open(&owned, &token()).unwrap();
         store.upsert_session(&Session::new("s1", 1)).unwrap();
         let mut with_output = event("s1", 1);
-        with_output.payload =
-            json!({"tool_input": {"command": "ls"}, "tool_response": "x".repeat(1000)});
+        let large = "x".repeat(1000);
+        with_output.payload = json!({
+            "prompt": "kept",
+            "tool_input": {
+                "file_path": "/a.rs", "content": large, "old_string": large, "new_string": large,
+                "edits": [{"old_string": large}], "new_source": large
+            },
+            "tool_response": large
+        });
         store.insert_event(&with_output).unwrap();
         store.insert_event(&event("s1", 2)).unwrap();
         store
@@ -1046,12 +1132,77 @@ mod tests {
 
         let listed = store.events_without_output("s1").unwrap();
         let mut expected = with_output.clone();
-        expected.payload = json!({"tool_input": {"command": "ls"}});
+        expected.payload = json!({"prompt": "kept", "tool_input": {"file_path": "/a.rs"}});
         assert_eq!(listed[0], expected);
         let mut invalid = event("s1", 2);
         invalid.payload = Value::Null;
         assert_eq!(listed[1], invalid);
         assert_eq!(listed.len(), 2);
+        assert_eq!(store.step_count("s1").unwrap(), 2);
+        assert_eq!(store.step_count("none").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_reader_never_creates_migrates_or_adopts_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let database = dir.path().join(DATABASE_FILE);
+
+        // Missing: not created.
+        assert!(matches!(
+            Store::open_for_reading(&owned, &token()),
+            Err(Error::MissingSchema)
+        ));
+        assert!(!database.exists());
+
+        // Empty: no schema stamped into it, no lock file taken.
+        fs::write(&database, "").unwrap();
+        assert!(matches!(
+            Store::open_for_reading(&owned, &token()),
+            Err(Error::MissingSchema)
+        ));
+        assert_eq!(fs::metadata(&database).unwrap().len(), 0);
+        assert!(!dir.path().join(LOCK_FILE).exists());
+        fs::remove_file(&database).unwrap();
+
+        // Older and newer schemas are refused, and the older one is not migrated.
+        drop(Store::open(&owned, &token()).unwrap());
+        for (version, older) in [(2, true), (99, false)] {
+            Connection::open(&database)
+                .unwrap()
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            let error = Store::open_for_reading(&owned, &token()).unwrap_err();
+            if older {
+                assert!(
+                    matches!(error, Error::OlderSchema { found: 2, known: 3 }),
+                    "{error}"
+                );
+            } else {
+                assert!(matches!(error, Error::NewerSchema { .. }), "{error}");
+            }
+            let conn = Connection::open(&database).unwrap();
+            assert_eq!(user_version(&conn).unwrap(), version);
+        }
+
+        // The current schema reads, with the token and schema checks of a writer.
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 3)
+            .unwrap();
+        let reader = Store::open_for_reading(&owned, &token()).unwrap();
+        assert_eq!(reader.sessions().unwrap(), []);
+        drop(reader);
+        let other = Token::parse("fedcba9876543210fedcba9876543210").unwrap();
+        assert!(matches!(
+            Store::open_for_reading(&owned, &other),
+            Err(Error::ForeignDatabase)
+        ));
+        tamper(&dir, "CREATE VIEW extra AS SELECT 1;");
+        assert!(matches!(
+            Store::open_for_reading(&owned, &token()),
+            Err(Error::UnexpectedSchema)
+        ));
     }
 
     #[test]

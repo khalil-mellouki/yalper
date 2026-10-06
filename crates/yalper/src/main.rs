@@ -58,7 +58,8 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("error: {message}");
+            // Messages quote paths and file system errors, which can hold repository text.
+            eprintln!("error: {}", yalper::init::printable(&message));
             ExitCode::FAILURE
         }
     }

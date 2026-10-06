@@ -2,8 +2,9 @@
 //!
 //! Everything shown comes from the event log, which holds what agents and repositories sent (prompts, tool
 //! input, paths, even session ids and tool names), so every value goes through [`printable`]: a crafted row
-//! cannot send escape sequences to the terminal. Reading never takes the writer lock, so it works while hooks
-//! are recording (SQLite's WAL lets readers and the writer run together).
+//! cannot send escape sequences to the terminal. The store is opened for reading only: nothing is created,
+//! migrated or written, and the writer lock is never taken, so it works while hooks are recording (SQLite's
+//! WAL lets readers and the writer run together).
 
 use std::collections::HashSet;
 use std::fs;
@@ -18,7 +19,7 @@ use serde_json::Value;
 use crate::hook::{self, HookEvent, YALPER_DIR};
 use crate::init::{printable, say};
 use crate::repo::{self, Refusal, YalperDir};
-use crate::store::{DATABASE_FILE, Event, Session, Store};
+use crate::store::{Event, Session, Store};
 
 /// A step's summary is cut to this many characters.
 const MAX_SUMMARY_CHARS: usize = 60;
@@ -28,6 +29,12 @@ const MAX_ACTION_CHARS: usize = 24;
 
 /// Session ids are shown with this many characters, or more when two sessions would look the same.
 const SHORT_ID_CHARS: usize = 8;
+
+/// Session ids are never shown with more characters than this. Claude Code's are 36.
+const MAX_ID_CHARS: usize = 64;
+
+/// The default view lists at most this many earlier sessions after the latest one.
+const MAX_EARLIER_SESSIONS: usize = 5;
 
 /// Marks text left out of a value that was cut.
 const ELLIPSIS: &str = "...";
@@ -78,13 +85,8 @@ pub fn log(
         .filter_map(|root| root.to_str().map(str::to_owned))
         .collect();
 
-    // Opening the store creates a missing database, and `yalper log` writes nothing.
-    if fs::symlink_metadata(yalper.dir.path().join(DATABASE_FILE)).is_err() {
-        say(out, NOTHING_RECORDED);
-        return Ok(());
-    }
     let failed = |error: crate::store::Error| format!("cannot read the recordings: {error}");
-    let store = Store::open(&yalper.dir, &yalper.token).map_err(failed)?;
+    let store = Store::open_for_reading(&yalper.dir, &yalper.token).map_err(failed)?;
     let sessions = store.sessions().map_err(failed)?;
     if sessions.is_empty() {
         say(out, NOTHING_RECORDED);
@@ -106,16 +108,21 @@ pub fn log(
         write_session(out, session, &events, id_chars, &roots, time_zone);
     }
     if *selection == Selection::Latest && sessions.len() > 1 {
-        let earlier = sessions.len() - 1;
         say(out, "");
         say(
             out,
-            &format!(
-                "{earlier} earlier session{}: `yalper log --all` lists every session, `yalper log --session \
-                 <id>` shows one.",
-                plural(earlier)
-            ),
+            "Earlier sessions (`yalper log --session <id>` shows one):",
         );
+        let earlier = &sessions[1..];
+        for session in earlier.iter().take(MAX_EARLIER_SESSIONS) {
+            let steps = store.step_count(&session.id).map_err(failed)?;
+            let header = session_header(session, steps as usize, id_chars, time_zone);
+            say(out, &format!("  {header}"));
+        }
+        if earlier.len() > MAX_EARLIER_SESSIONS {
+            let more = earlier.len() - MAX_EARLIER_SESSIONS;
+            say(out, &format!("  {more} more (`yalper log --all`)"));
+        }
     }
     Ok(())
 }
@@ -195,6 +202,29 @@ fn find_session<'a>(
     }
 }
 
+/// One line about a session: its short id, local start time, whether it ended, and its number of steps.
+fn session_header(
+    session: &Session,
+    steps: usize,
+    id_chars: usize,
+    time_zone: &TimeZone,
+) -> String {
+    let started = local_time(session.started_at_ms, time_zone).map_or_else(
+        || "at an unknown time".to_owned(),
+        |time| time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+    );
+    let status = match (session.ended_at_ms, &session.end_reason) {
+        (None, _) => "not ended".to_owned(),
+        (Some(_), Some(reason)) => format!("ended ({})", cut_end(&printable(reason), 40, false)),
+        (Some(_), None) => "ended".to_owned(),
+    };
+    format!(
+        "Session {}, started {started}, {status}, {steps} step{}",
+        short_id(&session.id, id_chars),
+        plural(steps)
+    )
+}
+
 /// Writes a session's header line, then its steps as aligned columns.
 fn write_session(
     out: &mut dyn Write,
@@ -204,24 +234,9 @@ fn write_session(
     roots: &[String],
     time_zone: &TimeZone,
 ) {
-    let started = local_time(session.started_at_ms, time_zone);
-    let status = match (session.ended_at_ms, &session.end_reason) {
-        (None, _) => "not ended".to_owned(),
-        (Some(_), Some(reason)) => format!("ended ({})", cut_end(&printable(reason), 40, false)),
-        (Some(_), None) => "ended".to_owned(),
-    };
     say(
         out,
-        &format!(
-            "Session {}, started {}, {status}, {} step{}",
-            short_id(&session.id, id_chars),
-            started.map_or_else(
-                || "at an unknown time".to_owned(),
-                |time| { time.strftime("%Y-%m-%d %H:%M:%S").to_string() }
-            ),
-            events.len(),
-            plural(events.len())
-        ),
+        &session_header(session, events.len(), id_chars, time_zone),
     );
     if events.is_empty() {
         say(out, "  No steps recorded yet.");
@@ -250,7 +265,7 @@ fn write_session(
             .to_owned()
     };
     say(out, &line("step", "time", "files", "action", "summary"));
-    let mut day = started.map(|time| time.date());
+    let mut day = local_time(session.started_at_ms, time_zone).map(|time| time.date());
     for row in &rows {
         if row.date.is_some() && row.date != day {
             if let Some(date) = row.date {
@@ -288,9 +303,13 @@ impl StepRow {
                 |time| time.strftime("%H:%M:%S").to_string(),
             ),
             // Empty for steps that take no snapshot, and for a snapshot that failed.
-            files: event
-                .files_changed
-                .map_or_else(String::new, |files| files.to_string()),
+            // `?` for a step that should have a snapshot but has none (the snapshot failed), empty for steps
+            // that never take one.
+            files: match event.files_changed {
+                Some(files) => files.to_string(),
+                None if takes_snapshot(&event.kind) => "?".to_owned(),
+                None => String::new(),
+            },
             action: cut_end(&action(event), MAX_ACTION_CHARS, false),
             summary: summary(event, roots),
         }
@@ -307,9 +326,33 @@ fn action(event: &Event) -> String {
         HookEvent::PostToolUse | HookEvent::PostToolUseFailure => event
             .tool_name
             .as_deref()
-            .map_or_else(|| "tool".to_owned(), printable),
+            .map_or_else(|| "tool".to_owned(), |name| printable(&tool_label(name))),
         HookEvent::Other(kind) => printable(&kind),
     }
+}
+
+/// A tool's name as shown: MCP tools, named `mcp__<server>__<tool>`, become `<server>:<tool>`.
+fn tool_label(name: &str) -> String {
+    match name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+    {
+        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+            format!("{server}:{tool}")
+        }
+        _ => name.to_owned(),
+    }
+}
+
+/// Whether the hook records a snapshot with this kind of step (see `record::record`).
+fn takes_snapshot(kind: &str) -> bool {
+    matches!(
+        HookEvent::from_name(kind),
+        HookEvent::SessionStart
+            | HookEvent::UserPromptSubmit
+            | HookEvent::PostToolUse
+            | HookEvent::PostToolUseFailure
+    )
 }
 
 /// A one-line summary of a step: the first line of its prompt or reply, how the session started or ended,
@@ -420,12 +463,21 @@ fn cut_start(text: &str, max: usize) -> String {
 
 /// The first `chars` characters of a session id, made printable.
 fn short_id(id: &str, chars: usize) -> String {
-    printable(&id.chars().take(chars).collect::<String>())
+    let mut shown: String = id.chars().take(chars).collect();
+    if chars >= MAX_ID_CHARS && id.chars().nth(chars).is_some() {
+        shown.push_str(ELLIPSIS);
+    }
+    printable(&shown)
 }
 
-/// How many characters of the session ids make them all look different, at least [`SHORT_ID_CHARS`].
+/// How many characters of the session ids make them all look different, at least [`SHORT_ID_CHARS`] and at
+/// most [`MAX_ID_CHARS`] (ids that only differ later look the same, and the work stays bounded).
 fn short_id_chars(ids: &[&str]) -> usize {
-    let longest = ids.iter().map(|id| id.chars().count()).max().unwrap_or(0);
+    let longest = ids
+        .iter()
+        .map(|id| id.chars().take(MAX_ID_CHARS).count())
+        .max()
+        .unwrap_or(0);
     (SHORT_ID_CHARS..longest)
         .find(|&chars| {
             let mut seen = HashSet::new();
@@ -512,5 +564,28 @@ mod tests {
         );
         assert_eq!(short_id_chars(&["00893aaf-19fa", "00893aaf-29fa"]), 10);
         assert_eq!(short_id_chars(&["00893aaf-1", "00893aaf-12"]), 11);
+
+        // Long ids sharing a long prefix stop at the cap and are shown cut.
+        let (a, b) = ("x".repeat(10_000) + "a", "x".repeat(10_000) + "b");
+        assert_eq!(short_id_chars(&[&a, &b]), MAX_ID_CHARS);
+        assert_eq!(
+            short_id(&a, MAX_ID_CHARS),
+            "x".repeat(MAX_ID_CHARS) + ELLIPSIS
+        );
+        let exact = "y".repeat(MAX_ID_CHARS);
+        assert_eq!(short_id(&exact, MAX_ID_CHARS), exact);
+        assert_eq!(short_id("00893aaf-19fa", 8), "00893aaf");
+    }
+
+    #[test]
+    fn mcp_tools_are_shown_as_server_and_tool() {
+        assert_eq!(
+            tool_label("mcp__github__create_issue"),
+            "github:create_issue"
+        );
+        assert_eq!(tool_label("mcp__my_server__a__b"), "my_server:a__b");
+        for name in ["Bash", "mcp__", "mcp__github", "mcp____x", "mcp__x__"] {
+            assert_eq!(tool_label(name), name);
+        }
     }
 }
