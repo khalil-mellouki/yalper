@@ -37,6 +37,14 @@ fn fails(dir: &Path, args: &[&str]) -> String {
     stderr(&output)
 }
 
+/// `root` as `yalper` prints it: the current directory the process sees, which on macOS resolves the
+/// temporary folder's `/var` link to `/private/var`. Not canonicalized on Windows, where that adds `\\?\`.
+fn shown(root: &Path) -> String {
+    #[cfg(unix)]
+    let root = fs::canonicalize(root).unwrap();
+    root.display().to_string()
+}
+
 fn settings_path(root: &Path) -> PathBuf {
     root.join(".claude").join("settings.local.json")
 }
@@ -75,7 +83,7 @@ fn init_then_uninstall_restores_the_project_and_purge_leaves_no_trace() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            format!("Removing Yalper from {}", root.display()).as_str(),
+            format!("Removing Yalper from {}", shown(root)).as_str(),
             "  Claude Code hooks: removed (.claude/settings.local.json held nothing else and was deleted)",
             "  .yalper/: kept, with your recordings (`yalper uninstall --purge` deletes them)",
             "  Git exclude: removed .claude/settings.local.json",
@@ -121,7 +129,7 @@ fn init_then_uninstall_restores_the_project_and_purge_leaves_no_trace() {
         text,
         format!(
             "Yalper is not set up in {}, nothing to remove.\n",
-            root.display()
+            shown(root)
         )
     );
     assert_eq!(files(root), before);
@@ -190,7 +198,7 @@ fn a_project_that_was_never_set_up_is_left_alone() {
             text,
             format!(
                 "Yalper is not set up in {}, nothing to remove.\n",
-                root.display()
+                shown(root)
             ),
             "{args:?}"
         );
