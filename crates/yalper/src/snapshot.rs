@@ -11,6 +11,7 @@
 //!
 //! [`snapshot`] walks the working tree and records it in the store.
 
+mod excludes;
 mod scan;
 
 use std::fmt;

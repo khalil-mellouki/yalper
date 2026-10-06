@@ -256,6 +256,8 @@ impl OwnedDir {
 /// refused without being followed, and a FIFO without waiting for a writer, in case the entry changed since
 /// the walk. Windows: the walk already told links apart, and the file is opened normally, because opening the
 /// reparse point itself would bypass OneDrive's handling of cloud files.
+/// Remaining gap on Windows, outside the threat model: another process of the same user could swap the file
+/// for a link between the walk and this open, and the link would be followed.
 pub fn open_regular_file(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     let file = {

@@ -11,15 +11,17 @@ use std::fs::{self, Metadata};
 use std::io::{self, Read};
 use std::path::{Component, Path};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gix::ObjectId;
 use ignore::{WalkBuilder, WalkState};
 
+use super::excludes::Excludes;
 use super::{Change, FileKind, Result, ShadowStore, validate_path};
 use crate::hook::YALPER_DIR;
 use crate::safe_fs::{self, OwnedDir};
-use crate::store::{CachedFile, FileCache, Store};
+use crate::store::{CachedFile, FileCache, Store, WriterLock};
 
 /// Files larger than this are left out of snapshots.
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -32,6 +34,10 @@ const RACY_WINDOW: Duration = Duration::from_secs(2);
 /// Threads of the directory walk. Listing directories is mostly waiting on the file system, so a few threads
 /// help, and more only cost time to start.
 const WALK_THREADS: usize = 4;
+
+/// Entries the walk can get ahead of the thread that stores them. A changed file carries its content (at most
+/// [`MAX_FILE_BYTES`]), so this bounds memory when many files changed at once.
+const QUEUED_ENTRIES: usize = 16;
 
 /// The result of [`snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +52,28 @@ pub struct Snapshot {
     /// How many times a file was read: files the stat cache knew to be unchanged are not read, and a changed
     /// file that the walk hashed is read a second time to be stored.
     pub files_read: usize,
+}
+
+impl Snapshot {
+    /// One line about the skipped entries worth logging (unreadable or invalid paths: files over the size
+    /// limit are expected), naming the first few. `None` if there are none.
+    pub fn problems(&self) -> Option<String> {
+        const NAMED: usize = 3;
+        let problems: Vec<&Skipped> = self
+            .skipped
+            .iter()
+            .filter(|skipped| !matches!(skipped.reason, SkipReason::TooLarge(_)))
+            .collect();
+        let first = problems.first()?;
+        let mut line = format!("snapshot skipped {} path(s): {first}", problems.len());
+        for skipped in problems.iter().skip(1).take(NAMED - 1) {
+            line.push_str(&format!("; {skipped}"));
+        }
+        if problems.len() > NAMED {
+            line.push_str(&format!("; and {} more", problems.len() - NAMED));
+        }
+        Some(line)
+    }
 }
 
 /// A file or directory [`snapshot`] could not take as it is.
@@ -90,16 +118,15 @@ impl fmt::Display for Skipped {
 }
 
 /// Takes a snapshot of the project that contains `yalper_dir`: every file that `.gitignore`, `.git/info/exclude`
-/// and the user's global excludes do not ignore, except anything named `.git` or `.yalper`. Symlinks are
-/// stored as symlinks (their target is never read), and on Unix the executable bit is kept.
+/// and the user's global excludes do not ignore (see [`Excludes`]), except anything named `.git` or `.yalper`.
+/// Symlinks are stored as symlinks (their target is never read), and on Unix the executable bit is kept.
 ///
-/// New file contents are written to the shadow store, which is only opened when something changed. The new
-/// tree and the stat cache are saved together in `store`. The caller must hold the [`WriterLock`].
+/// The walk runs in its own threads while this thread stores what they found: new file contents go to the
+/// shadow store, which is only opened when something changed. The new tree and the stat cache are saved
+/// together in `store`, under `lock`.
 ///
 /// One file that cannot be taken never fails the snapshot: it is listed in [`Snapshot::skipped`] instead.
-///
-/// [`WriterLock`]: crate::store::WriterLock
-pub fn snapshot(yalper_dir: &OwnedDir, store: &Store) -> Result<Snapshot> {
+pub fn snapshot(yalper_dir: &OwnedDir, store: &Store, lock: &WriterLock) -> Result<Snapshot> {
     let root = yalper_dir
         .path()
         .parent()
@@ -112,6 +139,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store) -> Result<Snapshot> {
     let start_over = previous.is_none();
     let (base, cache) =
         previous.unwrap_or_else(|| (ObjectId::empty_tree(gix::hash::Kind::Sha1), HashMap::new()));
+    let excludes = Excludes::new(root);
 
     let mut shadow = None;
     let mut snapshot = Snapshot {
@@ -127,71 +155,60 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store) -> Result<Snapshot> {
     let mut present = HashSet::new();
     let mut kept_prefixes = Vec::new();
 
-    for walked in walk(root, &cache) {
-        let (file, check) = match walked {
-            Walked::File(file, check) => (file, check),
-            Walked::Skipped(skipped) => {
-                if let SkipReason::Unreadable(_) = skipped.reason {
-                    kept_prefixes.push(skipped.path.clone());
+    thread::scope(|scope| -> Result<()> {
+        let (sender, receiver) = mpsc::sync_channel(QUEUED_ENTRIES);
+        let (cache, excludes) = (&cache, &excludes);
+        scope.spawn(move || walk(root, cache, excludes, sender));
+        // If this loop stops early, dropping `receiver` makes the walk stop too.
+        for walked in receiver {
+            let (file, check) = match walked {
+                Walked::File(file, check) => (file, check),
+                Walked::Skipped(skipped) => {
+                    if let SkipReason::Unreadable(_) = skipped.reason {
+                        kept_prefixes.push(skipped.path.clone());
+                    }
+                    snapshot.skipped.push(skipped);
+                    continue;
                 }
-                snapshot.skipped.push(skipped);
-                continue;
-            }
-        };
-        let cached = cache.get(&file.path);
-        let same_content = |oid, kind| cached.is_some_and(|c| c.oid == oid && c.kind == kind);
-        let (oid, len) = match check {
-            Check::Unchanged => {
-                present.insert(file.path);
-                continue;
-            }
-            Check::Hashed { oid, len } if same_content(oid, file.kind) => {
-                snapshot.files_read += 1;
-                (oid, len)
-            }
-            Check::Hashed { .. } | Check::New => {
-                snapshot.files_read += usize::from(matches!(check, Check::Hashed { .. }));
-                // New or changed: read here, where blobs are written one at a time.
-                let bytes = match read(root, &file) {
-                    Ok(Content::Bytes(bytes)) => bytes,
-                    Ok(Content::Gone) => continue,
-                    Ok(Content::TooLarge(size)) => {
-                        snapshot.skipped.push(file.skip(SkipReason::TooLarge(size)));
-                        continue;
-                    }
-                    Err(error) => {
-                        kept_prefixes.push(file.path.clone());
-                        let reason = SkipReason::Unreadable(error.to_string());
-                        snapshot.skipped.push(file.skip(reason));
-                        continue;
-                    }
-                };
-                snapshot.files_read += 1;
-                let oid = open_once(&mut shadow, yalper_dir)?.write_blob(&bytes)?;
-                if !same_content(oid, file.kind) {
+            };
+            let cached = cache.get(&file.path);
+            let (oid, len) = match check {
+                Check::Unchanged => {
+                    present.insert(file.path);
+                    continue;
+                }
+                Check::Same { oid, len } => {
+                    snapshot.files_read += 1;
+                    (oid, len)
+                }
+                Check::Changed { bytes } => {
+                    snapshot.files_read += 1;
+                    let oid = open_once(&mut shadow, yalper_dir)?.write_blob(&bytes)?;
                     changes.push(Change::Upsert {
                         path: file.path.clone(),
                         kind: file.kind,
                         blob: oid,
                     });
                     snapshot.changed.push(file.path.clone());
+                    (oid, bytes.len() as u64)
                 }
-                (oid, bytes.len() as u64)
+            };
+            let row = Cached {
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                kind: file.kind,
+                oid,
+                // A length that differs from the size seen by the walk means the file changed while it was
+                // read.
+                racy: file.mtime_ns >= racy_from_ns || len != file.size,
+            };
+            if cached != Some(&row) {
+                updated_rows.push(row.to_cached_file(&file.path));
             }
-        };
-        let row = Cached {
-            size: file.size,
-            mtime_ns: file.mtime_ns,
-            kind: file.kind,
-            oid,
-            // A length that differs from the size seen by the walk means the file changed while it was read.
-            racy: file.mtime_ns >= racy_from_ns || len != file.size,
-        };
-        if cached != Some(&row) {
-            updated_rows.push(row.to_cached_file(&file.path));
+            present.insert(file.path);
         }
-        present.insert(file.path);
-    }
+        Ok(())
+    })?;
 
     let mut removed = Vec::new();
     for path in cache.keys() {
@@ -216,6 +233,7 @@ pub fn snapshot(yalper_dir: &OwnedDir, store: &Store) -> Result<Snapshot> {
     }
     if start_over || snapshot.tree_id != base || !updated_rows.is_empty() || !removed.is_empty() {
         store.save_snapshot(
+            lock,
             &snapshot.tree_id.to_string(),
             &updated_rows,
             &removed,
@@ -300,15 +318,6 @@ struct Found {
     mtime_ns: i64,
 }
 
-impl Found {
-    fn skip(&self, reason: SkipReason) -> Skipped {
-        Skipped {
-            path: self.path.clone(),
-            reason,
-        }
-    }
-}
-
 enum Walked {
     File(Found, Check),
     Skipped(Skipped),
@@ -318,26 +327,31 @@ enum Walked {
 enum Check {
     /// Size, mtime and kind match a stat cache entry that is not racy: not read.
     Unchanged,
-    /// Not in the stat cache: read and stored after the walk.
-    New,
-    /// In the stat cache, but maybe changed: read and hashed by the walk thread. Only a file whose content
-    /// differs is read again after the walk, to be stored.
-    Hashed { oid: ObjectId, len: u64 },
+    /// Read and hashed by the walk thread: the same content and kind as the stat cache entry.
+    Same { oid: ObjectId, len: u64 },
+    /// Read by the walk thread: new, or its content or kind changed. Kept to be stored.
+    Changed { bytes: Vec<u8> },
 }
 
-/// Lists every file and symlink of the project that is not ignored, with its size, mtime and kind, using
-/// parallel threads. Files that may have changed since they were cached are hashed in those threads; their
-/// content is not kept, so memory stays small whatever the size of the project.
-fn walk(root: &Path, cache: &HashMap<String, Cached>) -> Vec<Walked> {
-    let (sender, receiver) = mpsc::channel();
+/// Sends every file and symlink of the project that is not ignored, with its size, mtime and kind, to
+/// `sender`, using parallel threads. Files the stat cache cannot vouch for are read and hashed in those
+/// threads; only changed contents are sent. `sender` holds few entries, so memory stays bounded whatever
+/// the size of the project.
+fn walk(
+    root: &Path,
+    cache: &HashMap<String, Cached>,
+    excludes: &Excludes,
+    sender: mpsc::SyncSender<Walked>,
+) {
     WalkBuilder::new(root)
-        // Dotfiles are code too, and `.ignore` and `.rgignore` are ripgrep's files, not git's.
+        // Dotfiles are code too. Ignore files are read by `Excludes`, not by the walker (see there), and
+        // never above the project, as git does.
         .hidden(false)
         .ignore(false)
-        .parents(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
+        .parents(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
         .follow_links(false)
         // At any depth: nested repositories and submodules have their own `.git`.
         .filter_entry(|entry| {
@@ -349,21 +363,22 @@ fn walk(root: &Path, cache: &HashMap<String, Cached>) -> Vec<Walked> {
         .run(|| {
             let sender = sender.clone();
             Box::new(move |entry| {
-                let (walked, state) = visit(root, cache, entry);
-                if let Some(walked) = walked {
-                    // The receiver lives until the walk is over.
-                    let _ = sender.send(walked);
+                let (walked, state) = visit(root, cache, excludes, entry);
+                match walked.map(|walked| sender.send(walked)) {
+                    // The snapshot stopped early: so does the walk.
+                    Some(Err(_)) => WalkState::Quit,
+                    _ => state,
                 }
-                state
             })
         });
-    drop(sender);
-    receiver.into_iter().collect()
 }
 
+/// Handles one entry of the walk. The walker calls this for a directory before any entry inside it, so its
+/// `.gitignore` is read in time.
 fn visit(
     root: &Path,
     cache: &HashMap<String, Cached>,
+    excludes: &Excludes,
     entry: std::result::Result<ignore::DirEntry, ignore::Error>,
 ) -> (Option<Walked>, WalkState) {
     let entry = match entry {
@@ -374,7 +389,11 @@ fn visit(
         return (None, WalkState::Continue);
     };
     if entry.depth() == 0 {
+        excludes.add_dir(entry.path());
         return (None, WalkState::Continue);
+    }
+    if excludes.is_ignored(entry.path(), file_type.is_dir()) {
+        return (None, WalkState::Skip);
     }
     let skip = |path: String, reason| {
         let skipped = Skipped { path, reason };
@@ -390,7 +409,7 @@ fn visit(
     } else if file_type.is_file() || file_type.is_symlink() {
         Some(FileKind::Regular)
     } else {
-        // FIFOs, sockets and devices: git does not store them either.
+        // FIFOs, sockets and devices: git does not store them either, and they are never opened.
         return (None, WalkState::Continue);
     };
     let metadata = match kind.map(|_| entry.metadata()) {
@@ -416,6 +435,7 @@ fn visit(
         return skip(path, SkipReason::InvalidPath(reason));
     }
     let Some(metadata) = metadata else {
+        excludes.add_dir(entry.path());
         return (None, WalkState::Continue);
     };
     let mtime_ns = match metadata.modified() {
@@ -428,26 +448,30 @@ fn visit(
         size: metadata.len(),
         mtime_ns,
     };
-    let check = match cache.get(&found.path) {
-        Some(cached) if cached.matches(&found) => Check::Unchanged,
-        _ if found.size > MAX_FILE_BYTES => {
-            return skip(found.path, SkipReason::TooLarge(found.size));
-        }
-        None => Check::New,
-        Some(_) => match read(root, &found) {
-            Ok(Content::Bytes(bytes)) => match blob_id(&bytes) {
-                Ok(oid) => Check::Hashed {
+    let cached = cache.get(&found.path);
+    if cached.is_some_and(|cached| cached.matches(&found)) {
+        return (
+            Some(Walked::File(found, Check::Unchanged)),
+            WalkState::Continue,
+        );
+    }
+    if found.size > MAX_FILE_BYTES {
+        return skip(found.path, SkipReason::TooLarge(found.size));
+    }
+    let check = match read(root, &found) {
+        Ok(Content::Bytes(bytes)) => match blob_id(&bytes) {
+            Ok(oid) if cached.is_some_and(|c| c.oid == oid && c.kind == found.kind) => {
+                Check::Same {
                     oid,
                     len: bytes.len() as u64,
-                },
-                Err(error) => return skip(found.path, SkipReason::Unreadable(error.to_string())),
-            },
-            Ok(Content::Gone) => return (None, WalkState::Continue),
-            Ok(Content::TooLarge(size)) => {
-                return skip(found.path, SkipReason::TooLarge(size));
+                }
             }
+            Ok(_) => Check::Changed { bytes },
             Err(error) => return skip(found.path, SkipReason::Unreadable(error.to_string())),
         },
+        Ok(Content::Gone) => return (None, WalkState::Continue),
+        Ok(Content::TooLarge(size)) => return skip(found.path, SkipReason::TooLarge(size)),
+        Err(error) => return skip(found.path, SkipReason::Unreadable(error.to_string())),
     };
     (Some(Walked::File(found, check)), WalkState::Continue)
 }
@@ -458,14 +482,15 @@ fn blob_id(bytes: &[u8]) -> io::Result<ObjectId> {
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// A walk error that may hide files: an unreadable directory or file. Errors about ignore file patterns are
-/// left out (the walk skips the bad pattern). Without a path, the whole project is reported, so nothing is
-/// taken as removed.
+/// A walk error that may hide files: an unreadable directory or file. Errors about paths outside the
+/// project are left out. Without a path, the whole project is reported, so nothing is taken as removed.
 fn walk_error(root: &Path, error: &ignore::Error) -> Option<Walked> {
     let io_error = error.io_error()?;
-    let path = error_path(error)
-        .and_then(|path| relative_path(root, path).ok())
-        .unwrap_or_default();
+    let path = match error_path(error) {
+        Some(path) if !path.starts_with(root) => return None,
+        Some(path) => relative_path(root, path).unwrap_or_default(),
+        None => String::new(),
+    };
     let reason = SkipReason::Unreadable(io_error.to_string());
     Some(Walked::Skipped(Skipped { path, reason }))
 }
@@ -583,6 +608,7 @@ fn link_bytes(target: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::excludes::MAX_IGNORE_FILE_BYTES;
     use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
 
@@ -631,7 +657,11 @@ mod tests {
         }
 
         fn snapshot(&self) -> Snapshot {
-            snapshot(&self.yalper, &self.store).unwrap()
+            snapshot(&self.yalper, &self.store, &self.lock()).unwrap()
+        }
+
+        fn lock(&self) -> WriterLock {
+            WriterLock::acquire(&self.yalper, crate::store::LOCK_TIMEOUT).unwrap()
         }
 
         /// Every file of `tree`: kind and content.
@@ -1051,7 +1081,7 @@ mod tests {
         rows.push(outside);
         project
             .store
-            .save_snapshot(&planted.tree_id, &rows, &[], true)
+            .save_snapshot(&project.lock(), &planted.tree_id, &rows, &[], true)
             .unwrap();
 
         let second = project.snapshot();
@@ -1158,5 +1188,203 @@ mod tests {
         }
         assert_eq!(Regular.mode(), 0o100644);
         assert_eq!(FileKind::from_mode(0o040000), None);
+    }
+
+    /// Runs `test` in a thread and fails if it does not finish within 20 seconds.
+    #[cfg(unix)]
+    fn without_hanging(test: impl FnOnce() + Send + 'static) {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            test();
+            sender.send(()).unwrap();
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the snapshot did not finish");
+    }
+
+    /// The paths of the regular files in the latest snapshot.
+    fn paths(project: &Project, snapshot: &Snapshot) -> Vec<String> {
+        project.texts(snapshot.tree_id).into_keys().collect()
+    }
+
+    #[test]
+    fn deeper_gitignore_files_take_precedence() {
+        let project = Project::new();
+        project.write(".gitignore", "*.log\ngenerated/\n");
+        project.write("keep/.gitignore", "!important.log\n*.tmp\n");
+        project.write("a.log", "x");
+        project.write("a.tmp", "x");
+        project.write("keep/important.log", "x");
+        project.write("keep/other.log", "x");
+        project.write("keep/b.tmp", "x");
+        project.write("generated/out.rs", "x");
+        project.write("keep/deep/c.tmp", "x");
+        let snapshot = project.snapshot();
+        assert_eq!(
+            paths(&project, &snapshot),
+            [
+                ".gitignore",
+                "a.tmp",
+                "keep/.gitignore",
+                "keep/important.log"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_oversized_gitignore_is_not_used() {
+        let project = Project::new();
+        let mut huge = "*.txt\n".to_owned();
+        while huge.len() as u64 <= MAX_IGNORE_FILE_BYTES {
+            huge.push_str("# padding to make the file larger than the limit\n");
+        }
+        project.write(".gitignore", &huge);
+        project.write("kept.txt", "kept");
+        let snapshot = project.snapshot();
+        assert_eq!(paths(&project, &snapshot), [".gitignore", "kept.txt"]);
+    }
+
+    #[test]
+    fn a_linked_gitignore_or_exclude_file_is_not_read() {
+        let project = Project::new();
+        let outside = tempfile::tempdir().unwrap();
+        let rules = outside.path().join("rules");
+        fs::write(&rules, "*\n").unwrap();
+        project.write("kept.txt", "kept");
+        project.write("sub/also-kept.txt", "kept");
+        if !symlink_file(&rules, &project.root().join(".gitignore")) {
+            return;
+        }
+        assert!(symlink_file(&rules, &project.root().join("sub/.gitignore")));
+        let exclude = project.root().join(".git/info/exclude");
+        fs::remove_file(&exclude).unwrap();
+        assert!(symlink_file(&rules, &exclude));
+
+        let snapshot = project.snapshot();
+        let mut files: Vec<String> = project.files(snapshot.tree_id).into_keys().collect();
+        files.sort();
+        // The links themselves are part of the project, as git would commit them.
+        assert_eq!(
+            files,
+            [
+                ".gitignore",
+                "kept.txt",
+                "sub/.gitignore",
+                "sub/also-kept.txt"
+            ]
+        );
+    }
+
+    /// Creates a file symlink. Returns false on Windows when the user may not create symlinks.
+    fn symlink_file(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+        match result {
+            Ok(()) => true,
+            Err(_) if cfg!(windows) => false,
+            Err(error) => panic!("cannot create symlink: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = Command::new("mkfifo").arg(path).status().unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gitignore_that_is_a_fifo_or_a_link_to_one_does_not_hang() {
+        without_hanging(|| {
+            let project = Project::new();
+            project.write("kept.txt", "kept");
+            let fifo = project.root().join("fifo");
+            mkfifo(&fifo);
+            std::os::unix::fs::symlink(&fifo, project.root().join(".gitignore")).unwrap();
+            fs::create_dir(project.root().join("sub")).unwrap();
+            mkfifo(&project.root().join("sub/.gitignore"));
+            let snapshot = project.snapshot();
+            let files: Vec<String> = project.files(snapshot.tree_id).into_keys().collect();
+            assert_eq!(files, [".gitignore", "kept.txt"]);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_the_project_is_left_out_without_hanging() {
+        without_hanging(|| {
+            let project = Project::new();
+            project.write("kept.txt", "kept");
+            mkfifo(&project.root().join("pipe"));
+            let snapshot = project.snapshot();
+            assert_eq!(paths(&project, &snapshot), ["kept.txt"]);
+            assert!(snapshot.skipped.is_empty(), "{:?}", snapshot.skipped);
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_stored_as_a_link_and_never_walked() {
+        let project = Project::new();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+        project.write("kept.txt", "kept");
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(project.root().join("junction"))
+            .arg(outside.path())
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let snapshot = project.snapshot();
+        let files = project.files(snapshot.tree_id);
+        assert_eq!(
+            files.keys().collect::<Vec<_>>(),
+            ["junction", "kept.txt"],
+            "{:?}",
+            snapshot.skipped
+        );
+        let (kind, target) = &files["junction"];
+        assert_eq!(*kind, FileKind::Symlink);
+        let target = String::from_utf8(target.clone()).unwrap();
+        let name = outside.path().file_name().unwrap().to_str().unwrap();
+        assert!(target.ends_with(name), "{target}");
+    }
+
+    #[test]
+    fn problems_are_summed_up_in_one_line() {
+        let skipped = |path: &str, reason| Skipped {
+            path: path.to_owned(),
+            reason,
+        };
+        let unreadable = || SkipReason::Unreadable("denied".to_owned());
+        let mut snapshot = Snapshot {
+            tree_id: ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            changed: Vec::new(),
+            skipped: vec![skipped("big.bin", SkipReason::TooLarge(MAX_FILE_BYTES + 1))],
+            files_read: 0,
+        };
+        assert_eq!(snapshot.problems(), None);
+        for name in ["a", "b", "c", "d", "e"] {
+            snapshot.skipped.push(skipped(name, unreadable()));
+        }
+        let line = snapshot.problems().unwrap();
+        assert!(
+            line.starts_with("snapshot skipped 5 path(s): \"a\" kept"),
+            "{line}"
+        );
+        assert!(
+            line.contains("\"c\" kept") && !line.contains("\"d\""),
+            "{line}"
+        );
+        assert!(line.ends_with("; and 2 more"), "{line}");
+        assert!(!line.contains("big.bin"), "{line}");
     }
 }

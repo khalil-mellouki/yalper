@@ -400,9 +400,10 @@ impl Store {
 
     /// Saves a new latest snapshot and brings the stat cache in line with it, in one transaction: `changed`
     /// rows are added or replaced and `removed` paths deleted. With `replace_all`, every other row is deleted
-    /// first. Only meaningful while holding the [`WriterLock`].
+    /// first. Taking the [`WriterLock`] makes sure no other process saves a snapshot at the same time.
     pub fn save_snapshot(
         &self,
+        _lock: &WriterLock,
         tree_id: &str,
         changed: &[CachedFile],
         removed: &[String],
@@ -1119,10 +1120,11 @@ mod tests {
         let owned = OwnedDir::open(dir.path()).unwrap();
         let store = Store::open(&owned).unwrap();
         assert_eq!(store.file_cache().unwrap(), None);
+        let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
 
         let (a, b) = (cached("a.rs", "aa"), cached("dir/b.rs", "bb"));
         store
-            .save_snapshot("tree1", &[a.clone(), b.clone()], &[], false)
+            .save_snapshot(&lock, "tree1", &[a.clone(), b.clone()], &[], false)
             .unwrap();
         let expected = FileCache {
             tree_id: "tree1".to_owned(),
@@ -1135,6 +1137,7 @@ mod tests {
         let c = cached("c.rs", "cc");
         store
             .save_snapshot(
+                &lock,
                 "tree2",
                 &[racy_a.clone(), c.clone()],
                 &["dir/b.rs".to_owned()],
@@ -1148,7 +1151,7 @@ mod tests {
         assert_eq!(sorted(store.file_cache().unwrap()), Some(expected));
 
         store
-            .save_snapshot("tree3", std::slice::from_ref(&b), &[], true)
+            .save_snapshot(&lock, "tree3", std::slice::from_ref(&b), &[], true)
             .unwrap();
         let expected = FileCache {
             tree_id: "tree3".to_owned(),
@@ -1171,8 +1174,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let owned = OwnedDir::open(dir.path()).unwrap();
             let store = Store::open(&owned).unwrap();
+            let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
             store
-                .save_snapshot("tree", &[cached("a.rs", "aa")], &[], false)
+                .save_snapshot(&lock, "tree", &[cached("a.rs", "aa")], &[], false)
                 .unwrap();
             store.conn.execute_batch(sql).unwrap();
             assert_eq!(store.file_cache().unwrap(), None, "{sql}");
