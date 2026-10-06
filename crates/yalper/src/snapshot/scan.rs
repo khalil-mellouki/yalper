@@ -1030,7 +1030,9 @@ mod tests {
     #[test]
     fn a_change_within_the_same_mtime_tick_is_detected() {
         let project = Project::new();
-        let now = SystemTime::now();
+        // An mtime the scans are always close to: the file looks changed at the very time each one runs, however
+        // slow the machine.
+        let now = SystemTime::now() + Duration::from_secs(60);
         project.write_at("recent.txt", "aaaa", now);
         let first = project.snapshot();
         let cache = project.store.file_cache().unwrap().unwrap();
@@ -1563,7 +1565,8 @@ mod tests {
         let again = project.snapshot_result().unwrap_err().to_string();
         assert!(again.contains("not walked again"), "{again}");
         assert_eq!(project.store.file_cache().unwrap(), before);
-        project.write("sub/.gitignore", &rules("*.tmp\n*.bak\n"));
+        // The same rules and one more comment line: still over the budget, but a changed file.
+        project.write("sub/.gitignore", &(rules("*.tmp\n") + "# comment\n"));
         let walked = project.snapshot_result().unwrap_err().to_string();
         assert!(!walked.contains("not walked again"), "{walked}");
         assert!(project.snapshot_result().is_err());
