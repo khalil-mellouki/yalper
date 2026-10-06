@@ -8,3 +8,4 @@ pub mod repo;
 pub mod safe_fs;
 pub mod snapshot;
 pub mod store;
+pub mod uninstall;

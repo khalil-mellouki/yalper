@@ -2,8 +2,10 @@
 
 #![allow(dead_code)] // Each test crate uses a different part.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 use yalper::hook::YALPER_DIR;
 use yalper::repo::{GIT_ID_FILE, ID_FILE, Token, YalperDir};
@@ -44,4 +46,60 @@ pub fn project() -> tempfile::TempDir {
     fs::create_dir(dir.path().join(".git")).unwrap();
     init(dir.path());
     dir
+}
+
+/// The `yalper` binary built for the integration tests.
+pub const EXE: &str = env!("CARGO_BIN_EXE_yalper");
+
+/// Runs `git` in `dir` with a fixed identity and checks that it succeeds.
+pub fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+/// A new git repository with one file.
+pub fn repository() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet"]);
+    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    dir
+}
+
+/// Runs the real `yalper` binary in `dir` with a temporary folder of its own, so the warning about a binary
+/// inside the temporary folder never shows up because of where the test build lives.
+pub fn yalper(dir: &Path, args: &[&str]) -> Output {
+    let temp = tempfile::tempdir().unwrap();
+    Command::new(EXE)
+        .args(args)
+        .current_dir(dir)
+        .env("TMPDIR", temp.path())
+        .env("TMP", temp.path())
+        .env("TEMP", temp.path())
+        .output()
+        .unwrap()
+}
+
+/// Every file under `dir` and its content. SQLite's shared memory file is left out: it is rewritten whenever
+/// the database is opened, whatever the database holds.
+pub fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if !path.to_string_lossy().ends_with("-shm") {
+                files.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
 }

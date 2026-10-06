@@ -22,6 +22,12 @@ enum Command {
         #[arg(long)]
         recreate: bool,
     },
+    /// Stop recording in the current git project: remove Yalper's Claude Code hooks. Recordings are kept.
+    Uninstall {
+        /// Also delete the .yalper folder with every recording.
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -36,6 +42,7 @@ fn main() -> ExitCode {
 
     let result = match Cli::parse().command {
         Command::Init { recreate } => init(recreate),
+        Command::Uninstall { purge } => uninstall(purge),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -53,6 +60,12 @@ fn init(recreate: bool) -> Result<(), String> {
     let exe = env::current_exe()
         .map_err(|error| format!("cannot find the path of the yalper binary: {error}"))?;
     yalper::init::init(&start, &exe, recreate, &mut io::stdout().lock())
+}
+
+fn uninstall(purge: bool) -> Result<(), String> {
+    let start = env::current_dir()
+        .map_err(|error| format!("cannot read the current directory: {error}"))?;
+    yalper::uninstall::uninstall(&start, purge, &mut io::stdout().lock())
 }
 
 #[cfg(test)]

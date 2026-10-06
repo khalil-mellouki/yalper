@@ -93,6 +93,29 @@ impl OwnedDir {
         &self.path
     }
 
+    /// Checks that [`path`](Self::path) still names this directory, not a link or another folder put in its
+    /// place. Unix: same device and inode as the held handle. Windows: the held handle stops the folder from
+    /// being renamed or deleted, so the path is only checked to be a real folder.
+    pub fn check_still_at_path(&self) -> io::Result<()> {
+        let named = std::fs::symlink_metadata(&self.path)?;
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            named.is_dir()
+                && (named.dev(), named.ino()) == stat_id(&rustix::fs::fstat(&self.handle)?)
+        };
+        #[cfg(windows)]
+        let same = named.is_dir();
+        if same {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "{} was replaced",
+                self.path.display()
+            )))
+        }
+    }
+
     /// Whether users other than the owner can create, rename or delete entries in this directory: on Unix,
     /// its group or world write bit is set.
     ///
