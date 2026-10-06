@@ -795,7 +795,8 @@ pub fn printable(text: &str) -> String {
 /// character (Unicode General_Category Cf: bidirectional marks and overrides, zero-width spaces, word
 /// joiners, byte order mark, tag characters, invisible operators), plus the line and paragraph separators,
 /// variation selectors, and the invisible fillers that can pass for letters in identifiers. The zero-width
-/// joiner U+200D is kept: emoji sequences need it and it hides nothing.
+/// joiner U+200D and the presentation selectors U+FE0E and U+FE0F are kept: emoji need them and they hide
+/// nothing.
 fn is_hidden_format(c: char) -> bool {
     matches!(
         c,
