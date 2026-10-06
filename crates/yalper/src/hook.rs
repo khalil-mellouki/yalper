@@ -7,8 +7,9 @@
 
 mod input;
 
+use std::any::Any;
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+
+use crate::safe_fs;
 
 pub use input::{HookEvent, HookInput, InputError};
 
@@ -28,15 +31,20 @@ pub const ERRORS_LOG: &str = "errors.log";
 /// When appending a line would make `errors.log` larger than this, the file is emptied first.
 pub const ERRORS_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
+/// Payloads larger than this are not parsed (the rest of stdin is drained and discarded).
+pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
 const MAX_MESSAGE_CHARS: usize = 2000;
+const MAX_EVENT_CHARS: usize = 64;
 
 /// The panic message and location, saved by the panic hook because `catch_unwind` only returns the payload.
 static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
-/// Handles one hook call: reads the payload from `stdin` and records it. Never panics and never prints.
-pub fn run(stdin: &mut dyn Read) {
+/// Replaces the process-wide panic hook with one that prints nothing and keeps the message for
+/// [`run`] to log. Only the `yalper` binary calls this, so tests and other callers keep their own hook.
+pub fn silence_panics() {
     panic::set_hook(Box::new(|info| {
-        let message = info.payload_as_str().unwrap_or("non-string panic payload");
+        let message = panic_text(info.payload());
         let text = match info.location() {
             Some(location) => format!("panic at {location}: {message}"),
             None => format!("panic: {message}"),
@@ -45,16 +53,20 @@ pub fn run(stdin: &mut dyn Read) {
             *slot = Some(text);
         }
     }));
+}
 
+/// Handles one hook call: reads the payload from `stdin` and records it. Never panics and never prints
+/// (once [`silence_panics`] has been called).
+pub fn run(stdin: &mut dyn Read) {
     let mut call = Call::default();
     let error = match panic::catch_unwind(AssertUnwindSafe(|| handle(stdin, &mut call))) {
         Ok(Ok(())) => return,
         Ok(Err(error)) => error,
-        Err(_) => LAST_PANIC
+        Err(payload) => LAST_PANIC
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
-            .unwrap_or_else(|| "panic".to_owned()),
+            .unwrap_or_else(|| format!("panic: {}", panic_text(payload.as_ref()))),
     };
     if let Some(dir) = &call.yalper_dir {
         // Nowhere is left to report a failure to write the error log, so it is ignored.
@@ -67,6 +79,14 @@ pub fn run(stdin: &mut dyn Read) {
     }
 }
 
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 /// What is known about the current call, kept outside `catch_unwind` so errors can still be logged.
 #[derive(Default)]
 struct Call {
@@ -75,27 +95,28 @@ struct Call {
 }
 
 fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
-    let mut bytes = Vec::new();
-    let payload = match stdin.read_to_end(&mut bytes) {
-        Ok(_) => serde_json::from_slice::<Value>(&bytes)
-            .map_err(|error| format!("invalid hook input: {error}")),
-        Err(error) => Err(format!("cannot read hook input: {error}")),
-    };
+    let payload = read_limited(stdin, MAX_PAYLOAD_BYTES).and_then(|bytes| {
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("invalid hook input: {error}"))
+    });
 
-    let payload_cwd = payload
-        .as_ref()
-        .ok()
-        .and_then(|value| value.get("cwd"))
-        .and_then(Value::as_str);
-    let starts = [
-        env::var_os("CLAUDE_PROJECT_DIR")
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from),
-        payload_cwd.map(PathBuf::from),
-        env::current_dir().ok(),
-    ];
+    let starts: Vec<PathBuf> = match env::var_os("CLAUDE_PROJECT_DIR").filter(|d| !d.is_empty()) {
+        Some(project_dir) => vec![PathBuf::from(project_dir)],
+        None => {
+            let payload_cwd = payload
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("cwd"))
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            payload_cwd
+                .into_iter()
+                .chain(env::current_dir().ok())
+                .collect()
+        }
+    };
     // A project without `.yalper/` is not recorded, and there is nowhere to log to.
-    let Some(dir) = find_yalper_dir(starts.into_iter().flatten()) else {
+    let Some(dir) = find_yalper_dir(starts) else {
         return Ok(());
     };
     call.yalper_dir = Some(dir);
@@ -115,17 +136,43 @@ fn handle(stdin: &mut dyn Read, call: &mut Call) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns the first `.yalper` directory found by walking up from each start directory in turn.
+/// Reads `reader` to the end, but keeps at most `limit` bytes. A longer input is drained (so the writer
+/// never sees a broken pipe) and reported as an error.
+fn read_limited(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    Read::take(&mut *reader, limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read hook input: {error}"))?;
+    if bytes.len() as u64 > limit {
+        let _ = io::copy(reader, &mut io::sink());
+        return Err(format!("hook input too large: more than {limit} bytes"));
+    }
+    Ok(bytes)
+}
+
+/// Returns the project's `.yalper` directory, trying each start directory in turn.
+///
+/// From each start, the search walks up only as far as the nearest git root (the first directory that
+/// contains `.git`), so a `.yalper` in a parent folder or in another project is never used. Outside a git
+/// repository nothing is found. A `.yalper` that is a symlink, or (on Unix) owned by another user, is
+/// ignored.
 pub fn find_yalper_dir(starts: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     starts.into_iter().find_map(|start| {
+        let git_root = start
+            .ancestors()
+            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())?;
         start
             .ancestors()
+            .take_while(|dir| dir.starts_with(git_root))
             .map(|dir| dir.join(YALPER_DIR))
-            .find(|candidate| candidate.is_dir())
+            .find(|candidate| safe_fs::is_owned_dir(candidate))
     })
 }
 
 /// Appends one line to the error log, emptying the log first if the line would push it past `max_bytes`.
+///
+/// `message` must never contain payload content (prompts, tool input or output): the log is not redacted.
+/// Only Yalper's own error texts and panic messages are passed here.
 pub fn append_error(
     path: &Path,
     event: Option<&str>,
@@ -135,14 +182,11 @@ pub fn append_error(
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    let message: String = message
-        .chars()
-        .take(MAX_MESSAGE_CHARS)
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let line = format!("{timestamp_ms} {} {message}\n", event.unwrap_or("-"));
+    let event = event.map_or_else(|| "-".to_owned(), |e| one_line(e, MAX_EVENT_CHARS));
+    let message = one_line(message, MAX_MESSAGE_CHARS);
+    let line = format!("{timestamp_ms} {event} {message}\n");
 
-    let current_len = path.metadata().map_or(0, |metadata| metadata.len());
+    let current_len = fs::symlink_metadata(path).map_or(0, |metadata| metadata.len());
     let mut options = OpenOptions::new();
     options.create(true);
     if current_len + line.len() as u64 > max_bytes {
@@ -150,32 +194,53 @@ pub fn append_error(
     } else {
         options.append(true);
     }
-    options.open(path)?.write_all(line.as_bytes())
+    safe_fs::open_regular_file(path, &options)?.write_all(line.as_bytes())
+}
+
+/// Keeps at most `max_chars` characters and turns line breaks into spaces, so one entry stays one line.
+fn one_line(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .take(max_chars)
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+
+    /// A temporary git project (it only needs a `.git` entry) with `.yalper/` in it.
+    fn project() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        root
+    }
 
     #[test]
-    fn finds_yalper_dir_in_an_ancestor() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+    fn finds_yalper_dir_from_a_subdirectory() {
+        let root = project();
         let deep = root.path().join("a").join("b");
         fs::create_dir_all(&deep).unwrap();
-
         assert_eq!(find_yalper_dir([deep]), Some(root.path().join(YALPER_DIR)));
+    }
+
+    #[test]
+    fn a_git_file_marks_the_root_like_a_git_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        assert_eq!(
+            find_yalper_dir([root.path().to_path_buf()]),
+            Some(root.path().join(YALPER_DIR))
+        );
     }
 
     #[test]
     fn tries_start_directories_in_order() {
         let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let third = tempfile::tempdir().unwrap();
-        fs::create_dir(second.path().join(YALPER_DIR)).unwrap();
-        fs::create_dir(third.path().join(YALPER_DIR)).unwrap();
-
+        let second = project();
+        let third = project();
         let starts = [first.path(), second.path(), third.path()].map(Path::to_path_buf);
         assert_eq!(
             find_yalper_dir(starts),
@@ -184,10 +249,40 @@ mod tests {
     }
 
     #[test]
+    fn stops_at_the_git_root() {
+        let parent = tempfile::tempdir().unwrap();
+        fs::create_dir(parent.path().join(YALPER_DIR)).unwrap();
+        let repo = parent.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let deep = repo.join("src");
+        fs::create_dir(&deep).unwrap();
+        assert_eq!(find_yalper_dir([repo, deep]), None);
+    }
+
+    #[test]
+    fn nothing_is_found_outside_a_git_repository() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        assert_eq!(find_yalper_dir([root.path().to_path_buf()]), None);
+    }
+
+    #[test]
     fn ignores_a_yalper_file() {
         let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
         fs::write(root.path().join(YALPER_DIR), "not a directory").unwrap();
         assert_eq!(find_yalper_dir([root.path().to_path_buf()]), None);
+    }
+
+    #[test]
+    fn input_over_the_limit_is_refused_and_drained() {
+        let mut reader: &[u8] = b"0123456789";
+        assert_eq!(read_limited(&mut reader, 10).unwrap(), b"0123456789");
+
+        let mut reader: &[u8] = b"0123456789A";
+        let error = read_limited(&mut reader, 10).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        assert!(reader.is_empty());
     }
 
     #[test]
@@ -196,12 +291,24 @@ mod tests {
         let log = dir.path().join(ERRORS_LOG);
         append_error(&log, Some("Stop"), "first\nsecond\r\nthird", 1024).unwrap();
         append_error(&log, None, "again", 1024).unwrap();
+        append_error(&log, Some("Bad\nEvent"), "x", 1024).unwrap();
 
         let text = fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert!(lines[0].ends_with(" Stop first second  third"), "{text}");
         assert!(lines[1].ends_with(" - again"), "{text}");
+        assert!(lines[2].ends_with(" Bad Event x"), "{text}");
+    }
+
+    #[test]
+    fn event_names_are_shortened() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join(ERRORS_LOG);
+        append_error(&log, Some(&"E".repeat(1000)), "x", u64::MAX).unwrap();
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(text.contains(&format!(" {} x", "E".repeat(MAX_EVENT_CHARS))));
+        assert!(!text.contains(&"E".repeat(MAX_EVENT_CHARS + 1)));
     }
 
     #[test]

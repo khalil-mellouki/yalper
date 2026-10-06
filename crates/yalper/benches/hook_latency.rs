@@ -10,33 +10,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const FILES: usize = 1000;
 const CHANGED_PER_CALL: usize = 3;
 const WARMUP_CALLS: usize = 5;
 const DEFAULT_CALLS: usize = 50;
-
-/// A temporary directory removed on drop. The benchmark avoids dev-dependencies on purpose.
-struct TempProject(PathBuf);
-
-impl TempProject {
-    fn create() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("yalper-bench-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        Self(root)
-    }
-}
-
-impl Drop for TempProject {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn file_path(root: &Path, index: usize) -> PathBuf {
     root.join(format!("pkg{}", index / 100))
@@ -102,8 +81,8 @@ fn main() {
         .filter(|&calls: &usize| calls > 0)
         .unwrap_or(DEFAULT_CALLS);
 
-    let project = TempProject::create();
-    let root = project.0.as_path();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
     build_project(root);
 
     let payload = serde_json::json!({

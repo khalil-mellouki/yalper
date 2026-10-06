@@ -9,10 +9,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
 serde_json.workspace = true
+
+# Unix only: the current user id (to check who owns `.yalper`) and O_NOFOLLOW, without unsafe code.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true

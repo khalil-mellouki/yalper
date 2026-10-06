@@ -8,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::json;
 use tempfile::TempDir;
-use yalper::hook::{ERRORS_LOG, HookEvent, HookInput, YALPER_DIR};
+use yalper::hook::{ERRORS_LOG, HookEvent, HookInput, MAX_PAYLOAD_BYTES, YALPER_DIR};
 
 fn fixtures() -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hooks");
@@ -20,9 +20,10 @@ fn fixtures() -> Vec<PathBuf> {
     paths
 }
 
-/// A temporary project folder with `.yalper/` in it.
+/// A temporary git project (it only needs a `.git` entry) with `.yalper/` in it.
 fn project() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     fs::create_dir(dir.path().join(YALPER_DIR)).unwrap();
     dir
 }
@@ -173,6 +174,7 @@ fn missing_required_field_is_logged_with_the_event_name() {
 #[test]
 fn project_without_yalper_dir_is_left_untouched() {
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     for stdin in [
         &b"not json"[..],
         b"",
@@ -181,7 +183,11 @@ fn project_without_yalper_dir_is_left_untouched() {
         let output = run_in(dir.path(), stdin);
         assert_silent_success(&output);
     }
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    let entries: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [".git"]);
 }
 
 #[test]
@@ -284,4 +290,104 @@ fn full_error_log_is_emptied_before_appending() {
         fs::metadata(&log).unwrap().len()
     );
     assert!(lines[0].contains("invalid hook input"));
+}
+
+#[test]
+fn payload_over_the_size_limit_is_logged_and_exits_zero() {
+    let project = project();
+    let stdin = vec![b' '; usize::try_from(MAX_PAYLOAD_BYTES).unwrap() + 1];
+    let output = run_in(project.path(), &stdin);
+    assert_silent_success(&output);
+    let lines = error_lines(project.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("hook input too large"), "{lines:?}");
+}
+
+#[test]
+fn project_dir_without_yalper_does_not_fall_back_to_cwd() {
+    let session_root = tempfile::tempdir().unwrap();
+    fs::create_dir(session_root.path().join(".git")).unwrap();
+    let other = project();
+    let payload = json!({"hook_event_name": "Stop", "cwd": other.path()}).to_string();
+    let output = Hook {
+        stdin: payload.as_bytes(),
+        project_dir: Some(session_root.path()),
+        current_dir: other.path(),
+        force_panic: false,
+    }
+    .run();
+    assert_silent_success(&output);
+    assert_eq!(error_lines(other.path()), Vec::<String>::new());
+}
+
+#[test]
+fn yalper_dir_above_the_git_root_is_not_used() {
+    let parent = tempfile::tempdir().unwrap();
+    fs::create_dir(parent.path().join(YALPER_DIR)).unwrap();
+    let repo = parent.path().join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let output = run_in(&repo, b"not json");
+    assert_silent_success(&output);
+    assert_eq!(error_lines(parent.path()), Vec::<String>::new());
+}
+
+#[test]
+fn yalper_dir_outside_a_git_repository_is_not_used() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(YALPER_DIR)).unwrap();
+    let output = run_in(dir.path(), b"not json");
+    assert_silent_success(&output);
+    assert_eq!(error_lines(dir.path()), Vec::<String>::new());
+}
+
+/// Makes `link` point to the directory `target`: a symlink on Unix, a junction on Windows (which needs no
+/// special privilege).
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn linked_yalper_dir_is_not_used() {
+    let outside = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir(repo.path().join(".git")).unwrap();
+    link_dir(outside.path(), &repo.path().join(YALPER_DIR));
+
+    let output = run_in(repo.path(), b"not json");
+    assert_silent_success(&output);
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn linked_error_log_is_not_written() {
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("victim.txt");
+    fs::write(&target, "keep me").unwrap();
+    let project = project();
+    let link = project.path().join(YALPER_DIR).join(ERRORS_LOG);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+        // Creating file symlinks needs Developer Mode or admin rights on Windows.
+        return;
+    }
+
+    let output = run_in(project.path(), b"not json");
+    assert_silent_success(&output);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
 }

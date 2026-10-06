@@ -8,6 +8,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/khalil-mellouki/yalper"
 authors = ["Khalil Mellouki and the Yalper contributors"]
+rust-version = "1.89"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }

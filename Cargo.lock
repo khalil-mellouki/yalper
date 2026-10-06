@@ -326,6 +326,7 @@ name = "yalper"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rustix",
  "serde_json",
  "tempfile",
 ]
