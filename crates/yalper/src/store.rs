@@ -8,7 +8,7 @@
 mod lock;
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 
-use crate::safe_fs::{self, Access, OwnedDir};
+use crate::safe_fs::{OwnedDir, PathGuard};
 
 pub use lock::{LOCK_FILE, LOCK_TIMEOUT, WriterLock};
 
@@ -186,9 +186,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Store {
     conn: Connection,
     wal_path: PathBuf,
-    /// Yalper's own handle on the database file. On Windows it keeps the file from being renamed or
-    /// deleted while the store is open, see [`OwnedDir::open_file`].
-    _database: File,
+    /// See [`OwnedDir::guard_path`]: on Windows it keeps the database file from being renamed or deleted.
+    _database: PathGuard,
 }
 
 impl Store {
@@ -197,24 +196,24 @@ impl Store {
     /// Creating or migrating takes the [`WriterLock`] for a moment, so a writer opens the store first and
     /// takes the lock after: opening while this process already holds the lock would wait for itself.
     pub fn open(dir: &OwnedDir) -> Result<Self> {
-        // SQLite opens its files by path, so they are checked first: the database through a handle that is
-        // kept open, the journal and WAL files by name. SQLite then refuses a symlink anywhere in the path
-        // (Unix; `dir.path()` is canonical) and the handle is compared with the file SQLite reached.
+        // SQLite opens its files by path, so they are checked by name first: anything but a regular file
+        // with a single link is refused. SQLite then refuses a symlink anywhere in the path (Unix;
+        // `dir.path()` is canonical), and the file it reached is compared with the one checked (Unix: device
+        // and inode; Windows: a handle kept open stops renames and deletes).
         // Remaining gap, outside the threat model: another process of the same user could swap a file
-        // between these checks and SQLite's own opens. On Windows the open handles stop renames and
-        // deletes; the journal and WAL files are only checked by name.
-        let database = dir.open_file(DATABASE_FILE, Access::ReadWrite)?;
+        // between these checks and SQLite's own opens (and swap it back), or swap the journal and WAL files.
+        let database = dir.guard_path(DATABASE_FILE)?;
         for name in DATABASE_SIDE_FILES {
             dir.check_regular_or_missing(name)?;
         }
-        let path = dir.path().join(DATABASE_FILE);
         let mut conn = Connection::open_with_flags(
-            &path,
+            dir.path().join(DATABASE_FILE),
             OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        safe_fs::check_same_file(&database, &path)?;
+        dir.check_guarded(DATABASE_FILE, &database)?;
 
         // A repository could commit a crafted database: no schema changes outside SQL, and no functions
         // with side effects from the schema.
@@ -777,6 +776,76 @@ mod tests {
         for steps in steps_per_session.values() {
             assert_eq!(*steps, (1..=per_session).collect::<Vec<_>>());
         }
+    }
+
+    /// Runs [`other_process`] on `database` in a new process of this test binary and returns whether its
+    /// checks passed.
+    fn run_other_process(database: &std::path::Path) -> bool {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::other_process", "--ignored"])
+            .env(OTHER_PROCESS_DATABASE, database)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    const OTHER_PROCESS_DATABASE: &str = "YALPER_TEST_OTHER_PROCESS_DATABASE";
+
+    /// Another process using the database the way any SQLite client would (the `sqlite3` shell, a
+    /// viewer): while a store holds a write transaction, it must not get the write lock.
+    #[test]
+    #[ignore = "run in a child process by closing_one_store_keeps_the_locks_of_another"]
+    fn other_process() {
+        let Some(path) = std::env::var_os(OTHER_PROCESS_DATABASE) else {
+            return;
+        };
+        let conn = Connection::open(path).unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let error = conn.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "{error}"
+        );
+        let rows: u32 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the other process sees only committed steps");
+    }
+
+    #[test]
+    fn closing_one_store_keeps_the_locks_of_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let database = owned.path().join(DATABASE_FILE);
+        let first = Store::open(&owned).unwrap();
+        first.upsert_session(&Session::new("s1", 1)).unwrap();
+        drop(Store::open(&owned).unwrap());
+
+        // On Unix, closing any descriptor of a file drops every POSIX lock the process holds on it. The
+        // first store's shared lock on the database (it tells other processes the database is in use) must
+        // survive the second store. Linux lists the locks of every process in /proc/locks.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inode = format!(":{} ", fs::metadata(&database).unwrap().ino());
+            let pid = format!(" {} ", std::process::id());
+            let held = fs::read_to_string("/proc/locks")
+                .unwrap()
+                .lines()
+                .any(|line| {
+                    line.contains(" POSIX ") && line.contains(&pid) && line.contains(&inode)
+                });
+            assert!(held, "the first store lost its lock on the database");
+        }
+
+        first.insert_event(&event("s1", 1)).unwrap();
+        first.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        first.insert_event(&event("s1", 2)).unwrap();
+        assert!(run_other_process(&database));
+        first.conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(first.events("s1").unwrap().len(), 2);
     }
 
     #[test]

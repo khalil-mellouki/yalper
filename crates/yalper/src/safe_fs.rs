@@ -10,7 +10,7 @@
 //! paths keep naming what was checked.
 //!
 //! SQLite opens its own files by path. For those, see [`OwnedDir::check_regular_or_missing`],
-//! [`check_same_file`], and `Store::open`.
+//! [`OwnedDir::guard_path`], and `Store::open`.
 
 use std::fs::File;
 use std::io;
@@ -180,27 +180,81 @@ impl OwnedDir {
     }
 }
 
-/// Checks that `path` still names the same file as the open `file` (Unix: same device and inode), for a
-/// file that another library has just reopened by path.
-///
-/// Windows: the standard library does not expose file ids, so this check always passes. There the open
-/// `file` does not allow its path to be renamed or deleted (see [`OwnedDir::open_file`]), which keeps the
-/// path on the same file instead.
-pub fn check_same_file(file: &File, path: &Path) -> io::Result<()> {
+/// A file inside an [`OwnedDir`] that another library (SQLite) opens by path, checked before and after that
+/// open. See [`OwnedDir::guard_path`].
+#[derive(Debug)]
+pub struct PathGuard {
+    /// Device and inode of the file before the open, if it existed.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let (open, named) = (file.metadata()?, std::fs::symlink_metadata(path)?);
-        if (open.dev(), open.ino()) != (named.dev(), named.ino()) {
-            return Err(io::Error::other(format!(
-                "{} was replaced while it was being opened",
-                path.display()
-            )));
-        }
-    }
+    before: Option<(u64, u64)>,
+    /// The file, created and checked by [`OwnedDir::open_file`] and kept open: it stops the path from being
+    /// renamed or deleted. Windows locks belong to one handle, so keeping it open is safe.
     #[cfg(windows)]
-    let _ = (file, path);
-    Ok(())
+    _file: File,
+}
+
+impl OwnedDir {
+    /// Prepares the file `name` for another library to open by path: refuses anything but a regular file
+    /// with a single link. Call [`check_guarded`](Self::check_guarded) once the library has opened it.
+    ///
+    /// Unix: the check is made by name relative to the directory handle and the library creates a missing
+    /// file. No descriptor is opened, because closing any descriptor of a file drops every POSIX lock this
+    /// process holds on it, including the locks of SQLite connections already open on it.
+    /// Windows: the file is created if missing, checked through a handle, and the handle is kept.
+    pub fn guard_path(&self, name: &str) -> io::Result<PathGuard> {
+        #[cfg(unix)]
+        {
+            self.check_regular_or_missing(name)?;
+            let before =
+                match rustix::fs::statat(&self.handle, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                {
+                    Ok(stat) => Some(stat_id(&stat)),
+                    Err(rustix::io::Errno::NOENT) => None,
+                    Err(error) => return Err(error.into()),
+                };
+            Ok(PathGuard { before })
+        }
+        #[cfg(windows)]
+        Ok(PathGuard {
+            _file: self.open_file(name, Access::ReadWrite)?,
+        })
+    }
+
+    /// Checks, after another library opened `self.path().join(name)`, that this path names the regular
+    /// single-link file `name` of this directory, and the same file as before the open if it existed then
+    /// (Unix: device and inode). On Windows the kept handle already ensures this.
+    pub fn check_guarded(&self, name: &str, guard: &PathGuard) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.check_regular_or_missing(name)?;
+            let here = stat_id(&rustix::fs::statat(
+                &self.handle,
+                name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?);
+            let path = self.path.join(name);
+            let named = std::fs::symlink_metadata(&path)?;
+            if (named.dev(), named.ino()) != here
+                || guard.before.is_some_and(|before| before != here)
+            {
+                return Err(io::Error::other(format!(
+                    "{} was replaced while it was being opened",
+                    path.display()
+                )));
+            }
+        }
+        #[cfg(windows)]
+        let _ = (name, guard);
+        Ok(())
+    }
+}
+
+/// Device and inode, typed like `std::os::unix::fs::MetadataExt`.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // The field types differ between Linux and macOS.
+fn stat_id(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
 }
 
 #[cfg(unix)]
@@ -268,34 +322,55 @@ mod tests {
     }
 
     #[test]
-    fn the_same_file_passes_the_identity_check() {
+    fn an_unchanged_file_passes_the_guard() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let file = owned.open_file("db", Access::ReadWrite).unwrap();
-        check_same_file(&file, &owned.path().join("db")).unwrap();
+        fs::write(dir.path().join("db"), "").unwrap();
+        let guard = owned.guard_path("db").unwrap();
+        owned.check_guarded("db", &guard).unwrap();
+    }
+
+    #[test]
+    fn a_file_created_by_the_other_library_passes_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let guard = owned.guard_path("db").unwrap();
+        fs::write(owned.path().join("db"), "").unwrap();
+        owned.check_guarded("db", &guard).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_replaced_file_fails_the_identity_check() {
+    fn a_replaced_file_fails_the_guard() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let file = owned.open_file("db", Access::ReadWrite).unwrap();
+        fs::write(dir.path().join("db"), "").unwrap();
+        let guard = owned.guard_path("db").unwrap();
         fs::write(dir.path().join("new"), "").unwrap();
         fs::rename(dir.path().join("new"), dir.path().join("db")).unwrap();
-        assert!(check_same_file(&file, &owned.path().join("db")).is_err());
+        assert!(owned.check_guarded("db", &guard).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_fails_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), dir.path().join("db")).unwrap();
+        assert!(owned.guard_path("db").is_err());
     }
 
     #[cfg(windows)]
     #[test]
-    fn an_open_file_cannot_be_swapped() {
+    fn a_guarded_file_cannot_be_swapped() {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
-        let file = owned.open_file("db", Access::ReadWrite).unwrap();
+        let guard = owned.guard_path("db").unwrap();
+        assert!(dir.path().join("db").is_file());
         fs::write(dir.path().join("new"), "").unwrap();
         assert!(fs::rename(dir.path().join("new"), dir.path().join("db")).is_err());
         assert!(fs::remove_file(dir.path().join("db")).is_err());
-        drop(file);
+        drop(guard);
         fs::rename(dir.path().join("new"), dir.path().join("db")).unwrap();
     }
 
