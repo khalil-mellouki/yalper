@@ -630,14 +630,15 @@ fn take_baseline(yalper: &YalperDir, out: &mut dyn Write) -> Result<(), String> 
                 &format!("{files} file{}", if files == 1 { "" } else { "s" }),
             );
             if let Some(problems) = snapshot.problems() {
-                say(out, &format!("  warning: {problems}"));
+                // The skipped paths are names from the repository.
+                say(out, &printable(&format!("  warning: {problems}")));
             }
         }
         Err(error) => say(
             out,
-            &format!(
+            &printable(&format!(
                 "failed ({error}). Recording still works: each step tries to take a snapshot again."
-            ),
+            )),
         ),
     }
     Ok(())
@@ -656,7 +657,10 @@ fn list_other_commands(root: &Path, exe: &str, out: &mut dyn Write) {
             continue;
         };
         for (setting, command) in other_commands(&settings, exe) {
-            lines.push(format!("    .claude/{name} {setting}: {command}"));
+            // The setting names come from the repository too (event keys), so the whole line is filtered.
+            lines.push(printable(&format!(
+                "    .claude/{name} {setting}: {command}"
+            )));
         }
     }
     if !lines.is_empty() {
@@ -717,11 +721,18 @@ fn other_commands(settings: &Value, exe: &str) -> Vec<(String, String)> {
     commands
 }
 
+/// `text` with every control character (line breaks, terminal escape sequences) replaced by a space, so text
+/// from a repository cannot change what the terminal shows.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// `command` on one line, cut after [`MAX_LISTED_COMMAND_CHARS`] characters.
 fn shortened(command: &str) -> String {
-    let mut line: String = command
+    let mut line: String = printable(command)
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
         .take(MAX_LISTED_COMMAND_CHARS)
         .collect();
     if command.chars().count() > MAX_LISTED_COMMAND_CHARS {
@@ -1130,8 +1141,8 @@ mod tests {
                 .any(|warning| warning.contains("temporary folder")),
             "{warnings:?}"
         );
-        let test_binary = env::current_exe().unwrap();
-        assert_eq!(exe_warnings(&test_binary), Vec::<String>::new());
+        let elsewhere = Path::new("/opt/no-such-folder/yalper");
+        assert_eq!(exe_warnings(elsewhere), Vec::<String>::new());
     }
 
     #[cfg(unix)]

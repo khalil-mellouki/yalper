@@ -34,10 +34,16 @@ fn repository() -> tempfile::TempDir {
     dir
 }
 
+/// Runs `yalper` with a temporary folder of its own, so the warning about a binary inside the temporary
+/// folder never shows up because of where the test build lives.
 fn yalper(dir: &Path, args: &[&str]) -> Output {
+    let temp = tempfile::tempdir().unwrap();
     Command::new(EXE)
         .args(args)
         .current_dir(dir)
+        .env("TMPDIR", temp.path())
+        .env("TMP", temp.path())
+        .env("TEMP", temp.path())
         .output()
         .unwrap()
 }
@@ -555,4 +561,31 @@ fn other_commands_in_the_project_settings_are_listed() {
     let plain = repository();
     let text = stdout(&init(plain.path()));
     assert!(!text.contains("Other commands"), "{text}");
+}
+
+#[test]
+fn repository_text_cannot_send_control_characters_to_the_terminal() {
+    let repo = repository();
+    let root = repo.path();
+    fs::create_dir(root.join(".claude")).unwrap();
+    let local = json!({
+        "hooks": {"Stop\u{1b}[2K\u{1b}[1A": [{"hooks": [
+            {"type": "command", "command": "run\u{1b}[31m\r\u{7}", "args": ["\u{9b}2J"]}
+        ]}]},
+        "statusLine\u{1b}": {"type": "command", "command": "x"},
+        "apiKeyHelper": "key\u{1b}]0;title\u{7}"
+    });
+    fs::write(settings_path(root), local.to_string()).unwrap();
+
+    let output = init(root);
+    assert_success(&output);
+    let text = stdout(&output);
+    assert!(text.contains("hooks.Stop [2K [1A: run [31m"), "{text}");
+    assert!(text.contains("apiKeyHelper: key ]0;title "), "{text}");
+    for c in text.chars() {
+        assert!(
+            c == '\n' || !c.is_control(),
+            "control character {c:?} in {text:?}"
+        );
+    }
 }
