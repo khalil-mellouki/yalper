@@ -1,0 +1,52 @@
+# Yalper's own secret rules, for secrets that the vendored gitleaks rules
+# (third_party/gitleaks/gitleaks.toml, kept unchanged) do not catch in hook payloads.
+#
+# Same format as gitleaks: `id`, `description`, `regex` (RE2 syntax, compiled with Unicode off),
+# optional `secretGroup` and `entropy`, and `keywords` (lowercase; the rule only runs when one occurs).
+# Several capture groups in one rule are alternatives for the secret: the first non-empty one is checked
+# and masked. Extra keys: `lettersOnlyAllowlist = true` skips a secret made only of letters, `_`, `.`
+# and `-`, like gitleaks' allowlist on `generic-api-key`; `codeAllowlist = true` skips a secret that
+# looks like code (see `looks_like_code` in `src/redact.rs`). `build.rs` appends these rules to gitleaks'.
+
+[[rules]]
+id = "yalper-private-key-partial"
+description = "A private key block cut off before its END line (for example by `head -n 7 id_rsa`): a BEGIN line, up to 4 header lines (Proc-Type: and DEK-Info: in encrypted PEM, Version: and Comment: in PGP), then at least 40 base64 characters, with spaces or real or escaped newlines in between; masked to the END line or the end of the text."
+regex = '''(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----(?:[ \t]|\r?\n|\\r|\\n)*(?:[A-Z][A-Z0-9-]{0,40}:[^\r\n\\]{0,200}(?:\r?\n|(?:\\r)?\\n)(?:[ \t]|\r?\n|\\r|\\n)*){0,4}[A-Z0-9+/=]{40}(?s:.)*?(?:-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----|\z)'''
+keywords = ["-----begin"]
+
+[[rules]]
+id = "yalper-url-password"
+description = "The password in a URL's user info, as in postgres://admin:password@db or redis://:password@cache, up to the last @ before the host. Only the password is masked."
+regex = '''(?i)\b[a-z][a-z0-9+.-]{1,30}://[^\s:/?#@'"\x60]*:([^\s/?#'"\x60]{1,256})@'''
+keywords = ["://"]
+
+[[rules]]
+id = "yalper-password-assignment"
+description = "A value assigned to a name containing pass or pwd (DB_PASS=, DB_PWD=), which generic-api-key only matches as password or passwd. Same shape and checks as generic-api-key."
+regex = '''(?i)[\w.-]{0,50}?(?:pass|pwd)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)'''
+entropy = 3.5
+keywords = ["pass", "pwd"]
+lettersOnlyAllowlist = true
+
+[[rules]]
+id = "yalper-password-value"
+description = "A password with symbols, which the generic rules do not match: a quoted value, or an unquoted run up to the next whitespace, quote or backtick, assigned to a name containing password, passwd, pass or pwd. Values that look like code (a variable, a call, a member access, a generic type) are skipped by codeAllowlist."
+regex = '''(?i)(?:passw(?:or)?d|pass|pwd)[\w.-]{0,20}[\s'"]{0,3}(?:=|:{1,3}=|:|=>|\?=)[ \t]*(?:"([^"\r\n]{8,150})"|'([^'\r\n]{8,150})'|([^\s'"\x60]{8,150})(?:[\s'"\x60]|$))'''
+entropy = 3
+keywords = ["pass", "pwd"]
+lettersOnlyAllowlist = true
+codeAllowlist = true
+
+[[rules]]
+id = "yalper-bearer-token"
+description = "A token after Bearer, as in an Authorization header."
+regex = '''(?i)\bbearer[ \t]+([\w.~+/-]{10,}=*)'''
+entropy = 3
+keywords = ["bearer"]
+lettersOnlyAllowlist = true
+
+[[rules]]
+id = "yalper-cli-password"
+description = "A password on a command line, only where the command makes it unambiguous: mysql or mariadb -p<password>, sshpass -p, docker, podman or helm login -p or --password, --password <8 or more characters>, and \"--password\", \"<value>\" in an argument array."
+regex = '''\b(?i:mysql|mariadb)[a-z]*\b[^\n|;&]{0,200}?[ \t]-p['"]?([^\s'"\x60;|&]+)|\bsshpass\b[^\n|;&]{0,100}?[ \t]-p[ \t]*['"]?([^\s'"\x60;|&]+)|\b(?i:docker|podman|helm)[ \t]+(?:registry[ \t]+)?login\b[^\n|;&]{0,200}?[ \t](?:-p|--password)(?:[ \t]+|=)['"]?([^\s'"\x60;|&]+)|--password(?:[ \t]+|=)([^\s'"\x60;|&$-][^\s'"\x60;|&]{7,})|"--password"[ \t]*,[ \t]*"([^"]{1,256})"'''
+keywords = ["mysql", "mariadb", "sshpass", "login", "--password"]

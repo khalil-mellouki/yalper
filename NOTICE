@@ -3,3 +3,11 @@ Copyright 2026 Khalil Mellouki and the Yalper contributors
 
 This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for details.
+
+This product includes the secret detection rules of gitleaks
+(https://github.com/gitleaks/gitleaks), version 8.30.1, file config/gitleaks.toml,
+in crates/yalper/third_party/gitleaks/. They are licensed under the MIT License:
+
+    Copyright (c) 2019 Zachary Rice
+
+The full license text is in crates/yalper/third_party/gitleaks/LICENSE.
