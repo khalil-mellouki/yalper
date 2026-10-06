@@ -12,9 +12,11 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aho-corasick.workspace = true
 clap.workspace = true
 gix.workspace = true
 ignore.workspace = true
+regex-automata.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 
@@ -27,6 +29,9 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # variable `YALPER_BENCH_SNAPSHOT` makes `yalper hook` take a snapshot. Never enabled in released binaries.
 bench-snapshot = []
 
+[build-dependencies]
+toml.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
@@ -37,6 +42,10 @@ required-features = ["bench-snapshot"]
 
 [[bench]]
 name = "shadow_store"
+harness = false
+
+[[bench]]
+name = "redact"
 harness = false
 
 [lints]
