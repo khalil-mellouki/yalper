@@ -190,6 +190,8 @@ fn a_project_that_was_never_set_up_is_left_alone() {
     let mut lines = exclude(&git_dir);
     lines.push_str(".yalper/\n.claude/settings.local.json\n");
     fs::write(git_dir.join("info").join("exclude"), lines).unwrap();
+    // An empty folder is no sign of Yalper either (init uses it like a missing one).
+    fs::create_dir(root.join(YALPER_DIR)).unwrap();
     let before = files(root);
 
     for args in [&["uninstall"][..], &["uninstall", "--purge"]] {
@@ -203,6 +205,52 @@ fn a_project_that_was_never_set_up_is_left_alone() {
             "{args:?}"
         );
         assert_eq!(files(root), before, "{args:?}");
+        assert!(root.join(YALPER_DIR).is_dir(), "{args:?}");
+    }
+}
+
+#[test]
+fn a_yalper_dir_deleted_by_hand_takes_its_token_and_exclude_line_with_it() {
+    let repo = repository();
+    let root = repo.path();
+    let before = files(root);
+    run(root, &["init"]);
+    fs::remove_dir_all(root.join(YALPER_DIR)).unwrap();
+
+    let text = run(root, &["uninstall"]);
+    assert!(text.contains("  Init token: removed"), "{text}");
+    assert!(
+        text.contains("  Git exclude: removed .yalper/, .claude/settings.local.json\n"),
+        "{text}"
+    );
+    assert_eq!(files(root), before);
+}
+
+#[test]
+fn an_interrupted_purge_is_finished_by_running_it_again() {
+    // What a purge stopped by a file in use leaves: `id` alone (deleted last), or an empty folder.
+    for keep_id in [true, false] {
+        let repo = repository();
+        let root = repo.path();
+        let before = files(root);
+        run(root, &["init"]);
+        run(root, &["uninstall"]);
+        for entry in fs::read_dir(root.join(YALPER_DIR)).unwrap() {
+            let path = entry.unwrap().path();
+            if !(keep_id && path.ends_with(ID_FILE)) {
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+
+        let text = run(root, &["uninstall", "--purge"]);
+        assert!(text.contains("  .yalper/: deleted"), "{keep_id}: {text}");
+        assert!(text.contains("  Init token: removed"), "{keep_id}: {text}");
+        assert!(!root.join(YALPER_DIR).exists(), "{keep_id}");
+        assert_eq!(files(root), before, "{keep_id}");
     }
 }
 
@@ -280,9 +328,39 @@ fn purge_never_follows_a_link() {
     assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
 }
 
+#[test]
+fn a_linked_claude_folder_is_skipped() {
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("settings.local.json");
+    let hooks = r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/yalper", "args": ["hook"]}]}]}}"#;
+    fs::write(&target, hooks).unwrap();
+
+    // Never set up: nothing to do.
+    let repo = repository();
+    let root = repo.path();
+    link_dir(outside.path(), &root.join(".claude"));
+    let text = run(root, &["uninstall"]);
+    assert!(text.contains("not set up"), "{text}");
+
+    // Set up, then `.claude` replaced by a link: the rest is still removed.
+    let repo = repository();
+    let root = repo.path();
+    run(root, &["init"]);
+    fs::remove_dir_all(root.join(".claude")).unwrap();
+    link_dir(outside.path(), &root.join(".claude"));
+    let text = run(root, &["uninstall", "--purge"]);
+    assert!(
+        text.contains("  Claude Code hooks: .claude/settings.local.json skipped"),
+        "{text}"
+    );
+    assert!(text.contains("  .yalper/: deleted"), "{text}");
+    assert!(!root.join(YALPER_DIR).exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), hooks);
+}
+
 #[cfg(unix)]
 #[test]
-fn a_linked_settings_file_or_exclude_file_is_refused() {
+fn a_linked_settings_file_is_skipped_and_a_linked_exclude_file_refused() {
     let outside = tempfile::tempdir().unwrap();
     let target = outside.path().join("target");
     fs::write(&target, "{}").unwrap();
@@ -292,8 +370,13 @@ fn a_linked_settings_file_or_exclude_file_is_refused() {
     run(root, &["init"]);
     fs::remove_file(settings_path(root)).unwrap();
     std::os::unix::fs::symlink(&target, settings_path(root)).unwrap();
-    let message = fails(root, &["uninstall"]);
-    assert!(message.contains("not a regular file"), "{message}");
+    let text = run(root, &["uninstall"]);
+    assert!(text.contains("settings.local.json skipped"), "{text}");
+    assert!(
+        fs::symlink_metadata(settings_path(root))
+            .unwrap()
+            .is_symlink()
+    );
     assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
 
     let repo = repository();
@@ -311,8 +394,8 @@ fn a_linked_settings_file_or_exclude_file_is_refused() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
 }
 
-#[test]
-fn a_linked_worktree_is_removed_alone_and_keeps_the_shared_exclude_lines() {
+/// A repository with one commit and a linked worktree at `<parent>/wt`: (main, parent, worktree).
+fn with_worktree() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let main = repository();
     git(main.path(), &["add", "main.rs"]);
     git(main.path(), &["commit", "--quiet", "-m", "first"]);
@@ -322,6 +405,30 @@ fn a_linked_worktree_is_removed_alone_and_keeps_the_shared_exclude_lines() {
         main.path(),
         &["worktree", "add", "--quiet", worktree.to_str().unwrap()],
     );
+    (main, parent, worktree)
+}
+
+#[test]
+fn a_worktree_alone_set_up_removes_its_yalper_exclude_line() {
+    let (main, _parent, worktree) = with_worktree();
+    let exclude_before = exclude(&main.path().join(".git"));
+    run(&worktree, &["init"]);
+
+    let text = run(&worktree, &["uninstall", "--purge"]);
+    assert!(text.contains("  Git exclude: removed .yalper/\n"), "{text}");
+    assert!(
+        text.contains("  Git exclude: kept .claude/settings.local.json (other worktrees"),
+        "{text}"
+    );
+    assert_eq!(
+        exclude(&main.path().join(".git")),
+        exclude_before + ".claude/settings.local.json\n"
+    );
+}
+
+#[test]
+fn a_linked_worktree_is_removed_alone_and_keeps_the_shared_exclude_lines() {
+    let (main, _parent, worktree) = with_worktree();
     let worktree_git_dir = main.path().join(".git").join("worktrees").join("wt");
     run(main.path(), &["init"]);
     run(&worktree, &["init"]);
@@ -350,4 +457,65 @@ fn a_linked_worktree_is_removed_alone_and_keeps_the_shared_exclude_lines() {
     let text = run(&worktree, &["uninstall", "--purge"]);
     assert!(text.contains("nothing to remove"), "{text}");
     assert_eq!(files(&worktree), before);
+}
+
+#[test]
+fn a_git_file_naming_another_repository_is_refused() {
+    let (main, _parent, worktree) = with_worktree();
+    run(main.path(), &["init"]);
+    run(&worktree, &["init"]);
+    let main_git = main.path().join(".git");
+    let before = files(&main_git);
+
+    // A folder whose `.git` file names another repository's git directory, or another worktree's.
+    for target in [main_git.clone(), main_git.join("worktrees").join("wt")] {
+        let folder = tempfile::tempdir().unwrap();
+        fs::write(
+            folder.path().join(".git"),
+            format!("gitdir: {}\n", target.display()),
+        )
+        .unwrap();
+        for args in [&["uninstall", "--purge"][..], &["init"]] {
+            let message = fails(folder.path(), args);
+            assert!(
+                message.contains("does not name this folder back"),
+                "{message}"
+            );
+            assert!(message.contains("Nothing was changed"), "{message}");
+        }
+        assert_eq!(files(&main_git), before, "{}", target.display());
+        assert_eq!(fs::read_dir(folder.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn a_submodule_is_set_up_and_removed_in_its_own_git_dir() {
+    let library = repository();
+    git(library.path(), &["add", "main.rs"]);
+    git(library.path(), &["commit", "--quiet", "-m", "first"]);
+    let app = repository();
+    let source = library.path().to_str().unwrap().replace('\\', "/");
+    git(
+        app.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            &source,
+            "lib",
+        ],
+    );
+    let submodule = app.path().join("lib");
+    let git_dir = app.path().join(".git").join("modules").join("lib");
+
+    run(&submodule, &["init"]);
+    assert!(git_dir.join(GIT_ID_FILE).exists());
+    assert!(exclude(&git_dir).contains("\n.yalper/\n"));
+    let text = run(&submodule, &["uninstall", "--purge"]);
+    assert!(text.contains("  .yalper/: deleted"), "{text}");
+    assert!(!git_dir.join(GIT_ID_FILE).exists());
+    assert!(!exclude(&git_dir).contains(".yalper/"));
+    assert!(!app.path().join(YALPER_DIR).exists());
 }

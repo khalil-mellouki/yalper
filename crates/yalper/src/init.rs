@@ -193,6 +193,16 @@ impl Repository {
         let git_dir = repo::git_dir(root)
             .filter(|dir| is_git_dir(dir))
             .ok_or_else(no_git_dir)?;
+        let is_git_file = fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_file());
+        if is_git_file && !repo::git_dir_links_back(root, &git_dir) {
+            return Err(format!(
+                "the .git file of {} points to {}, a git directory that does not name this folder back (it \
+                 is not this folder's worktree or submodule git directory), so Yalper will not use it. \
+                 Nothing was changed.",
+                root.display(),
+                git_dir.display()
+            ));
+        }
         let common_dir = repo::git_common_dir(root)
             .filter(|dir| is_git_dir(dir))
             .ok_or_else(no_git_dir)?;

@@ -28,6 +28,9 @@ pub const TOKEN_HEX_DIGITS: usize = 32;
 /// The `.git` file of a linked worktree or submodule holds one short line.
 const MAX_GIT_FILE_BYTES: u64 = 4096;
 
+/// A git directory's `config` or `gitdir` file larger than this is not read.
+const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
+
 /// A token file is never larger than this.
 const MAX_TOKEN_FILE_BYTES: u64 = 64;
 
@@ -107,6 +110,44 @@ pub fn git_common_dir(root: &Path) -> Option<PathBuf> {
         Some(common) => Some(git_dir.join(String::from_utf8(common).ok()?.trim())),
         None => Some(git_dir),
     }
+}
+
+/// Whether `git_dir`, the git directory that the `.git` file of `root` names, names `root` back: a linked
+/// worktree's git directory has a `gitdir` file naming that `.git` file, and a submodule's git directory has
+/// a `core.worktree` setting naming the folder. Without this check, a `.git` file could make Yalper use (and
+/// `yalper uninstall` clean up) the git directory of another repository.
+pub fn git_dir_links_back(root: &Path, git_dir: &Path) -> bool {
+    let read = |name: &str| {
+        safe_fs::read_small_regular_file(&git_dir.join(name), MAX_GIT_CONFIG_BYTES)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    };
+    let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if let Some(gitdir) = read("gitdir") {
+        return same(&git_dir.join(gitdir.trim()), &root.join(".git"));
+    }
+    read("config")
+        .as_deref()
+        .and_then(core_worktree)
+        .is_some_and(|worktree| same(&git_dir.join(worktree), root))
+}
+
+/// The value of `core.worktree` in the git config text `config`, if it is set there.
+fn core_worktree(config: &str) -> Option<&str> {
+    let mut in_core = false;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+        } else if in_core
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("worktree")
+        {
+            return Some(value.trim().trim_matches('"'));
+        }
+    }
+    None
 }
 
 /// A `.yalper/` directory that `yalper init` created for its repository, open, with its init token.
@@ -309,6 +350,32 @@ mod tests {
             Some(worktree_git_dir.join("../.."))
         );
         assert!(initialized(worktree.path()));
+    }
+
+    #[test]
+    fn core_worktree_is_read_from_the_core_section_only() {
+        let config =
+            "[core]\n\tbare = false\n\tWorktree = \"../../../sub\"\n[other]\n\tworktree = x\n";
+        assert_eq!(core_worktree(config), Some("../../../sub"));
+        assert_eq!(core_worktree("[other]\n\tworktree = x\n"), None);
+        assert_eq!(core_worktree("[core]\n\tbare = false\n"), None);
+    }
+
+    #[test]
+    fn a_git_file_must_be_named_back_by_its_git_dir() {
+        let other = project(None, None);
+        let root = tempfile::tempdir().unwrap();
+        let other_git = other.path().join(".git");
+        assert!(!git_dir_links_back(root.path(), &other_git));
+        fs::write(other_git.join("gitdir"), "/somewhere/else/.git\n").unwrap();
+        assert!(!git_dir_links_back(root.path(), &other_git));
+        fs::write(
+            other_git.join("gitdir"),
+            format!("{}\n", root.path().join(".git").display()),
+        )
+        .unwrap();
+        fs::write(root.path().join(".git"), "gitdir: x\n").unwrap();
+        assert!(git_dir_links_back(root.path(), &other_git));
     }
 
     #[cfg(unix)]

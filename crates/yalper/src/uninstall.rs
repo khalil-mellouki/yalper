@@ -51,17 +51,22 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
         format!("cannot update the git exclude file: {error}. Nothing was changed.")
     })?;
     let token_path = repository.git_dir.join(GIT_ID_FILE);
-    // Without any of these, the project was never set up (or is already cleaned up): the exclude lines are
-    // then the user's own and are left alone.
-    let was_set_up = settings != Settings::Unchanged
-        || matches!(yalper, Yalper::Ours | Yalper::Empty)
-        || fs::symlink_metadata(&token_path).is_ok();
+    let removes_hooks = matches!(settings, Settings::Updated(_) | Settings::Emptied);
+    // Without either, the project was never set up (or is already cleaned up): an empty `.yalper/` and the
+    // exclude lines are then the user's own and are left alone.
+    let was_set_up = removes_hooks || fs::symlink_metadata(&token_path).is_ok();
+    let recordings_kept = !purge && matches!(yalper, Yalper::Ours(_));
 
     // What was done, and whether anything changed: a line saying what was kept is not a change.
     let mut report = Vec::new();
-    let mut changed = settings != Settings::Unchanged;
+    let mut changed = removes_hooks;
     match settings {
         Settings::Unchanged => {}
+        Settings::Skipped => report.push(
+            "  Claude Code hooks: .claude/settings.local.json skipped (a link, or not a regular file and \
+             folder: yalper init never writes there)"
+                .to_owned(),
+        ),
         Settings::Updated(text) => {
             let existing = fs::symlink_metadata(&settings_path).ok();
             replace_file(&settings_path, text.as_bytes(), existing.as_ref())
@@ -81,25 +86,33 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
         }
     }
 
-    match (&yalper, purge) {
-        (Yalper::Missing, _) => {}
-        (Yalper::Ours | Yalper::Empty, true) => {
-            delete_yalper_dir(&yalper_path).map_err(|error| {
-                format!(
-                    "cannot delete {}: {error}. Close the Claude Code sessions running in this project \
-                     and run `yalper uninstall --purge` again.",
-                    yalper_path.display()
-                )
-            })?;
+    let failed_to_delete = |error: io::Error| {
+        format!(
+            "cannot delete {}: {error}. Close the Claude Code sessions running in this project and run \
+             `yalper uninstall --purge` again.",
+            yalper_path.display()
+        )
+    };
+    match yalper {
+        // `yalper init` uses an empty folder like a missing one.
+        Yalper::Missing | Yalper::Empty => {}
+        Yalper::Ours(dir) if purge => {
+            delete_yalper_dir(dir).map_err(failed_to_delete)?;
             report.push("  .yalper/: deleted".to_owned());
             changed = true;
         }
-        (Yalper::Ours, false) => report.push(
+        Yalper::Ours(_) => report.push(
             "  .yalper/: kept, with your recordings (`yalper uninstall --purge` deletes them)"
                 .to_owned(),
         ),
         // With `purge`, a foreign one was refused above.
-        (Yalper::Empty | Yalper::Foreign(_), _) => report.push("  .yalper/: kept".to_owned()),
+        Yalper::Foreign(_) => report.push("  .yalper/: kept".to_owned()),
+    }
+    // What an interrupted purge leaves behind, once its `id` was deleted.
+    if purge && was_set_up && matches!(inspect(root, &yalper_path), Yalper::Empty) {
+        fs::remove_dir(&yalper_path).map_err(failed_to_delete)?;
+        report.push("  .yalper/: deleted (it was empty)".to_owned());
+        changed = true;
     }
 
     // The token binds `.yalper/` to the repository: it goes when `.yalper/` is gone.
@@ -112,28 +125,34 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
     }
 
     if was_set_up {
-        let unneeded: Vec<&str> = EXCLUDE_LINES
+        let unneeded = EXCLUDE_LINES
             .into_iter()
-            .filter(|line| fs::symlink_metadata(root.join(line.trim_end_matches('/'))).is_err())
-            .collect();
-        match remove_exclude_lines(&repository, &exclude_path, &unneeded)? {
-            Exclude::Unchanged => {}
-            Exclude::Removed(lines) => {
-                report.push(format!("  Git exclude: removed {}", lines.join(", ")));
-                changed = true;
-            }
-            Exclude::Shared(lines) => report.push(format!(
+            .filter(|line| fs::symlink_metadata(root.join(line.trim_end_matches('/'))).is_err());
+        // Other worktrees read the same exclude file. `.yalper/` stays excluded while one of them is set up;
+        // their settings files are not looked for, so that line stays.
+        let shared = shares_exclude_file(&repository);
+        let other_set_up = shared && another_worktree_is_set_up(&repository);
+        let (remove, keep): (Vec<&str>, Vec<&str>) = unneeded.partition(|line| {
+            !shared || (line.trim_end_matches('/') == YALPER_DIR && !other_set_up)
+        });
+        let (removed, kept) = remove_exclude_lines(&exclude_path, &remove, &keep)?;
+        if !removed.is_empty() {
+            report.push(format!("  Git exclude: removed {}", removed.join(", ")));
+            changed = true;
+        }
+        if !kept.is_empty() {
+            report.push(format!(
                 "  Git exclude: kept {} (other worktrees of this repository share the exclude file; \
                  remove the lines by hand once none of them uses Yalper)",
-                lines.join(", ")
-            )),
+                kept.join(", ")
+            ));
         }
     }
 
     if !changed {
         say(
             out,
-            &if matches!(yalper, Yalper::Ours) {
+            &if recordings_kept {
                 format!(
                     "Yalper's hooks are not registered in {}, nothing to remove. Recordings are kept in \
                      .yalper/ (`yalper uninstall --purge` deletes them).",
@@ -157,13 +176,13 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
 }
 
 /// What is at `.yalper/`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Yalper {
     Missing,
     /// An empty folder (git never creates one, so a clone cannot plant it).
     Empty,
-    /// A folder `yalper init` created for this repository: its init token matches.
-    Ours,
+    /// A folder `yalper init` created for this repository (its init token matches), held open.
+    Ours(OwnedDir),
     /// Anything else, with the reason it is not Yalper's to delete.
     Foreign(String),
 }
@@ -187,17 +206,20 @@ fn inspect(root: &Path, path: &Path) -> Yalper {
     // Who may write to it does not matter here (`repo::open_yalper_dir` checks that for recording), only
     // where it comes from.
     match OwnedDir::open(path) {
-        Ok(dir) if repo::init_token(root, &dir).is_some() => Yalper::Ours,
+        Ok(dir) if repo::init_token(root, &dir).is_some() => Yalper::Ours(dir),
         Ok(_) => Yalper::Foreign(Refusal::TokenMismatch.to_string()),
         Err(error) => Yalper::Foreign(error.to_string()),
     }
 }
 
-/// Deletes the `.yalper/` folder at `path` without following any link inside it. Its `id` file goes last:
+/// Deletes the `.yalper/` folder `dir` without following any link inside it. The folder is held open and
+/// checked to still be at its path first (see [`OwnedDir::check_still_at_path`]). Its `id` file goes last:
 /// if a file in use stops the deletion halfway (Windows), the folder still carries its init token, so
 /// running `yalper uninstall --purge` again recognizes it and finishes the job.
-fn delete_yalper_dir(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
+fn delete_yalper_dir(dir: OwnedDir) -> io::Result<()> {
+    dir.check_still_at_path()?;
+    let path = dir.path().to_owned();
+    for entry in fs::read_dir(&path)? {
         let entry = entry?;
         if entry.file_name() != ID_FILE {
             init::remove(&entry.path())?;
@@ -207,43 +229,32 @@ fn delete_yalper_dir(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
     }
+    // On Windows the held handle stops the folder itself from being deleted.
+    drop(dir);
     fs::remove_dir(path)
 }
 
-/// What [`remove_exclude_lines`] did.
-enum Exclude<'a> {
-    /// None of the lines is in the file.
-    Unchanged,
-    /// These lines were removed.
-    Removed(Vec<&'a str>),
-    /// These lines were kept, because other worktrees read the same exclude file.
-    Shared(Vec<&'a str>),
-}
-
-/// Removes from the exclude file at `path` every line that is exactly one of `lines` (as `yalper init` writes
-/// them). The exclude file is shared by every worktree of the repository, and another one may still need
-/// them: then they are kept.
+/// Removes from the exclude file at `path` every line that is exactly one of `remove` (as `yalper init`
+/// writes them). Returns the lines of `remove` that were removed and the lines of `keep` that are in the
+/// file.
 fn remove_exclude_lines<'a>(
-    repository: &Repository,
     path: &Path,
-    lines: &[&'a str],
-) -> Result<Exclude<'a>, String> {
+    remove: &[&'a str],
+    keep: &[&'a str],
+) -> Result<(Vec<&'a str>, Vec<&'a str>), String> {
     let failed = |error: io::Error| format!("cannot update the git exclude file: {error}");
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Exclude::Unchanged),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(failed(error)),
     };
-    let (kept, found) = without_lines(&bytes, lines);
-    if found.is_empty() {
-        return Ok(Exclude::Unchanged);
+    let (rest, removed) = without_lines(&bytes, remove);
+    let (_, kept) = without_lines(&bytes, keep);
+    if !removed.is_empty() {
+        let existing = fs::symlink_metadata(path).ok();
+        replace_file(path, &rest, existing.as_ref()).map_err(failed)?;
     }
-    if shares_exclude_file(repository) {
-        return Ok(Exclude::Shared(found));
-    }
-    let existing = fs::symlink_metadata(path).ok();
-    replace_file(path, &kept, existing.as_ref()).map_err(failed)?;
-    Ok(Exclude::Removed(found))
+    Ok((removed, kept))
 }
 
 /// `text` without the lines that are exactly one of `lines` (a line ending in `\r\n` counts too), and the
@@ -275,11 +286,26 @@ fn shares_exclude_file(repository: &Repository) -> bool {
             .is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// Whether a git directory of the repository (the common one or a linked worktree's) holds an init token.
+/// Called once this worktree's own token is gone, so any token found is another worktree's.
+fn another_worktree_is_set_up(repository: &Repository) -> bool {
+    let worktrees = fs::read_dir(repository.common_dir.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path());
+    std::iter::once(repository.common_dir.clone())
+        .chain(worktrees)
+        .any(|git_dir| fs::symlink_metadata(git_dir.join(GIT_ID_FILE)).is_ok())
+}
+
 /// What removing the hooks does to the settings file.
 #[derive(Debug, PartialEq, Eq)]
 enum Settings {
     /// There is no file, or no registration of Yalper's in it.
     Unchanged,
+    /// `.claude` or the file is a link or of another kind: `yalper init` never writes there.
+    Skipped,
     /// The new content of the file.
     Updated(String),
     /// Nothing is left in the file: it is deleted.
@@ -289,6 +315,13 @@ enum Settings {
 /// Reads the settings file at `path` (if it exists) and removes Yalper's hooks from it, see
 /// [`unregister_hooks`]. A leading byte order mark is kept.
 fn unregistered_settings(path: &Path) -> Result<Settings, String> {
+    let claude_dir = path.parent().unwrap_or(path);
+    let other_kind = |path: &Path, is_expected: fn(&fs::Metadata) -> bool| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| !is_expected(&metadata))
+    };
+    if other_kind(claude_dir, fs::Metadata::is_dir) || other_kind(path, fs::Metadata::is_file) {
+        return Ok(Settings::Skipped);
+    }
     let Some(text) = init::read_settings(path)? else {
         return Ok(Settings::Unchanged);
     };
@@ -314,6 +347,10 @@ fn unregistered_settings(path: &Path) -> Result<Settings, String> {
 /// removed with them, then an event array left empty by that, then a `hooks` object left empty. Every other
 /// key, group and handler is kept as it is, in its order, empty or not. The result is formatted like
 /// `yalper init` writes it.
+///
+/// An event array or `hooks` object that was already empty before `yalper init` added to it is removed too:
+/// without stored state it cannot be told apart from one init created, and Claude Code treats an empty and
+/// a missing one alike.
 fn unregister_hooks(text: &str) -> Result<Settings, String> {
     let mut settings: Value =
         serde_json::from_str(text).map_err(|error| format!("it is not valid JSON ({error})"))?;
