@@ -1,0 +1,17 @@
+[package]
+name = "yalper"
+description = "Record, replay, and debug AI coding agent sessions."
+readme = "../../README.md"
+keywords = ["ai-agents", "claude-code", "debugging", "bisect", "replay"]
+categories = ["development-tools", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true
