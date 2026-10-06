@@ -21,7 +21,7 @@ use super::excludes::Excludes;
 use super::{Change, FileKind, Result, ShadowStore, validate_path};
 use crate::hook::YALPER_DIR;
 use crate::repo::Token;
-use crate::safe_fs::{self, OwnedDir};
+use crate::safe_fs::{self, Access, OwnedDir};
 use crate::store::{CachedFile, FileCache, Store, WriterLock};
 
 /// Files larger than this are left out of snapshots.
@@ -34,6 +34,12 @@ pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// one tick before that start, and a file changed and changed again within one tick has an mtime at most two
 /// ticks before it. 100 ms is three times that. A wider window costs time on every step: each file changed
 /// within it is read again (measured: about 3 ms per step on Windows with 2 s and steps 30 ms apart).
+///
+/// The start of the scan is read from the file system's own clock, like git compares with its index file's
+/// mtime: the scan writes [`SCAN_CLOCK_FILE`] and takes its mtime. A network share, WSL's `/mnt/c` or a Docker
+/// Desktop bind mount can stamp mtimes with a clock that differs from the local one by seconds; the project and
+/// `.yalper/` are stamped by the same one. Only a folder mounted inside the project from another file system
+/// could still be skewed.
 const RACY_WINDOW: Duration = Duration::from_millis(100);
 
 /// The racy window for an mtime that is a whole number of seconds, as file systems that keep whole or even
@@ -49,6 +55,18 @@ fn is_racy(mtime_ns: i64, started_ns: i64) -> bool {
         RACY_WINDOW
     };
     mtime_ns >= started_ns.saturating_sub(window.as_nanos() as i64)
+}
+
+/// The file in `.yalper/` whose mtime gives the start of a scan (see [`RACY_WINDOW`]).
+const SCAN_CLOCK_FILE: &str = "scan-clock";
+
+/// The time on the file system's clock, in nanoseconds since the Unix epoch: the mtime of [`SCAN_CLOCK_FILE`]
+/// right after writing to it.
+fn scan_clock(yalper_dir: &OwnedDir) -> io::Result<i64> {
+    use std::io::Write as _;
+    let mut file = yalper_dir.open_file(SCAN_CLOCK_FILE, Access::ReadWrite)?;
+    file.write_all(b"x")?;
+    Ok(nanos_since_epoch(file.metadata()?.modified()?))
 }
 
 /// Threads of the directory walk. Listing directories is mostly waiting on the file system, so a few threads
@@ -330,8 +348,7 @@ pub fn take(
     let shadow = ShadowStore::open(yalper_dir, token)?;
     let base =
         base().ok_or_else(|| io::Error::other("the snapshot was given up before it started"))?;
-    let started_ns = nanos_since_epoch(SystemTime::now());
-    let started_ms = started_ns / 1_000_000;
+    let started_ms = nanos_since_epoch(SystemTime::now()) / 1_000_000;
     if let Some(over_budget) = &base.over_budget
         && over_budget.still_holds(started_ms)
     {
@@ -343,6 +360,9 @@ pub fn take(
             remember: None,
         });
     }
+
+    // The local clock if the file system's cannot be read.
+    let started_ns = scan_clock(yalper_dir).unwrap_or(started_ms.saturating_mul(1_000_000));
 
     // Without a usable cache, the snapshot starts over from the empty tree and every file is read.
     let previous = base.cache.and_then(check_cache);
@@ -1060,6 +1080,20 @@ mod tests {
         let cache = project.store.file_cache().unwrap().unwrap();
         assert!(!cache.files[0].racy, "{cache:?}");
         assert_eq!(project.snapshot().files_read, 0);
+    }
+
+    #[test]
+    fn the_scan_clock_is_the_file_systems() {
+        let project = Project::new();
+        let local = nanos_since_epoch(SystemTime::now());
+        let clock = scan_clock(&project.yalper).unwrap();
+        // On a local disk both clocks agree, up to the file system's timestamp tick.
+        assert!((clock - local).abs() < 5_000_000_000, "{clock} {local}");
+        assert!(scan_clock(&project.yalper).unwrap() >= clock);
+        assert_eq!(
+            fs::read(project.yalper.path().join(SCAN_CLOCK_FILE)).unwrap(),
+            b"x"
+        );
     }
 
     #[test]

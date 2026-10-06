@@ -1,17 +1,19 @@
 //! The event log: one SQLite database per project, `.yalper/yalper.db`.
 //!
-//! Hook processes can run at the same time (parallel tool calls), so every write is made while holding the
+//! Hook processes can run at the same time (parallel tool calls). Each records its step in one write transaction
+//! ([`Store::write_transaction`]), which SQLite runs one at a time, and a hook that saves a snapshot also holds the
 //! [`WriterLock`], taken after opening the store. SQLite runs in WAL mode, so readers such as `yalper log`
 //! never take the lock (except for a moment if the database still has to be created) and are not blocked by
 //! a writer.
 
 mod lock;
 
+use std::cell::Cell;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
@@ -30,6 +32,14 @@ const WAL_FILE: &str = "yalper.db-wal";
 
 /// Files SQLite creates next to the database while it works.
 const DATABASE_SIDE_FILES: [&str; 3] = [WAL_FILE, "yalper.db-shm", "yalper.db-journal"];
+
+/// Long reads and writes check the deadline (see [`Store::set_deadline`]) once per this many rows: about 4 ms
+/// of work on the user's machine.
+const ROWS_PER_DEADLINE_CHECK: usize = 4096;
+
+/// The shortest a writer waits for another one under a deadline (see [`Store::write_transaction`]): Yalper's
+/// own write transactions take milliseconds, so a step is not dropped because the deadline already passed.
+const MIN_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// When the WAL is larger than this as a connection closes, it is copied into the database and emptied.
 const WAL_TRUNCATE_BYTES: u64 = 256 * 1024;
@@ -204,6 +214,8 @@ pub enum Error {
         found: u32,
         known: u32,
     },
+    /// The deadline set with [`Store::set_deadline`] passed during a long read or write.
+    DeadlinePassed,
 }
 
 impl fmt::Display for Error {
@@ -230,6 +242,10 @@ impl fmt::Display for Error {
                 f,
                 "the database is missing or empty: run `yalper init` first"
             ),
+            Self::DeadlinePassed => write!(
+                f,
+                "the deadline passed while reading or writing the stat cache"
+            ),
             Self::OlderSchema { found, known } => write!(
                 f,
                 "the database has schema version {found}, older than this Yalper's version {known}: run \
@@ -248,7 +264,8 @@ impl std::error::Error for Error {
             | Self::UnexpectedSchema
             | Self::ForeignDatabase
             | Self::MissingSchema
-            | Self::OlderSchema { .. } => None,
+            | Self::OlderSchema { .. }
+            | Self::DeadlinePassed => None,
         }
     }
 }
@@ -274,6 +291,8 @@ pub struct Store {
     /// The WAL to empty once it is large, when the store closes. `None` for a reader, which writes nothing.
     wal_path: Option<PathBuf>,
     token: Token,
+    /// See [`set_deadline`](Self::set_deadline).
+    deadline: Cell<Option<Instant>>,
     /// See [`OwnedDir::guard_path`]: on Windows it keeps the database file from being renamed or deleted.
     _database: PathGuard,
 }
@@ -304,6 +323,7 @@ impl Store {
             conn,
             wal_path: Some(dir.path().join(WAL_FILE)),
             token: token.clone(),
+            deadline: Cell::new(None),
             _database: database,
         })
     }
@@ -341,8 +361,28 @@ impl Store {
             conn,
             wal_path: None,
             token: token.clone(),
+            deadline: Cell::new(None),
             _database: database,
         })
+    }
+
+    /// Makes the reads and writes that can be long (the stat cache) fail with [`Error::DeadlinePassed`] once `deadline`
+    /// passes, and keeps [`write_transaction`](Self::write_transaction) from waiting for other writers much past it.
+    /// `None` (the default) removes the deadline.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        self.deadline.set(deadline);
+    }
+
+    /// Fails with [`Error::DeadlinePassed`] if the deadline passed. Called every [`ROWS_PER_DEADLINE_CHECK`] rows.
+    fn check_deadline(&self, rows: usize) -> Result<()> {
+        match self.deadline.get() {
+            Some(deadline)
+                if rows.is_multiple_of(ROWS_PER_DEADLINE_CHECK) && Instant::now() >= deadline =>
+            {
+                Err(Error::DeadlinePassed)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The init token this database belongs to.
@@ -520,12 +560,19 @@ impl Store {
         let Some(Some(tree_id)) = tree_id else {
             return Ok(None);
         };
-        let files: Option<Vec<CachedFile>> = self
+        let mut statement = self
             .conn
-            .prepare_cached("SELECT path, size, mtime_ns, mode, oid, racy FROM file_cache")?
-            .query_map([], cached_file_from_row)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(files.map(|files| FileCache { tree_id, files }))
+            .prepare_cached("SELECT path, size, mtime_ns, mode, oid, racy FROM file_cache")?;
+        let mut rows = statement.query([])?;
+        let mut files = Vec::new();
+        while let Some(row) = rows.next()? {
+            self.check_deadline(files.len())?;
+            match cached_file_from_row(row)? {
+                Some(file) => files.push(file),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(FileCache { tree_id, files }))
     }
 
     /// Runs `write` in one write transaction, committed if it returns `Ok` and rolled back otherwise. The
@@ -533,12 +580,34 @@ impl Store {
     /// every other writer: a step number read with [`next_step`](Self::next_step) inside it stays free until
     /// the step is inserted, with or without the [`WriterLock`].
     pub fn write_transaction<T>(&self, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Some(deadline) = self.deadline.get() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.conn
+                .busy_timeout(left.clamp(MIN_BUSY_TIMEOUT, LOCK_TIMEOUT))?;
+        }
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // Dropping the transaction on an error rolls it back.
         let value = write()?;
         transaction.commit()?;
         Ok(value)
+    }
+
+    /// Runs `write` inside the current transaction so that, if it fails, only its own changes are undone
+    /// (an SQLite savepoint) and the transaction can go on.
+    pub fn with_savepoint<T>(&self, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT partial")?;
+        match write() {
+            Ok(value) => {
+                self.conn.execute_batch("RELEASE partial")?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO partial; RELEASE partial")?;
+                Err(error)
+            }
+        }
     }
 
     /// A value of the `meta` table, or `None` if it is missing or not text.
@@ -607,7 +676,8 @@ impl Store {
                 "INSERT OR REPLACE INTO file_cache (path, size, mtime_ns, mode, oid, racy)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for file in changed {
+            for (index, file) in changed.iter().enumerate() {
+                self.check_deadline(index)?;
                 upsert.execute(params![
                     file.path,
                     file.size,
@@ -618,7 +688,8 @@ impl Store {
                 ])?;
             }
             let mut delete = conn.prepare_cached("DELETE FROM file_cache WHERE path = ?1")?;
-            for path in removed {
+            for (index, path) in removed.iter().enumerate() {
+                self.check_deadline(index)?;
                 delete.execute([path])?;
             }
             conn.prepare_cached(
@@ -932,6 +1003,45 @@ mod tests {
 
     fn token() -> Token {
         Token::parse("0123456789abcdef0123456789abcdef").unwrap()
+    }
+
+    #[test]
+    fn a_large_stat_cache_is_read_and_saved_only_until_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        let lock = WriterLock::acquire(&owned, LOCK_TIMEOUT).unwrap();
+        let rows: Vec<CachedFile> = (0..3 * ROWS_PER_DEADLINE_CHECK)
+            .map(|index| cached(&format!("dir/file{index}.rs"), "aa"))
+            .collect();
+        store
+            .save_snapshot(&lock, "tree", &rows, &[], true)
+            .unwrap();
+
+        store.set_deadline(Some(Instant::now()));
+        assert!(matches!(store.file_cache(), Err(Error::DeadlinePassed)));
+        // Inside a transaction, a savepoint undoes only the failed save, and the step can still be recorded.
+        let more: Vec<CachedFile> = (0..3 * ROWS_PER_DEADLINE_CHECK)
+            .map(|index| cached(&format!("other/file{index}.rs"), "bb"))
+            .collect();
+        store
+            .write_transaction(|| {
+                let saved =
+                    store.with_savepoint(|| store.save_snapshot(&lock, "tree2", &more, &[], true));
+                assert!(matches!(saved, Err(Error::DeadlinePassed)), "{saved:?}");
+                store.upsert_session(&Session::new("s", 1))
+            })
+            .unwrap();
+        assert_eq!(store.sessions().unwrap().len(), 1);
+
+        store.set_deadline(None);
+        let cache = store.file_cache().unwrap().unwrap();
+        assert_eq!(
+            (cache.tree_id.as_str(), cache.files.len()),
+            ("tree", rows.len())
+        );
+        store.set_deadline(Some(Instant::now() + Duration::from_secs(600)));
+        assert_eq!(store.file_cache().unwrap().unwrap().files.len(), rows.len());
     }
 
     #[test]

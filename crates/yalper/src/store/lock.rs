@@ -1,8 +1,10 @@
-//! `.yalper/lock`: makes hook processes write one at a time.
+//! `.yalper/lock`: makes hook processes take snapshots one at a time.
 //!
-//! Claude Code runs the hooks of parallel tool calls at the same time. Each hook holds this lock for its
-//! whole "snapshot and insert" section, so steps get consistent numbers and snapshots are taken one after
-//! the other.
+//! Claude Code runs the hooks of parallel tool calls at the same time. A hook that takes a snapshot holds this
+//! lock from reading the latest snapshot and stat cache until it has saved the new ones with its step, so each
+//! snapshot is built on the one before. Step numbers do not depend on it: they come from the write transaction
+//! that inserts the step (see `Store::write_transaction`). Hooks without a snapshot (`Stop`, `SessionEnd`) and
+//! hooks that could not get the lock before their deadline record their step without taking it.
 
 use std::fs::{File, TryLockError};
 use std::io;
@@ -14,8 +16,8 @@ use crate::safe_fs::{Access, OwnedDir};
 /// The lock file inside `.yalper/`.
 pub const LOCK_FILE: &str = "lock";
 
-/// How long [`WriterLock::acquire`] waits by default. Hooks hold the lock for milliseconds, so waiting
-/// this long means something is wrong, and the hook gives up instead of keeping the agent waiting.
+/// How long commands such as `yalper init` wait for the lock, and the longest a writer waits for another one in
+/// the database. Hooks wait at most until their snapshot deadline (see `record::DEADLINE`).
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 const MAX_PAUSE: Duration = Duration::from_millis(10);

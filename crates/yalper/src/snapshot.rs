@@ -57,6 +57,12 @@ fn store_config(token: &Token) -> String {
 /// `HEAD` holds one line like `ref: refs/heads/main`; anything larger was not written by Yalper.
 const MAX_HEAD_BYTES: u64 = 256;
 
+/// The most new trees of one snapshot written in parallel, one thread each (see [`ShadowStore::edit_tree`]).
+const MAX_PARALLEL_TREE_WRITES: usize = 8;
+
+/// Leftover temporary object files older than this are deleted by [`ShadowStore::remove_stale_temp_files`].
+const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// The most memory gix may allocate for one object, the same cap as for a hook payload. Files over 10 MiB are
 /// never snapshotted, so a larger object can only come from corruption.
 const ALLOC_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
@@ -333,6 +339,48 @@ impl ShadowStore {
         self.dir.path().join("objects")
     }
 
+    /// Deletes the temporary object files (`objects/xx/tmp_obj_*`) older than an hour: left by hooks stopped
+    /// at their deadline or killed while writing. Returns how many were deleted. Errors are ignored: a file
+    /// that cannot be deleted now can be deleted another time.
+    pub fn remove_stale_temp_files(&self) -> usize {
+        let Ok(fan_outs) = fs::read_dir(self.objects_dir()) else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for fan_out in fan_outs.flatten() {
+            let name = fan_out.file_name();
+            let is_fan_out = name.len() == 2
+                && name
+                    .to_str()
+                    .is_some_and(|name| name.bytes().all(|b| b.is_ascii_hexdigit()));
+            // A link is never followed.
+            if !is_fan_out || !fan_out.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(fan_out.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let stale = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("tmp_obj_"))
+                    && entry.metadata().is_ok_and(|metadata| {
+                        metadata.is_file()
+                            && metadata
+                                .modified()
+                                .ok()
+                                .and_then(|modified| now.duration_since(modified).ok())
+                                .is_some_and(|age| age >= STALE_TEMP_FILE_AGE)
+                    });
+                if stale && fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
     /// The id of the tree with no entries, the base of the first snapshot.
     pub fn empty_tree(&self) -> ObjectId {
         ObjectId::empty_tree(self.repo.object_hash())
@@ -383,9 +431,9 @@ impl ShadowStore {
                     .map_err(gix::Error::from)?;
             }
         }
-        // Each id is known as soon as its tree is encoded, so the new trees are written together at the end, in
-        // parallel: creating a file on Windows is mostly waiting (measured: 4.6 instead of 5.8 ms for the usual
-        // 3 trees of a step).
+        // Each id is known as soon as its tree is encoded, so the new trees are written together at the end: in
+        // parallel when there are only a few, as in a usual step (creating a file on Windows is mostly waiting;
+        // measured: 4.6 instead of 5.8 ms for 3 trees), one by one otherwise (a new folder hierarchy).
         let mut bytes = Vec::new();
         let mut new_trees = Vec::new();
         let tree = editor.write(|tree| {
@@ -397,22 +445,33 @@ impl ShadowStore {
             Ok::<_, Error>(id)
         })?;
         let objects = self.objects_dir();
+        if new_trees.len() > MAX_PARALLEL_TREE_WRITES {
+            for new in &new_trees {
+                persist(&objects, new)?;
+            }
+            return Ok(tree);
+        }
         std::thread::scope(|scope| {
-            let others: Vec<_> = (new_trees.iter().skip(1))
-                .map(|new| scope.spawn(|| persist(&objects, new)))
-                .collect();
-            let first = new_trees
-                .first()
-                .map_or(Ok(()), |new| persist(&objects, new));
-            others
-                .into_iter()
-                .map(|writer| {
+            let mut results = Vec::new();
+            let mut writers = Vec::new();
+            for new in new_trees.iter().skip(1) {
+                match std::thread::Builder::new().spawn_scoped(scope, || persist(&objects, new)) {
+                    Ok(writer) => writers.push(writer),
+                    // No thread available: written here.
+                    Err(_) => results.push(persist(&objects, new)),
+                }
+            }
+            if let Some(first) = new_trees.first() {
+                results.push(persist(&objects, first));
+            }
+            for writer in writers {
+                results.push(
                     writer
                         .join()
-                        .unwrap_or_else(|_| Err(io::Error::other("writing a tree failed")))
-                })
-                .chain([first])
-                .collect::<io::Result<()>>()
+                        .unwrap_or_else(|_| Err(io::Error::other("writing a tree failed"))),
+                );
+            }
+            results.into_iter().collect::<io::Result<()>>()
         })?;
         Ok(tree)
     }
@@ -723,28 +782,49 @@ struct NewObject {
 /// Writes `object` into the object directory `objects`: to a temporary file next to its final name, then
 /// renamed into place. The rename keeps a hook stopped at its deadline from leaving a partial object under a
 /// final name, which later writes of the same content would trust. Like git, the object's directory is created
-/// on demand, and a leftover `tmp_obj_*` file is harmless.
+/// on demand. A temporary file left by a stopped hook is never reused (its name has random bits, and a taken
+/// name is skipped) and is deleted by `yalper init` once it is an hour old (see
+/// [`ShadowStore::remove_stale_temp_files`]).
 fn persist(objects: &Path, object: &NewObject) -> io::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static TEMP_FILES: AtomicU64 = AtomicU64::new(0);
+    const ATTEMPTS: usize = 8;
 
     let hex = object.id.to_string();
     let fan_out = objects.join(&hex[..2]);
-    let temp = fan_out.join(format!(
-        "tmp_obj_{}_{}",
-        std::process::id(),
-        TEMP_FILES.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = match create_object_file(&temp) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match fs::create_dir(&fan_out) {
-                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
-                _ => {}
-            }
-            create_object_file(&temp)?
+    // Checked right before use: the store's layout was checked when it was opened, but the directory could
+    // have been created since, and an object must never be written through a link.
+    match fs::symlink_metadata(&fan_out) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "objects/{} is not a directory",
+                &hex[..2]
+            )));
         }
-        other => other?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(&fan_out) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        },
+        Err(error) => return Err(error),
+    }
+    let mut attempt = 0;
+    let (mut file, temp) = loop {
+        let temp = fan_out.join(format!(
+            "tmp_obj_{:016x}_{}",
+            temp_file_prefix(),
+            TEMP_FILES.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create_object_file(&temp) {
+            Ok(file) => break (file, temp),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists && attempt + 1 < ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
     };
     let written = file.write_all(&object.compressed);
     drop(file);
@@ -763,6 +843,18 @@ fn persist(objects: &Path, object: &NewObject) -> io::Result<()> {
     Ok(())
 }
 
+/// Random bits for the names of this process's temporary object files, so that a process never runs into a
+/// file left by an earlier one (process ids are reused).
+fn temp_file_prefix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // The standard library seeds each `RandomState` from the operating system's random number generator.
+    *PREFIX.get_or_init(|| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    })
+}
 /// Creates a new file for a loose object at `path`, read-only for everyone on Unix as git makes its objects.
 fn create_object_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
@@ -884,6 +976,69 @@ mod tests {
         }
         objects.sort();
         objects
+    }
+
+    #[test]
+    fn many_new_directories_are_written_one_by_one() {
+        let (dir, store) = new_store();
+        // 40 new directories two levels deep: 81 new trees in one edit, more than are written in parallel.
+        let files: Vec<(String, FileKind, String)> = (0..40)
+            .map(|index| (format!("d{index}/sub/f.txt"), Regular, format!("{index}")))
+            .collect();
+        let files: Vec<(&str, FileKind, &str)> = files
+            .iter()
+            .map(|(path, kind, content)| (path.as_str(), *kind, content.as_str()))
+            .collect();
+        let tree = from_scratch(&store, &files);
+        assert_eq!(
+            store
+                .changed_paths(store.empty_tree(), tree)
+                .unwrap()
+                .added
+                .len(),
+            40
+        );
+        assert_eq!(
+            loose_objects(&dir.path().join(SNAPSHOTS_DIR)).len(),
+            40 + 81
+        );
+    }
+
+    #[test]
+    fn stale_temporary_object_files_are_deleted() {
+        let (dir, store) = new_store();
+        let fan_out = dir.path().join(SNAPSHOTS_DIR).join("objects").join("ab");
+        fs::create_dir(&fan_out).unwrap();
+        let old = fan_out.join("tmp_obj_0123_7");
+        let fresh = fan_out.join("tmp_obj_0123_8");
+        let object = fan_out.join("cdef0123456789abcdef0123456789abcdef01");
+        for path in [&old, &fresh, &object] {
+            fs::write(path, "x").unwrap();
+        }
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for path in [&old, &object] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+        assert_eq!(store.remove_stale_temp_files(), 1);
+        assert!(!old.exists() && fresh.exists() && object.exists());
+    }
+
+    #[test]
+    fn an_object_directory_that_is_a_link_is_never_written_through() {
+        let (dir, store) = new_store();
+        let outside = tempfile::tempdir().unwrap();
+        // The blob of "hello\n" goes to `objects/ce`.
+        link_dir(
+            outside.path(),
+            &dir.path().join(SNAPSHOTS_DIR).join("objects").join("ce"),
+        );
+        assert!(store.write_blob(b"hello\n").is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     #[test]

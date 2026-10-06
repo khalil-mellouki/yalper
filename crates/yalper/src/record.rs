@@ -19,7 +19,7 @@ use crate::hook::{self, ERRORS_LOG_MAX_BYTES, HookEvent, HookInput};
 use crate::redact::redact_json;
 use crate::repo::YalperDir;
 use crate::snapshot::{self, Base, Pending};
-use crate::store::{Event, Session, Store, WriterLock};
+use crate::store::{Error as StoreError, Event, Session, Store, WriterLock};
 
 /// How long after the hook starts its snapshot must be done. A snapshot that is not done by then is abandoned:
 /// the step is recorded without a snapshot, the latest snapshot and the stat cache stay as they were (the
@@ -86,7 +86,8 @@ pub fn record_until(yalper: &YalperDir, input: HookInput, deadline: Instant) -> 
 
     // Opened before taking the lock: opening a new database takes the lock for a moment itself.
     let store = Store::open(dir, &yalper.token).map_err(|error| error.to_string())?;
-    let (lock, outcome) = match task {
+    store.set_deadline(Some(deadline));
+    let (lock, mut outcome) = match task {
         Some(Ok(task)) => task.finish(yalper, &store, deadline),
         Some(Err(reason)) => (None, Outcome::NotTaken(Some(reason))),
         None => (None, Outcome::NotTaken(None)),
@@ -97,7 +98,7 @@ pub fn record_until(yalper: &YalperDir, input: HookInput, deadline: Instant) -> 
         let _ = hook::append_error(dir, Some(kind), &problems, ERRORS_LOG_MAX_BYTES);
     }
     let (columns, payload) = redaction.finish()?;
-    let step = store
+    let (step, late_streak) = store
         .write_transaction(|| {
             let now = now_ms();
             store.upsert_session(&Session {
@@ -113,17 +114,31 @@ pub fn record_until(yalper: &YalperDir, input: HookInput, deadline: Instant) -> 
             if event == HookEvent::SessionStart {
                 store.reopen_session(&columns.session_id)?;
             }
-            let mut snapshot = None;
-            if let Some(lock) = &lock {
-                match &outcome {
-                    Outcome::Taken(pending) => {
-                        pending.save(&store, lock)?;
-                        snapshot = Some(&pending.snapshot);
+            if let (Some(lock), Outcome::Taken(pending)) = (&lock, &outcome) {
+                // A large stat cache to save after starting over can take longer than the time left: then the
+                // snapshot is dropped and the step recorded without it.
+                match store.with_savepoint(|| pending.save(&store, lock)) {
+                    Ok(()) => {}
+                    Err(StoreError::DeadlinePassed) => {
+                        outcome = Outcome::Late(format!(
+                            "abandoned, not saved within the deadline of {} ms",
+                            snapshot_deadline().as_millis()
+                        ));
                     }
-                    Outcome::Failed(error) => snapshot::remember_failure(&store, lock, error)?,
-                    Outcome::NotTaken(_) => {}
+                    // The step is still recorded.
+                    Err(error) => {
+                        outcome = Outcome::NotTaken(Some(format!("not saved: {error}")));
+                    }
                 }
             }
+            if let (Some(lock), Outcome::Failed(error)) = (&lock, &outcome) {
+                snapshot::remember_failure(&store, lock, error)?;
+            }
+            let late_streak = record_late_streak(&store, &outcome)?;
+            let snapshot = match &outcome {
+                Outcome::Taken(pending) => Some(&pending.snapshot),
+                _ => None,
+            };
             let step = store.next_step(&columns.session_id)?;
             store.insert_event(&Event {
                 session_id: columns.session_id.clone(),
@@ -144,7 +159,7 @@ pub fn record_until(yalper: &YalperDir, input: HookInput, deadline: Instant) -> 
                     .map(|snapshot| u32::try_from(snapshot.changed.len()).unwrap_or(u32::MAX)),
                 payload,
             })?;
-            Ok(step)
+            Ok((step, late_streak))
         })
         .map_err(|error| format!("the step was not recorded: {error}"))?;
     drop(lock);
@@ -154,7 +169,49 @@ pub fn record_until(yalper: &YalperDir, input: HookInput, deadline: Instant) -> 
         Outcome::NotTaken(Some(reason)) => {
             Err(format!("step {step} recorded without a snapshot: {reason}"))
         }
+        Outcome::Late(reason) => {
+            let mut line = format!(
+                "step {step} recorded without a snapshot: {reason} ({late_streak} in a row)"
+            );
+            if late_streak == LATE_STREAK_ADVICE {
+                line.push_str(
+                    ". Snapshots keep missing the deadline: the project probably has large folders that are \
+                     not ignored (downloaded data, build output, dependencies). Add them to .gitignore, or \
+                     to .git/info/exclude, so that each step does not wait about a second for nothing",
+                );
+            }
+            Err(line)
+        }
         Outcome::Taken(_) | Outcome::NotTaken(None) => Ok(()),
+    }
+}
+
+/// The `meta` key counting the snapshot steps in a row that missed the deadline.
+const LATE_STREAK_KEY: &str = "snapshot_deadline_misses";
+
+/// After this many snapshots in a row missed the deadline, the logged line says what to do about it (once).
+const LATE_STREAK_ADVICE: u64 = 3;
+
+/// Counts a snapshot that missed the deadline, or ends the count when one was taken, and returns the count.
+fn record_late_streak(store: &Store, outcome: &Outcome) -> crate::store::Result<u64> {
+    let streak = || {
+        store.meta(LATE_STREAK_KEY).map(|count| {
+            count
+                .and_then(|count| count.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+    };
+    match outcome {
+        Outcome::Late(_) => {
+            let count = streak()?.saturating_add(1);
+            store.set_meta(LATE_STREAK_KEY, Some(&count.to_string()))?;
+            Ok(count)
+        }
+        Outcome::Taken(_) => {
+            store.set_meta(LATE_STREAK_KEY, None)?;
+            Ok(0)
+        }
+        Outcome::Failed(_) | Outcome::NotTaken(_) => streak(),
     }
 }
 
@@ -164,10 +221,11 @@ enum Outcome {
     Taken(Pending),
     /// [`snapshot::take`] failed.
     Failed(snapshot::Error),
-    /// No snapshot: none is taken for this event (`None`), or one could not be taken in time (the reason).
+    /// Not done by the deadline (the reason): not taken, or not saved.
+    Late(String),
+    /// No snapshot: none is taken for this event (`None`), or one could not be started (the reason).
     NotTaken(Option<String>),
 }
-
 /// A step's snapshot, taken on its own thread so that the hook can stop waiting for it at the deadline.
 ///
 /// The thread starts first and prepares what needs no lock (see [`snapshot::take`]) while the hook opens the
@@ -205,30 +263,34 @@ impl SnapshotTask {
         deadline: Instant,
     ) -> (Option<WriterLock>, Outcome) {
         let left = || deadline.saturating_duration_since(Instant::now());
-        let not_taken = |reason: String| (None, Outcome::NotTaken(Some(reason)));
+        let late = |reason: String| (None, Outcome::Late(reason));
+        let abandoned = || {
+            late(format!(
+                "abandoned, not done within the deadline of {} ms",
+                snapshot_deadline().as_millis()
+            ))
+        };
         let lock = match WriterLock::acquire(&yalper.dir, left()) {
             Ok(lock) => lock,
-            Err(error) => {
-                return not_taken(format!("the writer lock was not free in time: {error}"));
-            }
+            Err(error) => return late(format!("the writer lock was not free in time: {error}")),
         };
+        // Reading a very large stat cache stops at the deadline too (see `Store::set_deadline`).
         match Base::read(store, &lock) {
             Ok(base) => {
                 // A send fails only if the thread already stopped, which `recv_timeout` reports.
                 let _ = self.base.send(base);
             }
+            Err(snapshot::Error::Store(StoreError::DeadlinePassed)) => return abandoned(),
             Err(error) => return (Some(lock), Outcome::Failed(error)),
         }
         match self.result.recv_timeout(left()) {
             Ok(Ok(pending)) => (Some(lock), Outcome::Taken(pending)),
             Ok(Err(error)) => (Some(lock), Outcome::Failed(error)),
-            Err(mpsc::RecvTimeoutError::Timeout) => not_taken(format!(
-                "abandoned, not done within the deadline of {} ms",
-                snapshot_deadline().as_millis()
-            )),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                not_taken("the snapshot thread stopped unexpectedly".to_owned())
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => abandoned(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => (
+                None,
+                Outcome::NotTaken(Some("the snapshot thread stopped unexpectedly".to_owned())),
+            ),
         }
     }
 }
