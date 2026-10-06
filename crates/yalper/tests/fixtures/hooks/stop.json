@@ -1,0 +1,12 @@
+{
+  "session_id": "00893aaf-19fa-41d2-8238-13269b9b3ca0",
+  "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-project/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+  "cwd": "/home/dev/project",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "I added `factorial` in src/factorial.rs. The test suite fails because `express` is not installed.",
+  "background_tasks": [],
+  "session_crons": []
+}
