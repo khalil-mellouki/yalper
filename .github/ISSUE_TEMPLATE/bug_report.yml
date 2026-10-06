@@ -1,0 +1,41 @@
+name: Bug report
+description: Something does not work as expected.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `yalper ...`
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Yalper version
+      placeholder: Output of `yalper --version`
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: For example Windows 11, macOS 15, Ubuntu 24.04
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and version
+      placeholder: For example Claude Code 2.x
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Please remove any secrets or private data before pasting.
+      render: text
