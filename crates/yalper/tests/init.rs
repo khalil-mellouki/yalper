@@ -1,52 +1,18 @@
 //! Runs the real `yalper init` binary in temporary git repositories.
 
-use std::collections::BTreeMap;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use common::{EXE, files, git, repository, yalper};
 use serde_json::{Value, json};
 use yalper::hook::{YALPER_DIR, find_yalper_dir};
 use yalper::init::{EVENTS, is_yalper_handler};
 use yalper::repo::{GIT_ID_FILE, ID_FILE, Token};
 use yalper::snapshot::SNAPSHOTS_DIR;
 use yalper::store::{DATABASE_FILE, Store};
-
-const EXE: &str = env!("CARGO_BIN_EXE_yalper");
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
-        .args(args)
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?}");
-}
-
-/// A new git repository with one file.
-fn repository() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init", "--quiet"]);
-    fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-    dir
-}
-
-/// Runs `yalper` with a temporary folder of its own, so the warning about a binary inside the temporary
-/// folder never shows up because of where the test build lives.
-fn yalper(dir: &Path, args: &[&str]) -> Output {
-    let temp = tempfile::tempdir().unwrap();
-    Command::new(EXE)
-        .args(args)
-        .current_dir(dir)
-        .env("TMPDIR", temp.path())
-        .env("TMP", temp.path())
-        .env("TEMP", temp.path())
-        .output()
-        .unwrap()
-}
 
 fn init(dir: &Path) -> Output {
     yalper(dir, &["init"])
@@ -72,24 +38,6 @@ fn settings_path(root: &Path) -> PathBuf {
 
 fn settings(root: &Path) -> Value {
     serde_json::from_slice(&fs::read(settings_path(root)).unwrap()).unwrap()
-}
-
-/// Every file under `dir` and its content. SQLite's shared memory file is left out: it is rewritten whenever
-/// the database is opened, whatever the database holds.
-fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    let mut files = BTreeMap::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(current) = pending.pop() {
-        for entry in fs::read_dir(&current).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if !path.to_string_lossy().ends_with("-shm") {
-                files.insert(path.clone(), fs::read(&path).unwrap());
-            }
-        }
-    }
-    files
 }
 
 /// The token in `path`, which must hold exactly the token and a newline.

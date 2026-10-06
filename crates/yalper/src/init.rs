@@ -59,7 +59,7 @@ const MAX_SETTINGS_BYTES: u64 = 16 * 1024 * 1024;
 /// A command listed in init's output is cut after this many characters.
 const MAX_LISTED_COMMAND_CHARS: usize = 120;
 
-const BOM: char = '\u{feff}';
+pub(crate) const BOM: char = '\u{feff}';
 
 /// Sets up Yalper in the git repository around `start`, registering `exe` as the hook command, and reports
 /// each step to `out`. A `.yalper/` that Yalper cannot use because it was not created by `yalper init` for
@@ -69,25 +69,15 @@ const BOM: char = '\u{feff}';
 /// Nothing is written when the repository root, its git directory, the settings file, or an existing
 /// `.yalper/` is unusable. Returns the message to show when setup fails.
 pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Result<(), String> {
-    let root = repo::find_root(start).ok_or_else(|| {
-        format!(
-            "{} is not inside a git repository. Run `yalper init` inside a git project (or run `git init` \
-             first).",
-            start.display()
-        )
-    })?;
-    let no_git_dir = || {
-        format!(
-            "cannot find the git directory of {}: its .git does not lead to a git directory",
-            root.display()
-        )
-    };
-    let git_dir = repo::git_dir(root)
-        .filter(|dir| is_git_dir(dir))
-        .ok_or_else(no_git_dir)?;
-    let common_dir = repo::git_common_dir(root)
-        .filter(|dir| is_git_dir(dir))
-        .ok_or_else(no_git_dir)?;
+    let Repository {
+        root,
+        git_dir,
+        common_dir,
+    } = Repository::find(
+        start,
+        "Run `yalper init` inside a git project (or run `git init` first).",
+    )?;
+    let root = root.as_path();
     let exe_text = exe.to_str().ok_or_else(|| {
         format!(
             "the path of the yalper binary is not valid UTF-8: {}",
@@ -179,6 +169,46 @@ pub fn init(start: &Path, exe: &Path, recreate: bool, out: &mut dyn Write) -> Re
     Ok(())
 }
 
+/// The git repository around a directory, as `yalper init` and `yalper uninstall` use it.
+pub(crate) struct Repository {
+    /// The root of the working tree (see [`repo::find_root`]).
+    pub root: PathBuf,
+    /// Its git directory, where the init token is (for a linked worktree, its own one).
+    pub git_dir: PathBuf,
+    /// The directory holding `info/exclude` (for a linked worktree, the common one).
+    pub common_dir: PathBuf,
+}
+
+impl Repository {
+    /// The repository around `start`, or the message to show: outside a git repository it ends with `hint`.
+    pub fn find(start: &Path, hint: &str) -> Result<Self, String> {
+        let root = repo::find_root(start)
+            .ok_or_else(|| format!("{} is not inside a git repository. {hint}", start.display()))?;
+        let no_git_dir = || {
+            format!(
+                "cannot find the git directory of {}: its .git does not lead to a git directory",
+                root.display()
+            )
+        };
+        let git_dir = repo::git_dir(root)
+            .filter(|dir| is_git_dir(dir))
+            .ok_or_else(no_git_dir)?;
+        let common_dir = repo::git_common_dir(root)
+            .filter(|dir| is_git_dir(dir))
+            .ok_or_else(no_git_dir)?;
+        Ok(Self {
+            root: root.to_owned(),
+            git_dir,
+            common_dir,
+        })
+    }
+
+    /// The exclude file git reads for this working tree.
+    pub fn exclude_file(&self) -> PathBuf {
+        self.common_dir.join("info").join("exclude")
+    }
+}
+
 /// Whether `dir` is a real directory (not a link) holding a `HEAD` file, as every git directory does.
 fn is_git_dir(dir: &Path) -> bool {
     fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_dir())
@@ -205,7 +235,7 @@ pub fn is_yalper_handler(handler: &Value) -> bool {
 /// that runs on every event the way `yalper init` registers it: a synchronous command with no `if`
 /// condition. Any other Yalper handler (for example one committed with a matcher that never matches) does
 /// not count, so it cannot stop init from registering the real one.
-fn is_registration(group_matches_all: bool, handler: &Value) -> bool {
+pub(crate) fn is_registration(group_matches_all: bool, handler: &Value) -> bool {
     group_matches_all
         && is_yalper_handler(handler)
         && handler.get("type").and_then(Value::as_str) == Some("command")
@@ -216,7 +246,7 @@ fn is_registration(group_matches_all: bool, handler: &Value) -> bool {
 }
 
 /// Whether the matcher group `group` runs its handlers for every call: no matcher, an empty one, or `*`.
-fn matches_all(group: &Map<String, Value>) -> bool {
+pub(crate) fn matches_all(group: &Map<String, Value>) -> bool {
     match group.get("matcher") {
         None => true,
         Some(Value::String(matcher)) => matcher.is_empty() || matcher == "*",
@@ -245,31 +275,7 @@ enum Settings {
 /// Reads the settings file at `path` (if it exists) and registers the hooks in it, see [`register_hooks`].
 /// A leading byte order mark (Windows PowerShell 5.1 writes one) is kept.
 fn registered_settings(path: &Path, exe: &str) -> Result<Settings, String> {
-    let claude_dir = path.parent().unwrap_or(path);
-    if fs::symlink_metadata(claude_dir).is_ok_and(|metadata| !metadata.is_dir()) {
-        return Err(format!(
-            "{} is not a folder (it may be a link), so Yalper will not write its settings there. \
-             Nothing was changed.",
-            claude_dir.display()
-        ));
-    }
-    let existing = match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(format!(
-                "{} is not a regular file (it may be a link), so Yalper will not edit it. Nothing was \
-                 changed.",
-                path.display()
-            ));
-        }
-        Ok(_) => Some(read_text(path).ok_or_else(|| {
-            format!(
-                "cannot read {} as UTF-8 text. Nothing was changed.",
-                path.display()
-            )
-        })?),
-    };
+    let existing = read_settings(path)?;
     let (bom, text) = match existing.as_deref().map(|text| text.strip_prefix(BOM)) {
         Some(Some(rest)) => (true, Some(rest)),
         _ => (false, existing.as_deref()),
@@ -281,6 +287,34 @@ fn registered_settings(path: &Path, exe: &str) -> Result<Settings, String> {
             "cannot register the hooks in {}: {why}. Nothing was changed.",
             path.display()
         )),
+    }
+}
+
+/// The text of the settings file at `path`, or `None` if there is none. A link at the file or at its folder,
+/// or a file that is not UTF-8 text, is an error: Yalper never edits it.
+pub(crate) fn read_settings(path: &Path) -> Result<Option<String>, String> {
+    let claude_dir = path.parent().unwrap_or(path);
+    if fs::symlink_metadata(claude_dir).is_ok_and(|metadata| !metadata.is_dir()) {
+        return Err(format!(
+            "{} is not a folder (it may be a link), so Yalper will not edit the settings there. \
+             Nothing was changed.",
+            claude_dir.display()
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "{} is not a regular file (it may be a link), so Yalper will not edit it. Nothing was \
+             changed.",
+            path.display()
+        )),
+        Ok(_) => read_text(path).map(Some).ok_or_else(|| {
+            format!(
+                "cannot read {} as UTF-8 text. Nothing was changed.",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -358,7 +392,11 @@ fn register_hooks(existing: Option<&str>, exe: &str) -> Result<Settings, String>
 /// (a leftover, or a link a repository planted) is removed first, never its target, and the temporary file
 /// is created new. On Unix it is readable only by its owner, or gets the permissions of `existing` (the
 /// replaced file). The temporary file is removed on any error.
-fn replace_file(path: &Path, bytes: &[u8], existing: Option<&fs::Metadata>) -> io::Result<()> {
+pub(crate) fn replace_file(
+    path: &Path,
+    bytes: &[u8],
+    existing: Option<&fs::Metadata>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -404,20 +442,7 @@ fn fill(file: &mut fs::File, bytes: &[u8], existing: Option<&fs::Metadata>) -> i
 /// equivalent form, such as `/.yalper/`), creating the file and its folder if needed. Returns the lines
 /// added. A link at the file or its folder is refused.
 fn add_excludes(path: &Path) -> io::Result<Vec<&'static str>> {
-    let refuse_link =
-        |path: &Path, is_expected: fn(&fs::Metadata) -> bool| match fs::symlink_metadata(path) {
-            Ok(metadata) if !is_expected(&metadata) => Err(io::Error::other(format!(
-                "{} is a link or not what git creates there",
-                path.display()
-            ))),
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        };
-    if let Some(info) = path.parent() {
-        refuse_link(info, fs::Metadata::is_dir)?;
-    }
-    refuse_link(path, fs::Metadata::is_file)?;
-
+    check_exclude_path(path)?;
     let text = match fs::read(path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -452,6 +477,24 @@ fn add_excludes(path: &Path) -> io::Result<Vec<&'static str>> {
         .open(path)?
         .write_all(addition.as_bytes())?;
     Ok(missing)
+}
+
+/// Refuses an exclude file at `path`, or its `info` folder, that is a link or not what git creates there.
+/// Either may be missing.
+pub(crate) fn check_exclude_path(path: &Path) -> io::Result<()> {
+    let refuse_link =
+        |path: &Path, is_expected: fn(&fs::Metadata) -> bool| match fs::symlink_metadata(path) {
+            Ok(metadata) if !is_expected(&metadata) => Err(io::Error::other(format!(
+                "{} is a link or not what git creates there",
+                path.display()
+            ))),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    if let Some(info) = path.parent() {
+        refuse_link(info, fs::Metadata::is_dir)?;
+    }
+    refuse_link(path, fs::Metadata::is_file)
 }
 
 /// What is at `.yalper/` before init changes anything.
@@ -603,7 +646,7 @@ fn forget_lost_snapshots(yalper: &YalperDir, out: &mut dyn Write) -> Result<(), 
 }
 
 /// Deletes whatever is at `path`: a folder with everything in it, or a file or link (never its target).
-fn remove(path: &Path) -> io::Result<()> {
+pub(crate) fn remove(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.is_dir() {
         fs::remove_dir_all(path)
     } else {
@@ -723,7 +766,7 @@ fn other_commands(settings: &Value, exe: &str) -> Vec<(String, String)> {
 
 /// `text` with every control character (line breaks, terminal escape sequences) replaced by a space, so text
 /// from a repository cannot change what the terminal shows.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -811,7 +854,7 @@ fn exe_warnings(exe: &Path) -> Vec<String> {
 }
 
 /// Prints one line of the report. A closed output does not stop init.
-fn say(out: &mut dyn Write, line: &str) {
+pub(crate) fn say(out: &mut dyn Write, line: &str) {
     let _ = writeln!(out, "{line}");
 }
 
