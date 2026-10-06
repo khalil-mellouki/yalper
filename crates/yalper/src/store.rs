@@ -308,6 +308,18 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a session as running again, for a session that is resumed after it ended: its end time and
+    /// reason are cleared.
+    pub fn reopen_session(&self, id: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE sessions SET ended_at_ms = NULL, end_reason = NULL
+                 WHERE id = ?1 AND ended_at_ms IS NOT NULL",
+            )?
+            .execute([id])?;
+        Ok(())
+    }
+
     /// The number the next step of `session_id` gets. Only meaningful while holding the [`WriterLock`].
     pub fn next_step(&self, session_id: &str) -> Result<u32> {
         let step = self
@@ -813,6 +825,9 @@ mod tests {
         expected.ended_at_ms = Some(950);
         expected.end_reason = Some("prompt_input_exit".to_owned());
         assert_eq!(store.sessions().unwrap(), [expected]);
+
+        store.reopen_session("s1").unwrap();
+        assert_eq!(store.sessions().unwrap(), [start]);
     }
 
     #[test]

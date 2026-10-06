@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-use crate::safe_fs;
+use crate::{repo, safe_fs};
 
 /// The most bytes one ignore file may have. A larger one is refused (it counts as absent).
 pub const MAX_IGNORE_FILE_BYTES: u64 = 256 * 1024;
@@ -58,9 +58,6 @@ pub const MAX_IGNORE_WEIGHT: u64 = 4000;
 /// Patterns match without regard to case where git does by default (`core.ignoreCase`, set by `git init` on
 /// case-insensitive file systems).
 const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
-
-/// The `.git` file of a linked worktree or submodule holds one short line.
-const MAX_GIT_FILE_BYTES: u64 = 4096;
 
 /// Long patterns cost more to compile: one more unit of weight per this many bytes.
 const BYTES_PER_WEIGHT: u64 = 8;
@@ -118,7 +115,7 @@ impl Excludes {
             refused: Mutex::new(Vec::new()),
             exceeded: AtomicBool::new(false),
         };
-        if let Some(dir) = git_common_dir(root) {
+        if let Some(dir) = repo::git_common_dir(root) {
             excludes.info_exclude = excludes.rules(root, &dir.join("info").join("exclude"));
         }
         excludes
@@ -283,41 +280,6 @@ pub(super) fn weight(pattern: &str) -> u64 {
         1 + length
     } else {
         4 + wildcards + alternations + length
-    }
-}
-
-/// The content of `path` if it is a regular file (not a link, FIFO or device) of at most `max_bytes`.
-fn read_small_regular_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    safe_fs::open_regular_file(path)
-        .ok()?
-        .take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= max_bytes).then_some(bytes)
-}
-
-/// The directory holding `info/exclude` for the repository whose work tree is `root`: `.git` itself, or for
-/// a linked worktree (a `.git` file) the repository's common directory.
-fn git_common_dir(root: &Path) -> Option<PathBuf> {
-    let dot_git = root.join(".git");
-    if fs::symlink_metadata(&dot_git).ok()?.is_dir() {
-        return Some(dot_git);
-    }
-    let text = read_small_regular_file(&dot_git, MAX_GIT_FILE_BYTES)?;
-    let git_dir = root.join(
-        String::from_utf8(text)
-            .ok()?
-            .strip_prefix("gitdir:")?
-            .trim(),
-    );
-    match read_small_regular_file(&git_dir.join("commondir"), MAX_GIT_FILE_BYTES) {
-        Some(common) => Some(git_dir.join(String::from_utf8(common).ok()?.trim())),
-        None => Some(git_dir),
     }
 }
 

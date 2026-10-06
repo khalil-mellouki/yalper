@@ -28,13 +28,28 @@ impl HookEvent {
             other => Self::Other(other.to_owned()),
         }
     }
+
+    /// The event's name as Claude Code sends it, or `None` for an event Yalper does not register for.
+    pub fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::SessionStart => Some("SessionStart"),
+            Self::UserPromptSubmit => Some("UserPromptSubmit"),
+            Self::PostToolUse => Some("PostToolUse"),
+            Self::PostToolUseFailure => Some("PostToolUseFailure"),
+            Self::Stop => Some("Stop"),
+            Self::SessionEnd => Some("SessionEnd"),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 /// One hook call from Claude Code.
 ///
 /// Parsing is lenient so that a change in Claude Code's payload never breaks recording: only `session_id`
 /// and `hook_event_name` are required, and an optional field with an unexpected type is treated as absent.
-/// The whole payload, including fields Yalper does not know, stays available in `raw`.
+/// The whole payload, including fields Yalper does not know, stays available in `raw`. The tool input and
+/// response, which can be large, are not copied out of it: see [`tool_input`](Self::tool_input) and
+/// [`tool_response`](Self::tool_response).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HookInput {
     pub session_id: String,
@@ -58,8 +73,6 @@ pub struct HookInput {
     // PostToolUse and PostToolUseFailure.
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
-    pub tool_input: Option<Value>,
-    pub tool_response: Option<Value>,
     pub error: Option<String>,
     pub is_interrupt: Option<bool>,
     pub duration_ms: Option<u64>,
@@ -92,13 +105,24 @@ impl fmt::Display for InputError {
 impl std::error::Error for InputError {}
 
 impl HookInput {
+    /// The `tool_input` of `PostToolUse` and `PostToolUseFailure`, read from [`raw`](Self::raw).
+    pub fn tool_input(&self) -> Option<&Value> {
+        self.raw.get("tool_input").filter(|value| !value.is_null())
+    }
+
+    /// The `tool_response` of `PostToolUse`, read from [`raw`](Self::raw).
+    pub fn tool_response(&self) -> Option<&Value> {
+        self.raw
+            .get("tool_response")
+            .filter(|value| !value.is_null())
+    }
+
     pub fn from_value(raw: Value) -> Result<Self, InputError> {
         if !raw.is_object() {
             return Err(InputError::NotAnObject);
         }
         let string = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
         let boolean = |key: &str| raw.get(key).and_then(Value::as_bool);
-        let any = |key: &str| raw.get(key).filter(|v| !v.is_null()).cloned();
         let required = |key: &'static str| string(key).ok_or(InputError::MissingField(key));
 
         Ok(Self {
@@ -117,8 +141,6 @@ impl HookInput {
             prompt: string("prompt"),
             tool_name: string("tool_name"),
             tool_use_id: string("tool_use_id"),
-            tool_input: any("tool_input"),
-            tool_response: any("tool_response"),
             error: string("error"),
             is_interrupt: boolean("is_interrupt"),
             duration_ms: raw.get("duration_ms").and_then(as_millis),
@@ -168,8 +190,8 @@ mod tests {
         assert_eq!(input.cwd.as_deref(), Some("/repo"));
         assert_eq!(input.agent_id.as_deref(), Some("a1"));
         assert_eq!(input.tool_name.as_deref(), Some("Bash"));
-        assert_eq!(input.tool_input, Some(json!({"command": "npm test"})));
-        assert_eq!(input.tool_response, None);
+        assert_eq!(input.tool_input(), Some(&json!({"command": "npm test"})));
+        assert_eq!(input.tool_response(), None);
         assert_eq!(input.error.as_deref(), Some("Exit code 1\nfailed"));
         assert_eq!(input.is_interrupt, Some(false));
         assert_eq!(input.duration_ms, Some(4187));
@@ -218,7 +240,7 @@ mod tests {
         assert_eq!(input.tool_name, None);
         assert_eq!(input.is_interrupt, None);
         assert_eq!(input.duration_ms, None);
-        assert_eq!(input.tool_response, Some(json!("plain text output")));
+        assert_eq!(input.tool_response(), Some(&json!("plain text output")));
     }
 
     #[test]
@@ -230,6 +252,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.duration_ms, Some(13));
+    }
+
+    #[test]
+    fn known_event_names_round_trip() {
+        for name in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert_eq!(HookEvent::from_name(name).name(), Some(name));
+        }
+        assert_eq!(HookEvent::from_name("PostToolBatch").name(), None);
     }
 
     #[test]
