@@ -309,7 +309,10 @@ mod tests {
         };
         let project = Project::new();
         let git_in_project = |args: &[&str]| {
+            // No automatic maintenance: git would run it in the background after the commit, changing `.git`
+            // while its state is read.
             let output = Command::new(git)
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                 .args(["-c", "user.name=Yalper Test"])
                 .args(["-c", "user.email=test@example.com"])
                 .args(args)
