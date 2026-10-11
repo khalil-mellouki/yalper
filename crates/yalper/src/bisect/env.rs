@@ -19,7 +19,7 @@
 //! - the variables that tell git which repository to use are removed, and `GIT_CEILING_DIRECTORIES` stops git
 //!   from searching for one above the copy: a test running `git stash` or `git clean` fails with "not a git
 //!   repository" instead of acting on the user's repository;
-//! - every variable whose value is a path into the project, or a list of paths holding one (an activated
+//! - every variable whose value is a path into the project, or a known list of paths holding one (an activated
 //!   virtual environment in `PATH` and `VIRTUAL_ENV`, `NODE_PATH`, `UV_PROJECT_ENVIRONMENT`, npm's `INIT_CWD`),
 //!   points to the same place in the copy instead.
 
@@ -60,6 +60,18 @@ const GIT_REPOSITORY_VARS: [&str; 16] = [
 ];
 
 const GIT_CEILING_DIRECTORIES: &str = "GIT_CEILING_DIRECTORIES";
+
+/// The variables, besides `PYTHONPATH`, whose value is a list of paths: each entry is redirected on its own.
+/// Any other variable is redirected only when its whole value is one path (see [`Redirect::single`]).
+const PATH_LISTS: [&str; 7] = [
+    "PATH",
+    "NODE_PATH",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "MANPATH",
+    "CLASSPATH",
+];
 
 /// The longest `PYTHONPATH` a run may get, name and `=` included: the limit of one environment variable on
 /// Windows, in characters (counted here in bytes, which are never fewer). Each virtual environment adds at most
@@ -130,9 +142,10 @@ fn make_real_dir(path: &Path) -> io::Result<()> {
 /// - the git variables of [`GIT_REPOSITORY_VARS`] removed, and `GIT_CEILING_DIRECTORIES` set to
 ///   `.yalper/bisect/` and to the project folder: git never searches above the copy for a repository, and a
 ///   command run one folder above the copy does not reach the project either;
-/// - every other variable whose value is a path into the project, outside `.yalper/`, or a list of paths
-///   holding one, pointing to the same place in the copy (see [`Redirect`]); on Windows, the hidden variables
-///   holding the current folder of each drive (`=C:`) are left out when they point into the project;
+/// - the entries of the path lists of [`PATH_LISTS`] and `PYTHONPATH`, and the value of any other variable that
+///   is as a whole one path, pointing to the same place in the copy when they point into the project, outside
+///   `.yalper/` (see [`Redirect`]); on Windows, the hidden variables holding the current folder of each drive
+///   (`=C:`) are left out when they point into the project;
 /// - `PYTHONPATH` starting with the folders of `additions`, and the variables of `additions` in place of the
 ///   user's.
 ///
@@ -170,6 +183,30 @@ pub fn run_env(
         copy: plain(&std::path::absolute(copy.path())?),
     };
 
+    let user: Vec<(OsString, OsString)> = user.into_iter().collect();
+    // Yalper's own home folder too: on Unix it falls back to the password database when `HOME` is not set.
+    let homes = user
+        .iter()
+        .filter(|(name, _)| {
+            ["HOME", "USERPROFILE"]
+                .iter()
+                .any(|home| same_name(name, home))
+        })
+        .map(|(_, value)| PathBuf::from(value))
+        .chain(std::env::home_dir());
+    for home in homes {
+        if !home.as_os_str().is_empty() && redirect.relative(&home).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot bisect in your home folder or a folder that holds it ({}): tools keep their \
+                     settings and caches there, so test runs could not be kept out of the project",
+                    home.display()
+                ),
+            ));
+        }
+    }
+
     let mut env = Vec::new();
     let mut python_path: Vec<PathBuf> = additions.python_path;
     let mut python_path_name = OsString::from("PYTHONPATH");
@@ -182,21 +219,6 @@ pub fn run_env(
         if replaced {
             continue;
         }
-        if ["HOME", "USERPROFILE"]
-            .iter()
-            .any(|home| same_name(&name, home))
-            && !value.is_empty()
-            && redirect.relative(Path::new(&value)).is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot bisect in your home folder or a folder that holds it ({}): tools keep their \
-                     settings and caches there, so test runs could not be kept out of the project",
-                    Path::new(&value).display()
-                ),
-            ));
-        }
         if cfg!(windows) && name.to_string_lossy().starts_with('=') {
             // `=C:` and the like: the current folder of a drive, for paths such as `C:file`.
             if redirect.relative(Path::new(&value)).is_none() {
@@ -208,8 +230,11 @@ pub fn run_env(
                 python_path.extend(redirect.entries(&value));
             }
             python_path_name = name;
-        } else {
+        } else if PATH_LISTS.iter().any(|list| same_name(&name, list)) {
             let value = redirect.list(&value)?;
+            env.push((name, value));
+        } else {
+            let value = redirect.single(value);
             env.push((name, value));
         }
     }
@@ -282,7 +307,7 @@ impl Redirect {
     /// [`relative`](Self::relative)).
     fn path(&self, path: &Path) -> Option<PathBuf> {
         let rest = self.relative(path)?;
-        if let Some(Component::Normal(first)) = rest.components().next() {
+        if let Some(first) = rest.first() {
             let in_yalper = if CASE_INSENSITIVE {
                 first.eq_ignore_ascii_case(YALPER_DIR)
             } else {
@@ -293,20 +318,24 @@ impl Redirect {
             }
         }
         let mut redirected = self.copy.clone();
-        redirected.extend(rest.components());
-        Some(redirected)
+        for name in &rest {
+            redirected.push(name);
+        }
+        // On Windows a name such as `D:` (from `C:\proj\D:\x`) starts a new path when it is added.
+        redirected.starts_with(&self.copy).then_some(redirected)
     }
 
-    /// Where `path` is inside the project (empty for the project itself), or `None` if it is not.
+    /// The names of the folders and file that lead from the project to `path` (none for the project itself),
+    /// or `None` if `path` is not inside the project.
     ///
     /// A relative path is relative to the folder of the run, the copy, and is not inside the project; on Windows
     /// a path from the root of the current drive (`\proj\bin`) is on the copy's drive. Paths are compared by
     /// their names after resolving `.` and `..` from the text, without regard to case where the file system
-    /// ignores it, so `/proj-other` is not inside `/proj`. A path that does not match is resolved, if it exists,
-    /// and compared again, which catches links to the project and Windows' short 8.3 names; network shares and
-    /// devices are never resolved, and on Windows nor are other drives than the project's (a network drive
-    /// could keep the run waiting).
-    fn relative(&self, path: &Path) -> Option<PathBuf> {
+    /// ignores it, so `/proj-other` is not inside `/proj`. Links are not followed: on macOS both forms of the
+    /// project (`/var` and `/private/var`) are compared. Only on Windows, a path holding a `~` on the project's
+    /// drive that does not match is resolved and compared again, to catch short 8.3 names such as `RUNNER~1`;
+    /// nothing else is ever looked up, so no network share, automount or device is touched.
+    fn relative(&self, path: &Path) -> Option<Vec<OsString>> {
         let path = if path.is_absolute() {
             drive_path(&plain(path))
         } else if cfg!(windows) && path.has_root() {
@@ -320,25 +349,49 @@ impl Redirect {
         if let Some(rest) = self.inside(&path) {
             return Some(rest);
         }
-        let first = path.components().next();
-        let same_drive = self.project.iter().any(|root| {
-            let (a, b) = (root.components().next(), first);
-            a.zip(b).is_some_and(|(a, b)| {
-                a.as_os_str()
-                    .eq_ignore_ascii_case(b.as_os_str().to_string_lossy().as_ref())
-            })
-        });
-        if has_special_prefix(&path) || !same_drive {
+        let short_name = cfg!(windows)
+            && path.to_string_lossy().contains('~')
+            && !has_special_prefix(&path)
+            && self.on_project_drive(&path);
+        if !short_name {
             return None;
         }
         let real = normalize(&drive_path(&plain(&fs::canonicalize(&path).ok()?)));
         self.inside(&real)
     }
 
-    /// Where the absolute, normalized `path` is inside a form of the project, by its text.
-    fn inside(&self, path: &Path) -> Option<PathBuf> {
+    /// Whether the absolute `path` is on the drive of a form of the project (Windows).
+    fn on_project_drive(&self, path: &Path) -> bool {
+        let drive = path.components().next();
+        self.project.iter().any(|root| {
+            root.components().next().zip(drive).is_some_and(|(a, b)| {
+                a.as_os_str()
+                    .eq_ignore_ascii_case(b.as_os_str().to_string_lossy().as_ref())
+            })
+        })
+    }
+
+    /// The names after a form of the project in the absolute, normalized `path`, by its text.
+    fn inside(&self, path: &Path) -> Option<Vec<OsString>> {
         let root = self.project.iter().find(|root| is_under(path, root))?;
-        Some(path.components().skip(root.components().count()).collect())
+        path.components()
+            .skip(root.components().count())
+            .map(|component| match component {
+                Component::Normal(name) => Some(name.to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The value `value` of a variable that is not a list of paths: redirected only when it is, as a whole, one
+    /// absolute path into the project. A value holding the separator of path lists is kept, since it may be a
+    /// list, and so is any other value (a URL, command options), even if a path into the project is part of it.
+    fn single(&self, value: OsString) -> OsString {
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        if value.to_string_lossy().contains(separator) {
+            return value;
+        }
+        self.path(Path::new(&value)).map_or(value, PathBuf::into)
     }
 
     /// The entries of the path list `value`, each redirected if it points into the project.
@@ -346,8 +399,8 @@ impl Redirect {
         std::env::split_paths(value).map(|entry| self.path(&entry).unwrap_or(entry))
     }
 
-    /// The path list `value`, which may be a single path, with every entry that points into the project
-    /// redirected; exactly `value` when none does.
+    /// The path list `value` with every entry that points into the project redirected; exactly `value` when
+    /// none does.
     fn list(&self, value: &OsStr) -> io::Result<OsString> {
         let mut moved = false;
         let entries: Vec<PathBuf> = std::env::split_paths(value)
@@ -511,6 +564,10 @@ mod tests {
         assert_eq!(path(r"\other\bin"), None);
         // Relative to the current folder of drive C:, which is the copy during a run.
         assert_eq!(path(r"C:proj\bin"), None);
+        // A name that would start a new path when added: the value is kept as it is.
+        assert_eq!(path(r"C:\proj\D:\x"), None);
+        assert_eq!(path(r"C:\proj\C:\.yalper"), None);
+        assert_eq!(path(r"C:\proj\D:"), None);
     }
 
     #[cfg(windows)]
@@ -719,28 +776,88 @@ mod tests {
     }
 
     #[test]
-    fn a_path_through_a_link_to_the_project_points_into_the_copy() {
+    fn values_that_only_hold_a_path_into_the_project_are_kept_byte_for_byte() {
+        let (project, copy, additions) = project_with_copy();
+        let root = plain(&std::path::absolute(project.path()).unwrap());
+        let text = |rest: &str| {
+            let mut path = root.clone();
+            path.push(rest);
+            path.to_string_lossy().into_owned()
+        };
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let kept = [
+            ("DATABASE_URL", format!("sqlite:///{}", text("dev.db"))),
+            ("YALPER_TEST_REMOTE", format!("user@host:{}", text("x"))),
+            ("NODE_OPTIONS", format!("--require {}", text("x.js"))),
+            ("YALPER_TEST_QUOTED", format!("\"{}\"", text("x"))),
+            (
+                "YALPER_TEST_TWO",
+                format!("{}{separator}{}", text("a"), text("b")),
+            ),
+            ("YALPER_TEST_SPACED", format!(" {}", text("x"))),
+        ];
+        let user: Vec<(OsString, OsString)> = kept
+            .iter()
+            .map(|(name, value)| ((*name).into(), value.into()))
+            .collect();
+        let env = run_env(user, project.path(), &copy, additions).unwrap();
+        for (name, expected) in &kept {
+            assert_eq!(value(&env, name), Some(OsStr::new(expected)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_path_through_a_link_to_the_project_is_not_followed() {
         let (project, copy, additions) = project_with_copy();
         project.write("bin/tool", "");
-        let copy_root = plain(&std::path::absolute(copy.path()).unwrap());
         let links = tempfile::tempdir().unwrap();
         let link = links.path().join("link");
         make_link(project.path(), &link).unwrap();
-        let user = vec![
-            ("YALPER_TEST_LINKED".into(), link.join("bin").into()),
-            ("YALPER_TEST_ROOT".into(), link.clone().into()),
-            ("YALPER_TEST_YALPER".into(), link.join(".yalper").into()),
-        ];
+        let user = vec![("YALPER_TEST_LINKED".into(), link.join("bin").into())];
         let env = run_env(user, project.path(), &copy, additions).unwrap();
         assert_eq!(
             value(&env, "YALPER_TEST_LINKED"),
-            Some(copy_root.join("bin").as_os_str())
+            Some(link.join("bin").as_os_str())
         );
-        assert_eq!(value(&env, "YALPER_TEST_ROOT"), Some(copy_root.as_os_str()));
+    }
+
+    /// The short 8.3 form of the existing `path`, as `cmd.exe` gives it: `None` if the file system keeps no short
+    /// names or `path` needs none.
+    #[cfg(windows)]
+    fn short_path(path: &Path) -> Option<PathBuf> {
+        use std::os::windows::process::CommandExt;
+        let output = Command::new("cmd")
+            .raw_arg(format!(
+                "/d /c for %I in (\"{}\") do @echo %~sI",
+                path.display()
+            ))
+            .output()
+            .unwrap();
+        let short = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        (short.to_string_lossy().contains('~') && short != path).then_some(short)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_short_8_3_name_of_the_project_points_into_the_copy() {
+        let (project, copy, _) = project_with_copy();
+        project.write("bin/tool", "");
+        let long = plain(&fs::canonicalize(project.path()).unwrap());
+        let Some(short) = short_path(&long) else {
+            // This file system keeps no short names.
+            return;
+        };
+        let copy_root = plain(&std::path::absolute(copy.path()).unwrap());
+        // Only the long form of the project: the short one is found by resolving the path.
+        let redirect = Redirect {
+            project: vec![long],
+            copy: copy_root.clone(),
+        };
         assert_eq!(
-            value(&env, "YALPER_TEST_YALPER"),
-            Some(link.join(".yalper").as_os_str())
+            redirect.path(&short.join("bin")),
+            Some(copy_root.join("bin"))
         );
+        assert_eq!(redirect.path(&short.join(".yalper")), None);
     }
 
     #[test]
