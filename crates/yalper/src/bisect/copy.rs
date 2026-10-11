@@ -360,8 +360,9 @@ fn still_placed(path: &Path, placed: &mut Placed, clean_at: i64) -> io::Result<b
 /// `info/exclude` (`info_exclude`) and the user's global excludes file. A `.gitignore` that is not a file of
 /// the tree, such as one a test created, has no effect. Ignored folders are not entered; a folder that is
 /// neither part of the tree nor ignored is entered, and removed once empty, so ignored files inside it stay
-/// as a checkout would leave them. Links are never followed: a link is removed itself, never what it points
-/// to.
+/// as a checkout would leave them. Extra paths are kept wherever they are. Links are never followed: a link
+/// is removed itself, never what it points to, and one that is neither a file of the tree nor an extra path
+/// is removed even where it is ignored.
 fn sweep(
     root: &Path,
     placed: &HashMap<String, Placed>,
@@ -393,12 +394,13 @@ fn sweep(
     };
 
     let mut deleted = 0;
-    // Folders still to list: path on disk, and path in the tree for a folder of the tree, `None` for a folder
-    // that is not part of it and not ignored.
-    let mut todo = vec![(root.to_path_buf(), Some(String::new()))];
+    // Folders still to list: path on disk, path relative to the copy (`None` if not UTF-8; for a folder of
+    // the tree, its spelling in the tree), and whether it is a folder of the tree. The others are folders
+    // that are neither part of the tree nor ignored.
+    let mut todo = vec![(root.to_path_buf(), Some(String::new()), true)];
     let mut created = Vec::new();
     excludes.add_dir(root, has_rules(""));
-    while let Some((dir, tree_dir)) = todo.pop() {
+    while let Some((dir, dir_path, in_tree)) = todo.pop() {
         if excludes.exceeded() {
             return Err(over_budget().into());
         }
@@ -415,12 +417,15 @@ fn sweep(
         for (name, file_type) in &entries {
             let full = dir.join(name);
             let is_dir = file_type.is_dir();
-            if let Some(tree_dir) = &tree_dir {
-                let path = name.to_str().map(|name| join(tree_dir, name));
-                if path.as_ref().is_some_and(|path| extra.contains(path)) {
-                    continue;
-                }
-                let tree_path = path.and_then(|path| {
+            let path = dir_path
+                .as_deref()
+                .zip(name.to_str())
+                .map(|(dir_path, name)| join(dir_path, name));
+            if path.as_ref().is_some_and(|path| extra.contains(path)) {
+                continue;
+            }
+            if in_tree {
+                let tree_path = path.clone().and_then(|path| {
                     if placed.contains_key(&path) || dirs.contains(path.as_str()) {
                         return Some(path);
                     }
@@ -433,14 +438,16 @@ fn sweep(
                 match tree_path {
                     Some(path) if is_dir && dirs.contains(path.as_str()) => {
                         excludes.add_dir(&full, has_rules(&path));
-                        todo.push((full, Some(path)));
+                        todo.push((full, Some(path), true));
                         continue;
                     }
                     Some(path) if !is_dir && placed.contains_key(&path) => continue,
                     _ => {}
                 }
             }
-            if excludes.is_ignored(&full, is_dir) {
+            // Yalper itself only puts links of the tree and extra paths in the copy. Any other link could lead
+            // a later run outside the copy, so it is removed even where it is ignored.
+            if !file_type.is_symlink() && excludes.is_ignored(&full, is_dir) {
                 continue;
             }
             if is_dir {
@@ -448,7 +455,7 @@ fn sweep(
                 // end if nothing is left in it.
                 excludes.add_dir(&full, false);
                 created.push(full.clone());
-                todo.push((full, None));
+                todo.push((full, path, false));
                 continue;
             }
             match fs::symlink_metadata(&full) {
@@ -738,21 +745,28 @@ fn is_written_as(metadata: &fs::Metadata, kind: FileKind) -> bool {
     metadata.is_file() && plain_as(metadata, kind)
 }
 
-/// Whether the regular file with `metadata` is stored as `kind` would write it: on Unix, the same executable
-/// bit and no other hard link (writing to the copy's file must not change another file).
+/// Whether the regular file with `metadata` is as the copy writes a file of kind `kind`: on Unix, mode 0644
+/// or 0755 exactly, so a permission a test changed is noticed, and no other hard link (writing to the copy's
+/// file must not change another file).
 #[cfg(unix)]
 fn plain_as(metadata: &fs::Metadata, kind: FileKind) -> bool {
     use std::os::unix::fs::MetadataExt;
-    metadata.nlink() == 1 && (metadata.mode() & 0o100 != 0) == (kind == FileKind::Executable)
+    let mode = if kind == FileKind::Executable {
+        0o755
+    } else {
+        0o644
+    };
+    metadata.nlink() == 1 && metadata.mode() & 0o777 == mode
 }
 
-/// Windows has no executable bit. The standard library does not expose the hard link count there (it is
-/// unstable), so a file with a second hard link whose content matches is kept by a first switch, and a test
-/// writing to it would change the other file too. Only a local process can create a hard link (a clone
-/// cannot), and later switches always replace a file instead of writing into it.
+/// Windows has no executable bit: a file is as the copy writes it unless it has the read-only attribute. The
+/// standard library does not expose the hard link count there (it is unstable), so a file with a second hard
+/// link whose content matches is kept by a first switch, and a test writing to it would change the other file
+/// too. Only a local process can create a hard link (a clone cannot), and later switches always replace a
+/// file instead of writing into it.
 #[cfg(windows)]
-fn plain_as(_metadata: &fs::Metadata, _kind: FileKind) -> bool {
-    true
+fn plain_as(metadata: &fs::Metadata, _kind: FileKind) -> bool {
+    !metadata.permissions().readonly()
 }
 
 #[cfg(unix)]
@@ -904,32 +918,48 @@ fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
             }
         });
     }
-    #[cfg(windows)]
-    if metadata.permissions().readonly() {
-        let mut permissions = metadata.permissions();
-        // Clears the Windows read-only attribute; this code does not run on Unix.
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions)?;
+    match fs::remove_file(path) {
+        // The read-only attribute belongs to the file, not to this name: with a second hard link outside the
+        // copy, clearing it changes that file too. So it is cleared only when the file cannot be removed
+        // otherwise.
+        #[cfg(windows)]
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && metadata.permissions().readonly() =>
+        {
+            let mut permissions = metadata.permissions();
+            // Clears the Windows read-only attribute; this code does not run on Unix.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+            fs::remove_file(path)
+        }
+        result => result,
     }
-    fs::remove_file(path)
 }
 
 /// Removes the folder `dir` and everything in it one entry at a time, making each folder writable by its
 /// owner first and clearing read-only attributes: for a folder `remove_dir_all` could not remove, such as one
-/// a test left without write permission. Links are removed, never followed.
+/// a test left without write permission. Links are removed, never followed. A work list instead of recursion,
+/// so a deeply nested folder cannot exhaust the stack.
 fn remove_dir_forcing(dir: &Path) -> io::Result<()> {
-    make_owner_writable(dir, &fs::symlink_metadata(dir)?)?;
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            remove_dir_forcing(&path)?;
-        } else {
-            remove_entry(&path, &metadata)?;
+    let mut todo = vec![dir.to_path_buf()];
+    // In the order they were listed: every folder comes after the folder holding it.
+    let mut listed = Vec::new();
+    while let Some(dir) = todo.pop() {
+        make_owner_writable(&dir, &fs::symlink_metadata(&dir)?)?;
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                todo.push(path);
+            } else {
+                remove_entry(&path, &metadata)?;
+            }
         }
+        listed.push(dir);
     }
-    fs::remove_dir(dir)
+    listed.iter().rev().try_for_each(fs::remove_dir)
 }
 
 /// Removes the cached bytecode of the Python file at `path`: the `__pycache__/<name>.*.pyc` files next to it,
@@ -972,6 +1002,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::process::Command;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use gix::objs::tree::{Entry, EntryKind};
 
@@ -1052,11 +1083,14 @@ mod tests {
                     let target = target.to_string_lossy().into_owned().into_bytes();
                     out.insert(path, (Symlink, target));
                 } else {
-                    let kind = if plain_as(&metadata, Executable) && cfg!(unix) {
-                        Executable
-                    } else {
-                        Regular
+                    #[cfg(unix)]
+                    let executable = {
+                        use std::os::unix::fs::PermissionsExt;
+                        metadata.permissions().mode() & 0o100 != 0
                     };
+                    #[cfg(windows)]
+                    let executable = false;
+                    let kind = if executable { Executable } else { Regular };
                     out.insert(path, (kind, fs::read(entry.path()).unwrap()));
                 }
             }
@@ -1790,18 +1824,184 @@ mod tests {
         let tree = project.tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
-        let path = copy.path().join("a.txt");
-        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
-        fs::write(&path, "two").unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-        // Same size and mtime as the copy wrote, but the mtime is too recent to vouch for the content.
+        fs::write(copy.path().join("a.txt"), "two").unwrap();
+        // The copy wrote this size and this mtime, at the end of the switch: the run's change landed in the
+        // same timestamp tick.
+        let mtime = set_placed_mtime(&mut copy, "a.txt", 0);
+        assert!(is_racy(mtime, copy.clean_at));
         assert_eq!(copy.switch(&project.store, tree).unwrap().restored, 1);
         assert_holds(&copy, &files);
+    }
+
+    /// Sets the mtime of the file `path` of the copy to `offset_ns` after the end of the last switch, and
+    /// makes the copy's stat manifest hold that mtime and the file's size, as if the copy had written it so.
+    /// Returns the mtime.
+    fn set_placed_mtime(copy: &mut TestCopy, path: &str, offset_ns: i64) -> i64 {
+        let full = copy.path().join(path);
+        let time = UNIX_EPOCH + Duration::from_nanos((copy.clean_at + offset_ns) as u64);
+        fs::File::options()
+            .write(true)
+            .open(&full)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        let metadata = fs::symlink_metadata(&full).unwrap();
+        let placed = copy.placed.get_mut(path).unwrap();
+        *placed = Placed::new(placed.file, &metadata);
+        placed.mtime_ns.unwrap()
+    }
+
+    #[test]
+    fn a_permission_a_test_changed_is_undone() {
+        let project = Project::new();
+        let files = [
+            ("plain.txt", Regular, "plain"),
+            ("run.sh", Executable, "#!/bin/sh\n"),
+            ("same.txt", Regular, "same"),
+        ];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        // Old enough that size and mtime alone vouch for the files: only the permission tells.
+        for (path, _, _) in files {
+            let mtime = set_placed_mtime(&mut copy, path, -10_000_000_000);
+            assert!(!is_racy(mtime, copy.clean_at));
+        }
+        let plain = copy.path().join("plain.txt");
+        let mut permissions = fs::metadata(&plain).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&plain, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let run = copy.path().join("run.sh");
+            fs::set_permissions(&run, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let restored = if cfg!(unix) { 2 } else { 1 };
+        assert_eq!(
+            copy.switch(&project.store, tree).unwrap().restored,
+            restored
+        );
+        assert_holds(&copy, &files);
+        assert_exact_modes(&copy, &files);
+        assert!(!fs::metadata(&plain).unwrap().permissions().readonly());
+    }
+
+    #[test]
+    fn a_locked_folder_a_test_put_in_place_of_a_file_is_removed() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
+        let before = contents(canary.path());
+        let files = [("x", Regular, "a file")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+
+        // The run replaces the file with a folder holding read-only files and a folder without write
+        // permission, which holds a link to a folder outside.
+        let x = copy.path().join("x");
+        fs::remove_file(&x).unwrap();
+        create(&x, "top.txt", "top");
+        create(&x, "sub/f.txt", "f");
+        link_dir(canary.path(), &x.join("sub").join("out"));
+        lock(
+            &[x.join("top.txt"), x.join("sub").join("f.txt")],
+            &x.join("sub"),
+        );
+
+        let switched = copy.switch(&project.store, tree).unwrap();
+        assert_eq!(switched.restored, 1);
+        assert_holds(&copy, &files);
+        assert_eq!(contents(canary.path()), before);
+    }
+
+    /// Makes `files` read-only and, on Unix, takes the write permission away from `dir`.
+    fn lock(files: &[PathBuf], dir: &Path) {
+        for file in files {
+            let mut permissions = fs::metadata(file).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(file, permissions).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        #[cfg(windows)]
+        let _ = dir;
+    }
+
+    #[test]
+    fn removing_a_locked_folder_never_follows_a_link_in_it() {
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
+        let before = contents(canary.path());
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        create(&locked, "deeper/f.txt", "f");
+        link_dir(canary.path(), &locked.join("deeper").join("out"));
+        lock(
+            &[locked.join("deeper").join("f.txt")],
+            &locked.join("deeper"),
+        );
+        // Called directly, so it runs on every system whether or not `remove_dir_all` would manage.
+        remove_dir_forcing(&locked).unwrap();
+        assert!(!locked.exists());
+        assert_eq!(contents(canary.path()), before);
+    }
+
+    #[test]
+    fn an_extra_path_in_a_folder_outside_the_tree_is_kept() {
+        let project = Project::new();
+        let files = [("a.txt", Regular, "a")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.set_extra_paths(["config/local.json".to_owned()]);
+        create(copy.path(), "config/local.json", "{}");
+        create(copy.path(), "config/other.txt", "x");
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 1);
+        let mut expected = expected(&files);
+        expected.insert("config/local.json".to_owned(), (Regular, b"{}".to_vec()));
+        assert_eq!(contents(copy.path()), expected);
+    }
+
+    #[test]
+    fn a_link_a_test_created_is_removed_even_where_it_is_ignored() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
+        let before = contents(canary.path());
+        let files = [
+            (".gitignore", Regular, "coverage\n"),
+            ("a.txt", Regular, "a"),
+        ];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        link_dir(canary.path(), &copy.path().join("coverage"));
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 1);
+        assert_holds(&copy, &files);
+        assert_eq!(contents(canary.path()), before);
+    }
+
+    #[test]
+    fn a_link_inside_a_folder_a_test_created_is_removed_not_followed() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
+        let before = contents(canary.path());
+        let files = [("a.txt", Regular, "a")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        create(copy.path(), "tmp/x.txt", "x");
+        link_dir(canary.path(), &copy.path().join("tmp").join("out"));
+        // `tmp/x.txt`, `tmp/out` and `tmp`.
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 3);
+        assert_holds(&copy, &files);
+        assert_eq!(contents(canary.path()), before);
     }
 
     #[test]
