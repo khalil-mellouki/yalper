@@ -333,8 +333,8 @@ impl Redirect {
     /// their names after resolving `.` and `..` from the text, without regard to case where the file system
     /// ignores it, so `/proj-other` is not inside `/proj`. Links are not followed: on macOS both forms of the
     /// project (`/var` and `/private/var`) are compared. Only on Windows, a path holding a `~` on the project's
-    /// drive that does not match is resolved and compared again, to catch short 8.3 names such as `RUNNER~1`;
-    /// nothing else is ever looked up, so no network share, automount or device is touched.
+    /// drive that does not match is resolved (links on it included) and compared again, to catch short 8.3 names
+    /// such as `RUNNER~1`; nothing else is ever looked up, so no network share, automount or device is touched.
     fn relative(&self, path: &Path) -> Option<Vec<OsString>> {
         let path = if path.is_absolute() {
             drive_path(&plain(path))
@@ -811,7 +811,8 @@ mod tests {
         let (project, copy, additions) = project_with_copy();
         project.write("bin/tool", "");
         let links = tempfile::tempdir().unwrap();
-        let link = links.path().join("link");
+        // The long form: on Windows a path holding a short 8.3 name (`RUNNER~1`) is resolved, links included.
+        let link = plain(&fs::canonicalize(links.path()).unwrap()).join("link");
         make_link(project.path(), &link).unwrap();
         let user = vec![("YALPER_TEST_LINKED".into(), link.join("bin").into())];
         let env = run_env(user, project.path(), &copy, additions).unwrap();
