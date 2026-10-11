@@ -1,18 +1,22 @@
 //! `yalper show`: its output for each kind of step of a session recorded from the hook fixtures, file changes
 //! made by a child process, binary files, cut diffs, missing snapshots, untrusted rows and file contents,
-//! and the errors.
+//! and the errors. Also the same rendering as `yalper bisect` uses it: a tool step with the prompt that led to
+//! it, and the diff between two trees that are not adjacent.
 
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use gix::ObjectId;
 use jiff::Timestamp;
 use jiff::tz::{self, TimeZone};
 use serde_json::{Value, json};
 use yalper::hook::{HookInput, YALPER_DIR, find_yalper_dir};
 use yalper::record::record;
 use yalper::repo::YalperDir;
-use yalper::show::{Options, show};
+use yalper::show::{
+    Changes, Format, Options, StepView, project_roots, prompt_of, show, write_step,
+};
 use yalper::snapshot::{self, SNAPSHOTS_DIR, ShadowStore};
 use yalper::store::{DATABASE_FILE, LOCK_TIMEOUT, Store, WriterLock};
 
@@ -844,4 +848,251 @@ fn showing_writes_nothing_into_the_yalper_dir() {
         assert!(output.status.success(), "{step}");
     }
     assert!(common::files(&yalper_dir) == before);
+}
+
+/// Step `step` of [`SESSION`] as `yalper bisect` shows it with [`write_step`]: with the prompt that led to a tool
+/// step, and the files changed from the tree of step `from` to the step's own tree, or the step's own changes
+/// when `from` is `None`. Times are shown two hours ahead of UTC, the project as /home/dev/project.
+fn render(root: &Path, step: u32, from: Option<u32>) -> String {
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let store = Store::open_for_reading(&dir.dir, &dir.token).unwrap();
+    let event = store.event(SESSION, step).unwrap().unwrap();
+    let prompt = prompt_of(&store, &event).unwrap();
+    let roots = project_roots(root, &dir);
+    let time_zone = TimeZone::fixed(tz::offset(2));
+    let view = StepView {
+        event: &event,
+        session: "00893aaf",
+        steps: store.step_count(SESSION).unwrap(),
+        prompt: prompt.as_ref(),
+        roots: &roots,
+        time_zone: &time_zone,
+    };
+    let shadow = ShadowStore::open(&dir.dir, &dir.token).unwrap();
+    let tree = |step| {
+        let event = store.event(SESSION, step).unwrap().unwrap();
+        ObjectId::from_hex(event.tree_id.unwrap().as_bytes()).unwrap()
+    };
+    let changes = match from {
+        Some(from) => Changes::Between {
+            shadow: &shadow,
+            from: tree(from),
+            to: tree(step),
+        },
+        None => Changes::OfStep(&dir),
+    };
+    let mut out = Vec::new();
+    write_step(&mut out, &view, changes, Format::default()).unwrap();
+    let root = root.to_str().unwrap();
+    let escaped = serde_json::to_string(root).unwrap();
+    String::from_utf8(out)
+        .unwrap()
+        .replace(&escaped[1..escaped.len() - 1], "/home/dev/project")
+        .replace(root, "/home/dev/project")
+}
+
+#[test]
+fn a_tool_step_with_the_prompt_that_led_to_it() {
+    let project = recorded_project();
+    insta::assert_snapshot!(render(project.path(), 4, None), @r"
+    Session 00893aaf, step 4 of 10, 2026-10-07 00:00:00
+
+    Prompt (step 2):
+      Rename old_name to new_name
+      and update the README
+
+    Bash, succeeded in 87 ms, subagent a1b2c3d4
+
+    Command:
+      ./scripts/update.sh && echo done
+
+    Output:
+      updated README.md
+      generated src/gen.rs
+      done
+
+    2 files changed:
+      modified  README.md
+      added     src/gen.rs
+
+    --- a/README.md
+    +++ b/README.md
+    @@ -1,1 +1,3 @@
+     # Demo
+    +
+    +Renamed `old_name` to `new_name`.
+
+    --- /dev/null
+    +++ b/src/gen.rs
+    @@ -0,0 +1,1 @@
+    +// generated
+    ");
+}
+
+#[test]
+fn only_tool_steps_show_a_prompt() {
+    let project = recorded_project();
+    let dir = find_yalper_dir([project.path().to_path_buf()]).unwrap();
+    let store = Store::open_for_reading(&dir.dir, &dir.token).unwrap();
+    let prompt_step = |step| {
+        let event = store.event(SESSION, step).unwrap().unwrap();
+        prompt_of(&store, &event).unwrap().map(|prompt| prompt.step)
+    };
+    // The start, the prompt itself and the reply have none; every tool step has the prompt of step 2.
+    assert_eq!(
+        (1..=10).map(prompt_step).collect::<Vec<_>>(),
+        [
+            None,
+            None,
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2),
+            None,
+            None
+        ]
+    );
+    // Rendered like `yalper show` for a step that is not a tool call.
+    assert_eq!(render(project.path(), 2, None), short(project.path(), 2));
+    assert_eq!(render(project.path(), 9, None), short(project.path(), 9));
+}
+
+#[test]
+fn a_diff_between_two_trees_that_are_not_adjacent() {
+    let project = recorded_project();
+    // From the tree of the prompt (step 2) to the tree of the Write (step 7): the changes of steps 3, 4 and 7.
+    // The Write's output keeps its own content: the diff starts before the Write's base, so it is not only
+    // the Write's change.
+    insta::assert_snapshot!(render(project.path(), 7, Some(2)), @r#"
+    Session 00893aaf, step 7 of 10, 2026-10-07 00:01:00
+
+    Prompt (step 2):
+      Rename old_name to new_name
+      and update the README
+
+    Write, succeeded in 9 ms
+
+    Input:
+      {
+        "file_path": "/home/dev/project/src/factorial.rs",
+        "content": "pub fn factorial(n: u64) -> u64 {\n    (1..=n).product()\n}\n"
+      }
+
+    Output:
+      {
+        "type": "create",
+        "filePath": "/home/dev/project/src/factorial.rs",
+        "content": "pub fn factorial(n: u64) -> u64 {\n    (1..=n).product()\n}\n",
+        "structuredPatch": [],
+        "originalFile": null
+      }
+
+    4 files changed:
+      modified  README.md
+      added     src/factorial.rs
+      added     src/gen.rs
+      modified  src/lib.rs
+
+    --- a/README.md
+    +++ b/README.md
+    @@ -1,1 +1,3 @@
+     # Demo
+    +
+    +Renamed `old_name` to `new_name`.
+
+    --- /dev/null
+    +++ b/src/factorial.rs
+    @@ -0,0 +1,3 @@
+    +pub fn factorial(n: u64) -> u64 {
+    +    (1..=n).product()
+    +}
+
+    --- /dev/null
+    +++ b/src/gen.rs
+    @@ -0,0 +1,1 @@
+    +// generated
+
+    --- a/src/lib.rs
+    +++ b/src/lib.rs
+    @@ -1,4 +1,4 @@
+    -pub fn old_name() {}
+    +pub fn new_name() {}
+     pub fn helper() -> u32 {
+     	1
+     }
+    "#);
+}
+
+#[test]
+fn a_rendered_prompt_never_brings_control_characters() {
+    let project = common::project();
+    let root = project.path();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    let evil = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\r\u{202E}X\tY";
+    record_payload(&dir, payload("UserPromptSubmit", json!({"prompt": evil})));
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "true"}}),
+        ),
+    );
+    let output = render(root, 2, Some(1));
+    assert!(!has_control_characters(&output), "{output:?}");
+    assert!(
+        output
+            .contains("\nPrompt (step 1):\n   ]0;owned  [2J 31m <U+202E>X\tY\n\nBash, succeeded\n"),
+        "{output}"
+    );
+}
+
+#[test]
+fn an_edit_keeps_its_own_patch_when_the_diff_holds_earlier_changes() {
+    let project = common::project();
+    let root = project.path();
+    fs::write(root.join("a.txt"), "one\n").unwrap();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    baseline(&dir);
+    record_payload(
+        &dir,
+        payload("UserPromptSubmit", json!({"prompt": "Count up"})),
+    );
+    fs::write(root.join("a.txt"), "two\n").unwrap();
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "./bump.sh"}}),
+        ),
+    );
+    fs::write(root.join("a.txt"), "three\n").unwrap();
+    let path = format!("{}/a.txt", root.display());
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({
+                "tool_name": "Edit",
+                "tool_input": {"file_path": path, "old_string": "two", "new_string": "three"},
+                "tool_response": {
+                    "filePath": path,
+                    "originalFile": "two\n",
+                    "structuredPatch": [{"lines": ["-two", "+three"]}]
+                }
+            }),
+        ),
+    );
+    // From the prompt's tree, the diff of a.txt holds the Bash step's change too: the Edit's own patch stays.
+    let range = render(root, 3, Some(1));
+    assert!(range.contains("\"structuredPatch\""), "{range}");
+    assert!(range.contains(r#""originalFile": "two\n""#), "{range}");
+    assert!(range.contains("\n-one\n+three\n"), "{range}");
+    // From the Edit's own base, the diff is the patch: it is left out of the output.
+    let own = render(root, 3, Some(2));
+    assert!(!own.contains("structuredPatch"), "{own}");
+    assert!(!own.contains("originalFile"), "{own}");
+    assert!(own.contains("\n-two\n+three\n"), "{own}");
+    assert_eq!(own, render(root, 3, None));
 }

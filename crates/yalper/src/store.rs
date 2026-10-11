@@ -546,6 +546,27 @@ impl Store {
         Ok(event)
     }
 
+    /// The latest step of kind `kind` (a hook event name) before step `step` of a session, if any.
+    pub fn last_event_before(
+        &self,
+        session_id: &str,
+        step: u32,
+        kind: &str,
+    ) -> Result<Option<Event>> {
+        let event = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM events WHERE session_id = ?1 AND step < ?2 AND kind = ?3
+                     ORDER BY step DESC LIMIT 1"
+                ),
+                params![session_id, step, kind],
+                event_from_row,
+            )
+            .optional()?;
+        Ok(event)
+    }
+
     /// The latest snapshot and its stat cache, or `None` if there is no snapshot yet or a stored value has a
     /// type Yalper never writes (a damaged or crafted database). Either way the next snapshot starts over.
     pub fn file_cache(&self) -> Result<Option<FileCache>> {
@@ -1583,6 +1604,43 @@ mod tests {
         assert_eq!(store.events("a").unwrap(), [event("a", 1), event("a", 2)]);
         assert_eq!(store.event("b", 1).unwrap(), Some(sparse));
         assert_eq!(store.event("b", 2).unwrap(), None);
+    }
+
+    #[test]
+    fn the_last_event_of_a_kind_before_a_step_stays_in_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        for session in ["a", "b"] {
+            store.upsert_session(&Session::new(session, 1)).unwrap();
+        }
+        let prompt = |session: &str, step| Event {
+            kind: "UserPromptSubmit".to_owned(),
+            ..event(session, step)
+        };
+        // a: 1 prompt, 2 tool, 3 prompt, 4 tool. b: 1 tool, 2 prompt.
+        for event in [
+            prompt("a", 1),
+            event("a", 2),
+            prompt("a", 3),
+            event("a", 4),
+            event("b", 1),
+            prompt("b", 2),
+        ] {
+            store.insert_event(&event).unwrap();
+        }
+        let before = |session, step| {
+            store
+                .last_event_before(session, step, "UserPromptSubmit")
+                .unwrap()
+                .map(|event| event.step)
+        };
+        assert_eq!(before("a", 4), Some(3));
+        assert_eq!(before("a", 3), Some(1));
+        assert_eq!(before("a", 2), Some(1));
+        assert_eq!(before("a", 1), None);
+        assert_eq!(before("b", 1), None);
+        assert_eq!(before("b", 9), Some(2));
     }
 
     #[test]

@@ -31,7 +31,10 @@ use std::time::{Duration, Instant};
 
 use super::CacheDir;
 use super::copy::{open_private_dir, remove_entry};
-use crate::safe_fs::{Access, OwnedDir};
+use crate::log::cut_end;
+use crate::redact::{redact_str, strip_escapes};
+use crate::safe_fs::{Access, OwnedDir, open_regular_file};
+use crate::show::{MAX_LINE_CHARS, content};
 
 /// Set by the first Ctrl-C once [`handle_ctrl_c`] is installed: the run going on is stopped, its processes
 /// killed, and the bisect ends.
@@ -468,13 +471,22 @@ fn outcome(status: ExitStatus) -> Outcome {
 /// Whether the end of `log` shows the linker error of [`Run::linker_file_held`]. Leaves the log's position at
 /// its end.
 fn log_shows_linker_file_held(log: &File) -> io::Result<bool> {
+    let (tail, _) = read_end(log, LOG_TAIL_BYTES)?;
     let mut log = log;
-    let end = log.seek(SeekFrom::End(0))?;
-    log.seek(SeekFrom::Start(end.saturating_sub(LOG_TAIL_BYTES)))?;
-    let mut tail = Vec::new();
-    log.take(LOG_TAIL_BYTES).read_to_end(&mut tail)?;
     log.seek(SeekFrom::End(0))?;
     Ok(shows_linker_file_held(&tail))
+}
+
+/// The last `max_bytes` bytes of `file` (all of it when it is that small), and whether they start at the start
+/// of the file.
+fn read_end(file: &File, max_bytes: u64) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = file;
+    let end = file.seek(SeekFrom::End(0))?;
+    let start = end.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    file.take(max_bytes).read_to_end(&mut tail)?;
+    Ok((tail, start == 0))
 }
 
 /// Whether a line of `output` is a `LNK1104`, `LNK1168` or `LNK1201` error naming an `.exe`, `.dll` or `.pdb`
@@ -555,6 +567,50 @@ impl Logs {
         }
         Ok(log)
     }
+}
+
+/// The last `lines` lines of the log at `path` (a run or install log), safe to show on screen.
+///
+/// Logs are written as the tests print, unredacted, while what Yalper shows may reach a model provider (an
+/// agent that runs `yalper bisect` reads its output). So: a link or anything but a regular file at `path` is
+/// refused, never followed; only the last 64 KiB are read, and a line cut by that start is left out; terminal
+/// escape sequences are removed (colors could split a secret's key from its value), then secrets are masked by
+/// the rules of `crate::redact` over all of those bytes (so the first line of a private key above the lines
+/// shown still counts); each line is cut to 200 characters and made printable (tabs kept). Trailing blank
+/// lines are left out.
+pub fn log_tail(path: &Path, lines: usize) -> io::Result<Vec<String>> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let (tail, whole) = read_end(&open_regular_file(path)?, SHOWN_TAIL_BYTES)?;
+    Ok(tail_lines(&tail, whole, lines))
+}
+
+/// How much of the end of a log [`log_tail`] reads: far more than the lines it shows, for the secret rules.
+const SHOWN_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The last `lines` lines of `tail`, the end of a log (`whole` when it is the whole log), as [`log_tail`]
+/// shows them.
+fn tail_lines(tail: &[u8], whole: bool, lines: usize) -> Vec<String> {
+    let tail = if whole {
+        tail
+    } else {
+        match tail.iter().position(|&byte| byte == b'\n') {
+            Some(end) => &tail[end + 1..],
+            None => return Vec::new(),
+        }
+    };
+    let text = String::from_utf8_lossy(tail);
+    let text = strip_escapes(&text);
+    let text = redact_str(&text).unwrap_or_else(|| text.into_owned());
+    let all: Vec<&str> = text.trim_end().lines().collect();
+    all[all.len().saturating_sub(lines)..]
+        .iter()
+        .map(|line| content(&cut_end(line, MAX_LINE_CHARS, false)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1076,5 +1132,137 @@ mod tests {
         assert_eq!(run.outcome, Outcome::Passed);
         let output = fs::read_to_string(logs.path().join("step-1.log")).unwrap();
         assert_eq!(output.trim_end(), "hello");
+    }
+
+    /// A GitHub token the secret rules mask, built at run time so the source holds no token-shaped text.
+    fn fake_token() -> String {
+        format!("ghp_{}{}", "R8x2Lq9VmT4kZ7wN1c", "J5hB3gF6dS0aP2yE8u")
+    }
+
+    #[test]
+    fn a_log_tail_masks_secrets_and_control_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        let token = fake_token();
+        let evil = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{9b}31m\u{202E}X\tY";
+        let mut log: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        log.push_str(&format!("export GITHUB_TOKEN={token}\r\n"));
+        log.push_str(&format!("{evil}\r\n"));
+        log.push_str(&format!("{}\n", "z".repeat(MAX_LINE_CHARS + 20)));
+        log.push_str("last\r\n\n \n");
+        fs::write(&path, &log).unwrap();
+
+        let mut tail = log_tail(&path, 5).unwrap();
+        assert!(!tail[1].contains(&token[4..10]), "{tail:?}");
+        assert!(
+            tail[1].starts_with("export GITHUB_TOKEN=[REDACTED:"),
+            "{tail:?}"
+        );
+        tail[1] = "(masked)".to_owned();
+        assert_eq!(
+            tail,
+            [
+                "line 30".to_owned(),
+                "(masked)".to_owned(),
+                "<U+202E>X\tY".to_owned(),
+                format!("{}...", "z".repeat(MAX_LINE_CHARS - 3)),
+                "last".to_owned(),
+            ]
+        );
+        assert_eq!(log_tail(&path, 1).unwrap(), ["last"]);
+        assert_eq!(log_tail(&path, 0).unwrap(), Vec::<String>::new());
+
+        // A private key whose BEGIN line is above the lines shown is still masked.
+        let body: String = (0..4)
+            .map(|n| {
+                format!(
+                    "{}{n}\n",
+                    "MIIEowIBAAKCAQEA7x2Lq9VmT4kZ7wN1cJ5hB3gF6dS0aP2yE8uR"
+                )
+            })
+            .collect();
+        let key = format!(
+            "-----BEGIN {0} KEY-----\n{body}-----END {0} KEY-----\n",
+            "RSA PRIVATE"
+        );
+        fs::write(&path, format!("before\n{key}after\n")).unwrap();
+        let tail = log_tail(&path, 3).unwrap();
+        assert!(tail.iter().all(|line| !line.contains("MIIE")), "{tail:?}");
+        assert_eq!(tail.last().unwrap(), "after");
+
+        // Colors between a key and its value do not hide the value from the rules.
+        let value = format!("{}{}", "R8x2Lq9VmT4kZ7wN", "1cJ5hB3gF6dS0aP2");
+        fs::write(
+            &path,
+            format!("API_KEY=\u{1b}[1m{value}\u{1b}[0m\n\u{1b}[31mFAILED\u{1b}[0m\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            log_tail(&path, 5).unwrap(),
+            ["API_KEY=[REDACTED:generic-api-key]", "FAILED"]
+        );
+
+        fs::write(&path, "").unwrap();
+        assert_eq!(log_tail(&path, 5).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_log_tail_reads_only_the_end_of_a_long_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        // 3,000 lines of 50 bytes: the last 64 KiB start inside a line, which is left out.
+        let log: String = (0..3_000)
+            .map(|n| format!("line {n:05}{}\n", " ".repeat(39)))
+            .collect();
+        fs::write(&path, &log).unwrap();
+        let tail = log_tail(&path, usize::MAX).unwrap();
+        assert_eq!(SHOWN_TAIL_BYTES % 50, 36);
+        assert_eq!(tail.len(), SHOWN_TAIL_BYTES as usize / 50);
+        assert!(
+            tail.iter().all(|line| line.starts_with("line ")),
+            "{tail:?}"
+        );
+        assert_eq!(tail.last().unwrap().trim_end(), "line 02999");
+
+        // A last line longer than what is read is not shown: its start is unknown.
+        fs::write(&path, "x".repeat(SHOWN_TAIL_BYTES as usize + 1)).unwrap();
+        assert_eq!(log_tail(&path, 5).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_log_tail_is_read_only_from_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = log_tail(&dir.path().join("missing.log"), 5).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(log_tail(dir.path(), 5).is_err());
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("secret.txt");
+            fs::write(&target, "secret\n").unwrap();
+            let link = dir.path().join("link.log");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(log_tail(&link, 5).is_err());
+        }
+    }
+
+    #[test]
+    fn the_tail_of_a_run_log_is_shown_redacted() {
+        let project = Project::new();
+        let logs = Logs::open(&project.cache).unwrap();
+        let log = logs.create("step-1.log").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let command = format!("echo token {}", fake_token());
+        let run = run(
+            &command,
+            dir.path(),
+            &environment(),
+            &log,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(run.outcome, Outcome::Passed);
+        let tail = log_tail(&logs.path().join("step-1.log"), 5).unwrap();
+        assert_eq!(tail, ["token [REDACTED:github-pat]"]);
     }
 }

@@ -18,9 +18,12 @@
 //! `"key": "value"` (so `{"password": "..."}` is caught), and, when a string contains `\"`, the string
 //! with `\"` and `\\` unescaped (JSON escaped twice, as in logs).
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::iter::Peekable;
+use std::str::Chars;
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -112,6 +115,50 @@ pub fn redact_str(text: &str) -> Option<String> {
         Value::String(redacted) if redacted != text => Some(redacted),
         _ => None,
     }
+}
+
+/// `text` without terminal escape sequences, to run before the rules on text written for a terminal: colors
+/// or cursor moves between a secret's key and its value (`API_KEY=\x1b[1m...`) would otherwise hide it from
+/// rules that need the two side by side. Removed: CSI sequences (`ESC [` or U+009B, parameter and intermediate
+/// bytes, then a final byte), OSC sequences (`ESC ]` up to BEL, `ESC \` or the end of the line), and any other
+/// `ESC` sequence (intermediate bytes, then a final byte). Text without ESC or U+009B is returned as is.
+pub fn strip_escapes(text: &str) -> Cow<'_, str> {
+    if !text.contains(['\u{1b}', '\u{9b}']) {
+        return Cow::Borrowed(text);
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{1b}' if chars.next_if_eq(&'[').is_some() => skip_csi(&mut chars),
+            '\u{1b}' if chars.next_if_eq(&']').is_some() => {
+                while let Some(c) = chars.next_if(|&c| c != '\n') {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            '\u{1b}' => {
+                while chars
+                    .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+                    .is_some()
+                {}
+                chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c));
+            }
+            c => kept.push(c),
+        }
+    }
+    Cow::Owned(kept)
+}
+
+/// Skips the rest of a CSI sequence: parameter and intermediate bytes, then its final byte.
+fn skip_csi(chars: &mut Peekable<Chars<'_>>) {
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{3f}').contains(c))
+        .is_some()
+    {}
+    chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
 }
 
 fn deadline() -> Duration {
@@ -1606,5 +1653,41 @@ mod tests {
         assert_eq!(shannon_entropy(b"aaaa"), 0.0);
         assert_eq!(shannon_entropy(b"aabb"), 1.0);
         assert_eq!(shannon_entropy(b"abcdefgh"), 3.0);
+    }
+
+    #[test]
+    fn terminal_escapes_are_stripped() {
+        let cases = [
+            ("plain text\n", "plain text\n"),
+            (
+                "\u{1b}[1mbold\u{1b}[0m \u{1b}[38;5;196mred\u{1b}[m",
+                "bold red",
+            ),
+            ("\u{9b}31mC1\u{9b}0m", "C1"),
+            ("\u{1b}[?25lcursor\u{1b}[2J", "cursor"),
+            ("a\u{1b}]0;title\u{7}b", "ab"),
+            (
+                "a\u{1b}]8;;https://x\u{1b}\\link\u{1b}]8;;\u{1b}\\b",
+                "alinkb",
+            ),
+            ("open \u{1b}]0;title\nnext", "open \nnext"),
+            ("\u{1b}(Bcharset\u{1b}=keypad\u{1b}7", "charsetkeypad"),
+            ("end\u{1b}", "end"),
+            ("end\u{1b}[", "end"),
+            ("tab\u{1b}\tkept", "tab\tkept"),
+        ];
+        for (text, stripped) in cases {
+            assert_eq!(strip_escapes(text), stripped, "{text:?}");
+        }
+        assert!(matches!(strip_escapes("no escapes"), Cow::Borrowed(_)));
+
+        // A colored value is masked once the colors are gone.
+        let api_key = fake(ALNUM, 32, 17);
+        let colored = format!("API_KEY=\u{1b}[1m{api_key}\u{1b}[0m\n");
+        assert_eq!(redact_str(&colored), None, "colors hide the value");
+        assert_eq!(
+            redacted(&strip_escapes(&colored)),
+            "API_KEY=[REDACTED:generic-api-key]\n"
+        );
     }
 }
