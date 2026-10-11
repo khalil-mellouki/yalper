@@ -6,6 +6,9 @@
 //! from, both kept with the step (`tree_id` and `base_tree_id`), so a change made by a shell command shows up
 //! like an edit, and the list always matches the step's number of files changed.
 //!
+//! [`write_step`] is the same rendering for other commands: `yalper bisect` shows the step that broke the tests
+//! with the prompt that led to it ([`prompt_of`]) and the diff between any two trees ([`Changes::Between`]).
+//!
 //! Everything shown comes from the event log or the snapshot store, which hold what agents and repositories
 //! wrote, so every line goes through [`printable`] (tabs are kept in content lines: they move the cursor but
 //! cannot start an escape sequence), every path is checked with the rules of [`validate_path`], and every
@@ -39,7 +42,7 @@ use crate::store::{Event, Store};
 const MAX_TEXT_LINES: usize = 20;
 
 /// Without `--full`, a line of text or of a diff is cut to this many characters.
-const MAX_LINE_CHARS: usize = 200;
+pub(crate) const MAX_LINE_CHARS: usize = 200;
 
 /// A tool name, model, end reason or subagent id is cut to this many characters.
 const MAX_FIELD_CHARS: usize = 80;
@@ -96,6 +99,24 @@ pub struct Options {
     pub color: bool,
 }
 
+impl Options {
+    fn format(&self) -> Format {
+        Format {
+            full: self.full,
+            color: self.color,
+        }
+    }
+}
+
+/// How much [`write_step`] shows, and how.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Format {
+    /// Whole texts and diffs instead of cutting them short (still within fixed limits).
+    pub full: bool,
+    /// Color the diff with terminal escape sequences.
+    pub color: bool,
+}
+
 /// Shows step `step` of a session of the project around `start` (see [`Options`]), with times in
 /// `time_zone`. Returns the message to show when the step cannot be shown: outside a project set up with
 /// `yalper init`, no such session or step, or recordings that cannot be read.
@@ -129,41 +150,128 @@ pub fn show(
             ),
         });
     };
+    let roots = project_roots(start, &yalper);
+    let view = StepView {
+        event: &event,
+        session: &short,
+        steps,
+        prompt: None,
+        roots: &roots,
+        time_zone,
+    };
+    write_step(out, &view, Changes::OfStep(&yalper), options.format())
+}
 
-    let time = local_time(event.ts_ms, time_zone).map_or_else(
+/// The project root as found from `start` and as `.yalper/` was opened (canonical on Unix), as `yalper log`
+/// tries them: tool paths are absolute, and [`StepView::roots`] makes them relative to the project.
+pub fn project_roots(start: &Path, yalper: &YalperDir) -> Vec<String> {
+    [repo::find_root(start), yalper.dir.path().parent()]
+        .into_iter()
+        .flatten()
+        .filter_map(|root| root.to_str().map(str::to_owned))
+        .collect()
+}
+
+/// A step and what [`write_step`] shows with it.
+pub struct StepView<'a> {
+    pub event: &'a Event,
+    /// The short id of the step's session, as `yalper log` shows it.
+    pub session: &'a str,
+    /// How many steps the session has.
+    pub steps: u32,
+    /// The prompt that led to a tool step (see [`prompt_of`]), shown before the tool call. Ignored for other
+    /// steps.
+    pub prompt: Option<&'a Event>,
+    /// The project root, as given by [`project_roots`].
+    pub roots: &'a [String],
+    /// The time zone of the time shown.
+    pub time_zone: &'a TimeZone,
+}
+
+/// The file changes [`write_step`] shows under a step.
+pub enum Changes<'a> {
+    /// What the step changed (from its `base_tree_id` to its `tree_id`), read from the snapshot store of this
+    /// `.yalper/`. Shown only for a step that takes a snapshot.
+    OfStep(&'a YalperDir),
+    /// From tree `from` to tree `to` of `shadow`, whichever steps they belong to.
+    Between {
+        shadow: &'a ShadowStore,
+        from: ObjectId,
+        to: ObjectId,
+    },
+}
+
+/// The prompt that led to a tool step: the latest prompt before it in its session. `None` for any other
+/// step, and for a tool step with no prompt before it.
+pub fn prompt_of(store: &Store, event: &Event) -> crate::store::Result<Option<Event>> {
+    if !is_tool_call(event) {
+        return Ok(None);
+    }
+    let prompt = HookEvent::UserPromptSubmit.name().unwrap_or_default();
+    store.last_event_before(&event.session_id, event.step, prompt)
+}
+
+fn is_tool_call(event: &Event) -> bool {
+    matches!(
+        HookEvent::from_name(&event.kind),
+        HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+    )
+}
+
+/// Writes a step as `yalper show` does: a header line, the prompt that led to it (if given, for a tool step),
+/// what the step was (a prompt, a reply, the start or end of the session, or a tool call with its input and
+/// output), then the file changes `changes`, listed with a unified diff of each changed or added text file.
+/// Returns the message to show when the snapshots cannot be read, after writing what could be shown.
+pub fn write_step(
+    out: &mut dyn Write,
+    view: &StepView<'_>,
+    changes: Changes<'_>,
+    format: Format,
+) -> Result<(), String> {
+    let event = view.event;
+    let time = local_time(event.ts_ms, view.time_zone).map_or_else(
         || "at an unknown time".to_owned(),
         |time| time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
     );
     say(
         out,
-        &printable(&format!("Session {short}, step {step} of {steps}, {time}")),
+        &printable(&format!(
+            "Session {}, step {} of {}, {time}",
+            view.session, event.step, view.steps
+        )),
     );
     // The files section comes last but is built first: a file tool's output repeats the file or its patch,
     // which is left out only when the diff of that file is shown below.
     let mut files = Vec::new();
-    let diffed = if takes_snapshot(&event.kind) {
-        write_files(&mut files, &yalper, &event, options)
-    } else {
-        Ok(Vec::new())
-    };
-    let shown_by_diff = match (&diffed, edited_file(&event)) {
-        (Ok(diffed), Some(edited)) => {
-            // Tool paths are absolute. The project root is tried as found from `start` and as `.yalper/` was
-            // opened (canonical on Unix), as `yalper log` does.
-            let roots: Vec<String> = [repo::find_root(start), yalper.dir.path().parent()]
-                .into_iter()
-                .flatten()
-                .filter_map(|root| root.to_str().map(str::to_owned))
-                .collect();
-            diffed.contains(&relative_path(edited, &roots))
+    let diffed = match changes {
+        Changes::OfStep(yalper) if takes_snapshot(&event.kind) => {
+            Some(write_files(&mut files, yalper, event, format))
         }
+        Changes::OfStep(_) => None,
+        Changes::Between { shadow, from, to } => {
+            Some(write_tree_diff(&mut files, shadow, from, to, format))
+        }
+    };
+    let shown_by_diff = match (&diffed, edited_file(event)) {
+        (Some(Ok(diffed)), Some(edited)) => diffed.contains(&relative_path(edited, view.roots)),
         _ => false,
     };
-    write_step(out, &event, options.full, shown_by_diff);
-    if takes_snapshot(&event.kind) {
+    if let Some(prompt) = view.prompt.filter(|_| is_tool_call(event)) {
+        let text = prompt.payload.get("prompt").and_then(Value::as_str);
+        text_block(
+            out,
+            &format!("Prompt (step {})", prompt.step),
+            text,
+            format.full,
+        );
         say(out, "");
-        let _ = out.write_all(&files);
     }
+    write_event(out, event, format.full, shown_by_diff);
+    let Some(diffed) = diffed else {
+        return Ok(());
+    };
+    say(out, "");
+    let _ = out.write_all(&files);
     diffed.map(|_| ())
 }
 
@@ -187,7 +295,7 @@ fn edited_file(event: &Event) -> Option<&str> {
 
 /// Writes what the step was: a prompt, a reply, the start or end of the session, or a tool call with its
 /// input and output. `shown_by_diff`: the diff below shows the file a file tool edited (see [`edited_file`]).
-fn write_step(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bool) {
+fn write_event(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bool) {
     let text = |key: &str| event.payload.get(key).and_then(Value::as_str);
     match HookEvent::from_name(&event.kind) {
         HookEvent::SessionStart => {
@@ -341,20 +449,19 @@ fn text_block(out: &mut dyn Write, heading: &str, text: Option<&str>, full: bool
 }
 
 /// `text` made printable like [`printable`], except that tabs are kept.
-fn content(text: &str) -> String {
+pub(crate) fn content(text: &str) -> String {
     text.split('\t')
         .map(printable)
         .collect::<Vec<_>>()
         .join("\t")
 }
 
-/// Writes the files the step changed: a list, then a unified diff of each changed text file, one file at a
-/// time.
+/// Writes the files the step changed (see [`write_tree_diff`]), or why they cannot be shown.
 fn write_files(
     out: &mut dyn Write,
     yalper: &YalperDir,
     event: &Event,
-    options: &Options,
+    format: Format,
 ) -> Result<Vec<String>, String> {
     let Some(tree) = &event.tree_id else {
         say(
@@ -375,14 +482,6 @@ fn write_files(
         }
         return Ok(Vec::new());
     };
-    let not_available = |out: &mut dyn Write| {
-        say(
-            out,
-            "Snapshot not available: the snapshot store no longer has the snapshots of this step (it was \
-             lost and created again since).",
-        );
-    };
-    let failed = |error: crate::snapshot::Error| format!("cannot read the snapshots: {error}");
     let (tree, base) = (tree_id(tree)?, tree_id(base)?);
     if base == tree {
         say(out, "No files changed.");
@@ -391,20 +490,45 @@ fn write_files(
     let shadow = match ShadowStore::open(&yalper.dir, &yalper.token) {
         Ok(shadow) => shadow,
         Err(crate::snapshot::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            not_available(out);
+            say(out, NOT_AVAILABLE);
             return Ok(Vec::new());
         }
-        Err(error) => return Err(failed(error)),
+        Err(error) => return Err(snapshots_failed(error)),
     };
-    if !shadow.has_object(tree) || !shadow.has_object(base) {
-        not_available(out);
+    write_tree_diff(out, &shadow, base, tree, format)
+}
+
+/// Shown when the snapshot store does not have a tree to diff.
+const NOT_AVAILABLE: &str = "Snapshot not available: the snapshot store no longer has the snapshots of this \
+                             step (it was lost and created again since).";
+
+fn snapshots_failed(error: crate::snapshot::Error) -> String {
+    format!("cannot read the snapshots: {error}")
+}
+
+/// Writes the files changed from tree `from` to tree `to` of `shadow`, whichever steps they belong to: a
+/// list, then a unified diff of each changed or added text file, one file at a time, within the limits of
+/// `format`. Returns the paths, as stored in the tree, of the files whose whole diff was written.
+pub fn write_tree_diff(
+    out: &mut dyn Write,
+    shadow: &ShadowStore,
+    from: ObjectId,
+    to: ObjectId,
+    format: Format,
+) -> Result<Vec<String>, String> {
+    if from == to {
+        say(out, "No files changed.");
+        return Ok(Vec::new());
+    }
+    if !shadow.has_object(to) || !shadow.has_object(from) {
+        say(out, NOT_AVAILABLE);
         return Ok(Vec::new());
     }
     let changes = shadow
-        .file_changes(base, tree, MAX_TREE_ENTRIES)
-        .map_err(failed)?;
+        .file_changes(from, to, MAX_TREE_ENTRIES)
+        .map_err(snapshots_failed)?;
     let count = changes.files.len();
-    let listed = if options.full {
+    let listed = if format.full {
         count
     } else {
         count.min(MAX_LISTED_FILES)
@@ -440,15 +564,15 @@ fn write_files(
         );
     }
 
-    let budget = if options.full {
+    let budget = if format.full {
         FULL_BUDGET
     } else {
         SHORT_BUDGET
     };
     let mut writer = DiffWriter {
         out,
-        color: options.color,
-        full: options.full,
+        color: format.color,
+        full: format.full,
         budget,
         truncated: false,
         diffed: Vec::new(),
@@ -457,12 +581,12 @@ fn write_files(
         if !file.diffed {
             continue;
         }
-        if !writer.file(&shadow, file).map_err(failed)? {
+        if !writer.file(shadow, file).map_err(snapshots_failed)? {
             break;
         }
     }
     if writer.truncated {
-        let marker = if options.full {
+        let marker = if format.full {
             format!("{ELLIPSIS} diff truncated: it is larger than Yalper shows")
         } else {
             format!("{ELLIPSIS} diff truncated (--full shows more)")

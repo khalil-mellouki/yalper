@@ -43,5 +43,5 @@ pub use link::CANNOT_LINK;
 pub use node_modules::{Linked, NodeModules};
 pub use python::{LinkedEnvs, PythonEnvs};
 pub use run::{
-    Exit, Logs, Outcome, Run, SKIP_EXIT_CODE, STOP, STOPPED_EXIT_CODE, handle_ctrl_c, run,
+    Exit, Logs, Outcome, Run, SKIP_EXIT_CODE, STOP, STOPPED_EXIT_CODE, handle_ctrl_c, log_tail, run,
 };
