@@ -11,15 +11,58 @@
 //!   every bisect of that copy: the project's `target/` is never used, and cargo's own fingerprints decide
 //!   what to rebuild. The first bisect of a Rust project compiles its dependencies there once per copy (see
 //!   [`TestCopy::cargo_target_path`] for why copies do not share one).
+//!
+//! [`run_env`] builds the complete environment of a run from the user's, so that the tools it runs stay in the
+//! copy even though the copy sits inside the project (see also [`write_boundaries`](super::write_boundaries)):
+//!
+//! - the variables that tell git which repository to use are removed, and `GIT_CEILING_DIRECTORIES` stops git
+//!   from searching for one above the copy: a test running `git stash` or `git clean` fails with "not a git
+//!   repository" instead of acting on the user's repository;
+//! - entries of `PATH`, `VIRTUAL_ENV` and `PYTHONPATH` that point into the project, such as an activated
+//!   virtual environment or `node_modules/.bin`, point to the same place in the copy instead.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::copy::remove_entry;
-use super::link::plain;
-use super::{PythonEnvs, TestCopy};
+use super::link::{is_under, normalize, plain};
+use super::{BISECT_DIR, PythonEnvs, TestCopy};
+use crate::hook::YALPER_DIR;
+use crate::snapshot::CASE_INSENSITIVE;
+
+/// The variables that tell git which repository, index or objects to use, removed from the environment of a
+/// test run: the ones git itself clears before it runs a command in another repository (`local_repo_env` in
+/// git's `environment.c`), and `GIT_NAMESPACE`. `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` (configuration
+/// given with `git -c`) go with them, as git does, since they were meant for the repository Yalper was started
+/// from. The user's and the system's configuration files (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`) are kept:
+/// no configuration makes git find a repository that `GIT_CEILING_DIRECTORIES` hides.
+const GIT_REPOSITORY_VARS: [&str; 16] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+
+const GIT_CEILING_DIRECTORIES: &str = "GIT_CEILING_DIRECTORIES";
+
+/// The longest `PYTHONPATH` a run may get, name and `=` included: the limit of one environment variable on
+/// Windows, in characters (counted here in bytes, which are never fewer). Each virtual environment adds at most
+/// 256 folders, so several large ones could pass it.
+const MAX_PYTHONPATH: usize = 32_767;
 
 /// What the environment of a test run adds to the user's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +118,186 @@ fn make_real_dir(path: &Path) -> io::Result<()> {
     })
 }
 
+/// The complete environment of a test run in `copy` of the project at `project`, for [`run`](super::run):
+/// the user's environment `user` (usually `std::env::vars_os()`) with
+///
+/// - the git variables of [`GIT_REPOSITORY_VARS`] removed, and `GIT_CEILING_DIRECTORIES` set to
+///   `.yalper/bisect/` and to the project folder: git never searches above the copy for a repository, and a
+///   command run one folder above the copy does not reach the project either;
+/// - the entries of `PATH`, `VIRTUAL_ENV` and `PYTHONPATH` that point into the project, outside `.yalper/`,
+///   pointing to the same place in the copy (see [`Redirect`]);
+/// - `PYTHONPATH` starting with the folders of `additions`, and the variables of `additions` in place of the
+///   user's.
+///
+/// Fails if `PYTHONPATH` would be longer than [`MAX_PYTHONPATH`], or if the project's path holds the separator
+/// of path lists (`;` on Windows, `:` elsewhere): git would then read a wrong `GIT_CEILING_DIRECTORIES`.
+pub fn run_env(
+    user: impl IntoIterator<Item = (OsString, OsString)>,
+    project: &Path,
+    copy: &TestCopy,
+    additions: EnvAdditions,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    let project = forms(project)?;
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    if let Some(path) = project
+        .iter()
+        .find(|path| path.to_string_lossy().contains(separator))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot keep the test runs inside the test copy: the project's path holds {separator:?}, which \
+                 cannot be written in a list of paths for git: {}",
+                path.display()
+            ),
+        ));
+    }
+    let ceilings: Vec<PathBuf> = project
+        .iter()
+        .flat_map(|root| [root.join(YALPER_DIR).join(BISECT_DIR), root.clone()])
+        .collect();
+    let ceilings = join(&ceilings)?;
+    let redirect = Redirect {
+        project,
+        copy: plain(&std::path::absolute(copy.path())?),
+    };
+
+    let mut env = Vec::new();
+    let mut python_path: Vec<PathBuf> = additions.python_path;
+    let mut python_path_name = OsString::from("PYTHONPATH");
+    for (name, value) in user {
+        let replaced = GIT_REPOSITORY_VARS
+            .iter()
+            .chain([&GIT_CEILING_DIRECTORIES])
+            .chain(additions.vars.iter().map(|(name, _)| name))
+            .any(|var| same_name(&name, var));
+        if replaced {
+            continue;
+        }
+        if same_name(&name, "PYTHONPATH") {
+            // An empty `PYTHONPATH` holds no folder.
+            if !value.is_empty() {
+                python_path.extend(redirect.entries(&value));
+            }
+            python_path_name = name;
+        } else if same_name(&name, "PATH") {
+            let value = redirect.list(&value)?;
+            env.push((name, value));
+        } else if same_name(&name, "VIRTUAL_ENV") {
+            let value = redirect
+                .path(Path::new(&value))
+                .map_or(value, PathBuf::into);
+            env.push((name, value));
+        } else {
+            env.push((name, value));
+        }
+    }
+    if !python_path.is_empty() {
+        let value = join(&python_path)?;
+        let length = python_path_name.len() + 1 + value.len();
+        if length > MAX_PYTHONPATH {
+            return Err(io::Error::other(format!(
+                "cannot start the test run: its PYTHONPATH would be {length} characters long, over the \
+                 limit of {MAX_PYTHONPATH} (the project's virtual environments list too many editable \
+                 installs)"
+            )));
+        }
+        env.push((python_path_name, value));
+    }
+    env.push((GIT_CEILING_DIRECTORIES.into(), ceilings));
+    env.extend(
+        additions
+            .vars
+            .into_iter()
+            .map(|(name, value)| (name.into(), value)),
+    );
+    Ok(env)
+}
+
+/// Whether the variable name `name` is `var`, without regard to case on Windows, where names ignore it.
+fn same_name(name: &OsStr, var: &str) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(var)
+    } else {
+        name == var
+    }
+}
+
+/// `path` made absolute and, if it exists, with every link resolved, both without Windows' `\\?\` prefix: paths
+/// in the environment may be written in either form (on macOS, `/var` is a link to `/private/var`; on Windows,
+/// a short 8.3 name such as `RUNNER~1` resolves to the long one).
+fn forms(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut forms = vec![plain(&std::path::absolute(path)?)];
+    if let Ok(real) = fs::canonicalize(path) {
+        let real = plain(&real);
+        if real != forms[0] {
+            forms.push(real);
+        }
+    }
+    Ok(forms)
+}
+
+/// `paths` joined with the system's separator for path lists (`;` on Windows, `:` elsewhere).
+fn join(paths: &[PathBuf]) -> io::Result<OsString> {
+    std::env::join_paths(paths).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot build the environment of the test run: {error}"),
+        )
+    })
+}
+
+/// Points paths inside the project to the same place in the test copy.
+#[derive(Debug)]
+struct Redirect {
+    /// The forms of the project folder (see [`forms`]).
+    project: Vec<PathBuf>,
+    /// The copy folder, absolute.
+    copy: PathBuf,
+}
+
+impl Redirect {
+    /// The path in the copy for `path`, if `path` is absolute and is the project folder or inside it, outside
+    /// `.yalper/`. Paths are compared by their names after resolving `.` and `..` from the text, without regard
+    /// to case where the file system ignores it, so `/proj-other` is not inside `/proj`.
+    fn path(&self, path: &Path) -> Option<PathBuf> {
+        if !path.is_absolute() {
+            // Relative to the folder of the run, which is the copy.
+            return None;
+        }
+        let path = normalize(&plain(path));
+        let root = self.project.iter().find(|root| is_under(&path, root))?;
+        let rest: Vec<Component> = path.components().skip(root.components().count()).collect();
+        if let Some(Component::Normal(first)) = rest.first() {
+            let in_yalper = if CASE_INSENSITIVE {
+                first.eq_ignore_ascii_case(YALPER_DIR)
+            } else {
+                *first == YALPER_DIR
+            };
+            if in_yalper {
+                return None;
+            }
+        }
+        let mut redirected = self.copy.clone();
+        redirected.extend(rest);
+        Some(redirected)
+    }
+
+    /// The entries of the path list `value`, each redirected if it points into the project.
+    fn entries<'a>(&'a self, value: &'a OsStr) -> impl Iterator<Item = PathBuf> + 'a {
+        std::env::split_paths(value).map(|entry| self.path(&entry).unwrap_or(entry))
+    }
+
+    /// The path list `value` with every entry that points into the project redirected; exactly `value` when
+    /// none does.
+    fn list(&self, value: &OsStr) -> io::Result<OsString> {
+        if std::env::split_paths(value).all(|entry| self.path(&entry).is_none()) {
+            return Ok(value.to_owned());
+        }
+        join(&self.entries(value).collect::<Vec<_>>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +341,267 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o700);
             }
         }
+    }
+
+    /// `path` written with `/`, as an absolute path of this system: on Windows on drive `C:`, with `\`.
+    fn p(path: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
+    /// The project `/proj`, also reached as `/real/proj`, and its copy `/proj/.yalper/bisect/copy-0`.
+    fn redirect() -> Redirect {
+        Redirect {
+            project: vec![p("/proj"), p("/real/proj")],
+            copy: p("/proj/.yalper/bisect/copy-0"),
+        }
+    }
+
+    fn in_copy(path: &str) -> PathBuf {
+        let mut in_copy = p("/proj/.yalper/bisect/copy-0");
+        in_copy.extend(path.split('/').filter(|name| !name.is_empty()));
+        in_copy
+    }
+
+    #[test]
+    fn paths_inside_the_project_point_into_the_copy() {
+        let redirect = redirect();
+        let path = |text: &str| redirect.path(&p(text));
+        assert_eq!(
+            path("/proj/node_modules/.bin"),
+            Some(in_copy("node_modules/.bin"))
+        );
+        assert_eq!(path("/proj/.venv/bin/"), Some(in_copy(".venv/bin")));
+        assert_eq!(path("/proj"), Some(in_copy("")));
+        assert_eq!(path("/real/proj/src"), Some(in_copy("src")));
+        // Dots are resolved from the text first.
+        assert_eq!(path("/proj/a/../bin"), Some(in_copy("bin")));
+        assert_eq!(path("/proj/./bin"), Some(in_copy("bin")));
+        assert_eq!(path("/proj/../other/bin"), None);
+        // Whole names only.
+        assert_eq!(path("/proj-other/bin"), None);
+        assert_eq!(path("/pro"), None);
+        assert_eq!(path("/"), None);
+        assert_eq!(path("/real"), None);
+        // Yalper's own folder, the copies included, is left as it is.
+        assert_eq!(path("/proj/.yalper/bin"), None);
+        assert_eq!(path("/proj/.yalper/bisect/copy-0/bin"), None);
+        assert_eq!(path("/proj/.yalperx/bin"), Some(in_copy(".yalperx/bin")));
+        // Relative paths already lead into the copy, where the run starts.
+        assert_eq!(redirect.path(Path::new("node_modules/.bin")), None);
+        assert_eq!(redirect.path(Path::new("")), None);
+        // Case, where the file system ignores it.
+        let upper = path("/PROJ/Bin");
+        assert_eq!(upper, CASE_INSENSITIVE.then(|| in_copy("Bin")));
+        let yalper = path("/proj/.YALPER/bin");
+        assert_eq!(yalper, (!CASE_INSENSITIVE).then(|| in_copy(".YALPER/bin")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefixes_and_drive_letters_are_compared_as_paths() {
+        let redirect = redirect();
+        let path = |text: &str| redirect.path(Path::new(text));
+        assert_eq!(path(r"\\?\C:\proj\bin"), Some(in_copy("bin")));
+        assert_eq!(path(r"c:\proj\bin"), Some(in_copy("bin")));
+        assert_eq!(path(r"C:/proj/bin"), Some(in_copy("bin")));
+        assert_eq!(path(r"D:\proj\bin"), None);
+        // Relative to the current folder of drive C: or to its root: not absolute.
+        assert_eq!(path(r"C:proj\bin"), None);
+        assert_eq!(path(r"\proj\bin"), None);
+    }
+
+    #[test]
+    fn a_path_list_keeps_its_other_entries_and_its_exact_text_when_nothing_moves() {
+        let redirect = redirect();
+        let list = |entries: &[PathBuf]| std::env::join_paths(entries).unwrap();
+        let untouched = list(&[p("/usr/bin"), PathBuf::new(), PathBuf::from("bin")]);
+        assert_eq!(redirect.list(&untouched).unwrap(), untouched);
+
+        let mixed = list(&[
+            p("/usr/bin"),
+            p("/proj/node_modules/.bin"),
+            PathBuf::new(),
+            p("/proj-other/bin"),
+            p("/proj/.venv/bin"),
+        ]);
+        let expected = list(&[
+            p("/usr/bin"),
+            in_copy("node_modules/.bin"),
+            PathBuf::new(),
+            p("/proj-other/bin"),
+            in_copy(".venv/bin"),
+        ]);
+        assert_eq!(redirect.list(&mixed).unwrap(), expected);
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        assert_eq!(expected.to_string_lossy().matches(separator).count(), 4);
+    }
+
+    /// The value of `name` in `env`, which must hold it once.
+    fn value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
+        let mut found = env.iter().filter(|(var, _)| same_name(var, name));
+        let value = found.next().map(|(_, value)| value.as_os_str());
+        assert!(found.next().is_none(), "{name} is set twice");
+        value
+    }
+
+    #[test]
+    fn the_run_environment_is_the_users_kept_inside_the_copy() {
+        let project = Project::new();
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&[("README.md", "")]))
+            .unwrap();
+        let mut python = PythonEnvs::new(project.path()).unwrap();
+        python.link(&mut copy).unwrap();
+        let mut additions = env_additions(&copy, &python).unwrap();
+        let root = plain(&std::path::absolute(project.path()).unwrap());
+        let copy_root = plain(&std::path::absolute(copy.path()).unwrap());
+        additions.python_path = vec![copy_root.join("src")];
+
+        let os = |text: &str| OsString::from(text);
+        let user_path =
+            std::env::join_paths([root.join(".venv").join("bin"), p("/usr/bin")]).unwrap();
+        let user = vec![
+            (os("GIT_DIR"), root.join(".git").into_os_string()),
+            (os("GIT_WORK_TREE"), root.clone().into_os_string()),
+            (
+                os("GIT_INDEX_FILE"),
+                root.join(".git/index").into_os_string(),
+            ),
+            (os("GIT_OBJECT_DIRECTORY"), os("objects")),
+            (os("GIT_ALTERNATE_OBJECT_DIRECTORIES"), os("alternates")),
+            (os("GIT_COMMON_DIR"), os("common")),
+            (os("GIT_NAMESPACE"), os("namespace")),
+            (os("GIT_CONFIG_PARAMETERS"), os("'core.worktree'='x'")),
+            (os("GIT_CONFIG_COUNT"), os("1")),
+            (os("GIT_CEILING_DIRECTORIES"), os("elsewhere")),
+            (os("GIT_CONFIG_GLOBAL"), os("my-gitconfig")),
+            (os(if cfg!(windows) { "Path" } else { "PATH" }), user_path),
+            (os("VIRTUAL_ENV"), root.join(".venv").into_os_string()),
+            (os("PYTHONPATH"), root.join("lib").into_os_string()),
+            (os("CARGO_TARGET_DIR"), root.join("target").into_os_string()),
+            (os("YALPER_TEST_OTHER"), os("kept")),
+        ];
+        let env = run_env(user, project.path(), &copy, additions.clone()).unwrap();
+
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            assert_eq!(value(&env, name), None, "{name}");
+        }
+        let ceilings: Vec<PathBuf> =
+            std::env::split_paths(value(&env, "GIT_CEILING_DIRECTORIES").unwrap()).collect();
+        assert!(
+            ceilings.contains(&root.join(".yalper").join("bisect")),
+            "{ceilings:?}"
+        );
+        assert!(ceilings.contains(&root), "{ceilings:?}");
+        assert_eq!(
+            value(&env, "GIT_CONFIG_GLOBAL"),
+            Some(OsStr::new("my-gitconfig"))
+        );
+        assert_eq!(value(&env, "YALPER_TEST_OTHER"), Some(OsStr::new("kept")));
+
+        // The name of `PATH` keeps its case; its project entry points into the copy.
+        let path_name = if cfg!(windows) { "Path" } else { "PATH" };
+        assert!(env.iter().any(|(name, _)| name == path_name));
+        let path: Vec<PathBuf> = std::env::split_paths(value(&env, "PATH").unwrap()).collect();
+        assert_eq!(path, [copy_root.join(".venv").join("bin"), p("/usr/bin")]);
+        assert_eq!(
+            value(&env, "VIRTUAL_ENV"),
+            Some(copy_root.join(".venv").as_os_str())
+        );
+        let python_path: Vec<PathBuf> =
+            std::env::split_paths(value(&env, "PYTHONPATH").unwrap()).collect();
+        assert_eq!(python_path, [copy_root.join("src"), copy_root.join("lib")]);
+        for (name, expected) in &additions.vars {
+            assert_eq!(value(&env, name), Some(expected.as_os_str()), "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn variable_names_are_matched_without_regard_to_case_on_windows() {
+        let project = Project::new();
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&[("README.md", "")]))
+            .unwrap();
+        let python = PythonEnvs::new(project.path()).unwrap();
+        let additions = env_additions(&copy, &python).unwrap();
+        let user = vec![
+            (OsString::from("git_dir"), OsString::from("x")),
+            (OsString::from("Cargo_Target_Dir"), OsString::from("x")),
+            (OsString::from("PythonPath"), OsString::from(r"C:\lib")),
+        ];
+        let env = run_env(user, project.path(), &copy, additions).unwrap();
+        assert_eq!(value(&env, "GIT_DIR"), None);
+        assert_ne!(value(&env, "CARGO_TARGET_DIR"), Some(OsStr::new("x")));
+        assert!(env.iter().any(|(name, _)| name == "PythonPath"));
+    }
+
+    #[test]
+    fn pythonpath_is_set_only_when_it_holds_a_folder() {
+        let project = Project::new();
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&[("README.md", "")]))
+            .unwrap();
+        let python = PythonEnvs::new(project.path()).unwrap();
+        let additions = env_additions(&copy, &python).unwrap();
+        let env = run_env(Vec::new(), project.path(), &copy, additions.clone()).unwrap();
+        assert_eq!(value(&env, "PYTHONPATH"), None);
+        let empty = vec![(OsString::from("PYTHONPATH"), OsString::new())];
+        let env = run_env(empty, project.path(), &copy, additions).unwrap();
+        assert_eq!(value(&env, "PYTHONPATH"), None);
+    }
+
+    #[test]
+    fn a_pythonpath_over_the_windows_limit_is_refused() {
+        let project = Project::new();
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&[("README.md", "")]))
+            .unwrap();
+        let python = PythonEnvs::new(project.path()).unwrap();
+        let mut additions = env_additions(&copy, &python).unwrap();
+        let folder = |index: usize| p(&format!("/{index:0>99}"));
+        // Each folder takes its length plus a separator, except the last; then comes `PYTHONPATH=`.
+        let with_separator = folder(0).as_os_str().len() + 1;
+        let fits = (MAX_PYTHONPATH - "PYTHONPATH=".len() + 1) / with_separator;
+        additions.python_path = (0..fits).map(folder).collect();
+        run_env(Vec::new(), project.path(), &copy, additions.clone()).unwrap();
+
+        additions.python_path.push(folder(fits));
+        let error = run_env(Vec::new(), project.path(), &copy, additions).unwrap_err();
+        assert!(error.to_string().contains("PYTHONPATH"), "{error}");
+    }
+
+    #[test]
+    fn a_project_path_that_cannot_be_written_in_a_path_list_is_an_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent
+            .path()
+            .join(if cfg!(windows) { "a;b" } else { "a:b" });
+        fs::create_dir_all(root.join(".yalper")).unwrap();
+        let yalper = crate::safe_fs::OwnedDir::open(&root.join(".yalper")).unwrap();
+        let mut copy = TestCopy::open(&yalper, 0).unwrap();
+        let project = Project::new();
+        copy.switch(&project.store, project.tree(&[("README.md", "")]))
+            .unwrap();
+        let python = PythonEnvs::new(&root).unwrap();
+        let additions = env_additions(&copy, &python).unwrap();
+        let error = run_env(Vec::new(), &root, &copy, additions).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("git"), "{error}");
     }
 
     #[test]
