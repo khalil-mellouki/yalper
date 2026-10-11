@@ -2207,16 +2207,21 @@ mod tests {
         drop(bisect);
         assert_eq!(state(project.path()), before);
 
-        // A bisect that never uses `copy-0` removes them at its start. A link out of the project is not looked
-        // at.
+        // A bisect that never uses `copy-0` removes them at its start, wherever they point, never following
+        // them. Real folders stay.
         leave_links();
         let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep.txt"), "keep").unwrap();
         let out_link = copy_0.join("tools").join("node_modules").join("out");
         fs::create_dir_all(out_link.parent().unwrap()).unwrap();
         make_link(outside.path(), &out_link).unwrap();
+        write(&copy_0, "tools/.venv/pyvenv.cfg", "made by a test\n");
+        assert_eq!(links_under(&copy_0).len(), 3);
         assert_eq!(remove_left_links(&project.cache), None);
-        assert_eq!(links_under(&copy_0), std::slice::from_ref(&out_link));
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
         assert!(copy_0.join("web/package.json").is_file());
+        assert!(copy_0.join("tools/.venv/pyvenv.cfg").is_file());
+        assert!(outside.path().join("keep.txt").is_file());
         let mut bisect = Bisect::new(&project, Some("exit 0".to_owned()));
         let other_lockfile = project.tree(&[
             (".gitignore", "node_modules/\n.venv/\n"),
@@ -2226,7 +2231,7 @@ mod tests {
         ]);
         assert_eq!(bisect.ready(&project, other_lockfile), "copy-1");
         drop(bisect);
-        assert_eq!(links_under(&copy_0), [out_link]);
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
         assert_eq!(state(project.path()), before);
     }
 
