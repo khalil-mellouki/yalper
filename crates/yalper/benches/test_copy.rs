@@ -1,9 +1,10 @@
 //! Measures how long switching a bisect test copy to the next step takes after a test run: undo what the run
 //! changed, diff the two trees, and write the files that differ.
 //!
-//! The project has 1,000 files in 111 folders, like the hook latency benchmark, and the copy alternates
-//! between two trees 5 files apart. Before each switch a fake test run changes 2 files of the tree and creates
-//! 1. Prints the median and p90 of the switch, and the time of the first fill of an empty copy (report only).
+//! The project has 1,000 files in 111 folders, like the hook latency benchmark, and the copy, in the project's
+//! cache folder under a temporary base folder, alternates between two trees 5 files apart. Before each switch a
+//! fake test run changes 2 files of the tree and creates 1. Prints the median and p90 of the switch, and the
+//! time of the first fill of an empty copy (report only).
 //!
 //! Run with `cargo bench --bench test_copy`. Set `YALPER_BENCH_CALLS` to change the number of switches, and
 //! `YALPER_BENCH_MAX_MEDIAN_MS` to fail (exit code 1) when the median is that many milliseconds or more: CI
@@ -15,7 +16,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use yalper::bisect::{Switched, TestCopy};
+use yalper::bisect::{CacheDir, Switched, TestCopy};
 use yalper::repo::Token;
 use yalper::safe_fs::OwnedDir;
 use yalper::snapshot::{Change, FileKind, ShadowStore};
@@ -84,7 +85,11 @@ fn main() {
         .collect();
     let tree_b = store.edit_tree(tree_a, &changed).unwrap();
 
-    let mut copy = TestCopy::open(&yalper, 0).unwrap();
+    // The project's cache folder in a temporary base folder, as `YALPER_CACHE_DIR` would give.
+    let cache_base = tempfile::tempdir().unwrap();
+    let cache =
+        CacheDir::open_in(&cache_base.path().join("yalper"), project.path(), &token).unwrap();
+    let mut copy = TestCopy::open(&cache, 0).unwrap();
     let start = Instant::now();
     copy.switch(&store, tree_a).unwrap();
     let first_fill = start.elapsed();

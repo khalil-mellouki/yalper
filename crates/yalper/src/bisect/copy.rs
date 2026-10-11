@@ -1,5 +1,5 @@
-//! Test copies: folders `.yalper/bisect/copy-<n>/` that hold the code of one snapshot step, reused from one
-//! step to the next.
+//! Test copies: folders `copy-<n>/` in the project's cache folder (see [`CacheDir`]) that hold the code of one
+//! snapshot step, reused from one step to the next.
 //!
 //! Switching a copy to another step writes only the files that differ, so a switch costs milliseconds even
 //! in a large project. Nothing on disk is trusted between two bisects: the first switch of a [`TestCopy`]
@@ -46,7 +46,7 @@ use std::time::SystemTime;
 
 use gix::ObjectId;
 
-use super::BISECT_DIR;
+use super::CacheDir;
 use super::link::{is_real_dir_no_follow, normalize, plain};
 use crate::repo;
 use crate::safe_fs::{self, OwnedDir};
@@ -55,20 +55,20 @@ use crate::snapshot::{
     TreeFile, file_system_clock, is_racy, nanos_since_epoch, over_budget_reason, validate_path,
 };
 
-/// The file in `.yalper/bisect/` whose mtime gives the time a switch ended, on the file system's clock (see
-/// [`is_racy`]).
-const CLOCK_FILE: &str = "clock";
+/// The file in the project's cache folder whose mtime gives the time a switch ended, on the file system's
+/// clock (see [`is_racy`]).
+pub(super) const CLOCK_FILE: &str = "clock";
 
-/// The folder in `.yalper/bisect/` that holds the `PYTHONPYCACHEPREFIX` folder of each copy,
+/// The folder in the project's cache folder that holds the `PYTHONPYCACHEPREFIX` folder of each copy,
 /// `pycache/copy-<n>/`: Python writes the bytecode of the files a test run imports there, never next to them,
 /// so nothing is written into the project's virtual environment through a link of the copy.
-const PYCACHE_DIR: &str = "pycache";
+pub(super) const PYCACHE_DIR: &str = "pycache";
 
-/// The folder in `.yalper/bisect/` that holds the `CARGO_TARGET_DIR` of each copy, `cargo-target/copy-<n>/`,
-/// reused by every step and every bisect of that copy. One per copy, not one shared by all: cargo tells a
-/// workspace crate is fresh from its source mtimes and from hashes of paths relative to the workspace, so a
-/// copy whose sources are older than another copy's build would run that build.
-const CARGO_TARGET_DIR: &str = "cargo-target";
+/// The folder in the project's cache folder that holds the `CARGO_TARGET_DIR` of each copy,
+/// `cargo-target/copy-<n>/`, reused by every step and every bisect of that copy. One per copy, not one shared by
+/// all: cargo tells a workspace crate is fresh from its source mtimes and from hashes of paths relative to the
+/// workspace, so a copy whose sources are older than another copy's build would run that build.
+pub(super) const CARGO_TARGET_DIR: &str = "cargo-target";
 
 /// The most entries (files and folders) of a tree diff one switch takes. Over it the switch is refused: no
 /// project has that many files, but a crafted store could repeat a large subtree many times.
@@ -85,12 +85,12 @@ const WRITE_THREADS: usize = 4;
 /// bounds memory.
 const QUEUED_WRITES: usize = 16;
 
-/// A test copy: a real folder `.yalper/bisect/copy-<n>/` that [`switch`](Self::switch) fills with the code of
-/// a snapshot step.
+/// A test copy: a real folder `copy-<n>/` in the project's cache folder that [`switch`](Self::switch) fills with
+/// the code of a snapshot step.
 #[derive(Debug)]
 pub struct TestCopy {
-    /// `.yalper/bisect/`, which holds [`CLOCK_FILE`].
-    bisect: OwnedDir,
+    /// The project's cache folder, which holds [`CLOCK_FILE`].
+    cache: CacheDir,
     dir: OwnedDir,
     /// The `info/exclude` file of the project's repository: its rules apply in the copy as in the project.
     info_exclude: Option<PathBuf>,
@@ -134,22 +134,20 @@ pub struct Switched {
 }
 
 impl TestCopy {
-    /// Opens test copy number `number` of the `.yalper/` folder `yalper_dir`, creating `.yalper/bisect/` and
-    /// the copy if they are missing, as real folders accessible only by their owner on Unix. A link at either
-    /// path is refused, and so is a folder other users can change.
-    pub fn open(yalper_dir: &OwnedDir, number: usize) -> io::Result<Self> {
-        let bisect = open_private_dir(&yalper_dir.path().join(BISECT_DIR))?;
+    /// Opens test copy number `number` in the project's cache folder `cache`, creating it if it is missing, as a
+    /// real folder accessible only by its owner on Unix. A link at its path is refused, and so is a folder other
+    /// users can change.
+    pub fn open(cache: &CacheDir, number: usize) -> io::Result<Self> {
+        let cache = cache.try_clone()?;
+        cache.dir().check_still_at_path()?;
         let name = format!("copy-{number}");
-        let dir = open_private_dir(&bisect.path().join(&name))?;
-        let pycache = bisect.path().join(PYCACHE_DIR).join(&name);
-        let cargo_target = bisect.path().join(CARGO_TARGET_DIR).join(name);
-        let info_exclude = yalper_dir
-            .path()
-            .parent()
-            .and_then(repo::git_common_dir)
+        let dir = open_private_dir(&cache.path().join(&name))?;
+        let pycache = cache.path().join(PYCACHE_DIR).join(&name);
+        let cargo_target = cache.path().join(CARGO_TARGET_DIR).join(name);
+        let info_exclude = repo::git_common_dir(cache.project())
             .map(|git_dir| git_dir.join("info").join("exclude"));
         Ok(Self {
-            bisect,
+            cache,
             info_exclude,
             tree: None,
             placed: HashMap::new(),
@@ -166,21 +164,21 @@ impl TestCopy {
         self.dir.path()
     }
 
-    /// The copy's `PYTHONPYCACHEPREFIX` folder, `.yalper/bisect/pycache/copy-<n>/`, which may not exist yet
-    /// (see [`env_additions`](super::env_additions)).
+    /// The copy's `PYTHONPYCACHEPREFIX` folder, `pycache/copy-<n>/` in the project's cache folder, which may not
+    /// exist yet (see [`env_additions`](super::env_additions)).
     pub fn pycache_path(&self) -> &Path {
         &self.pycache
     }
 
-    /// The copy's `CARGO_TARGET_DIR`, `.yalper/bisect/cargo-target/copy-<n>/`, which may not exist yet (see
-    /// [`env_additions`](super::env_additions)).
+    /// The copy's `CARGO_TARGET_DIR`, `cargo-target/copy-<n>/` in the project's cache folder, which may not exist
+    /// yet (see [`env_additions`](super::env_additions)).
     pub fn cargo_target_path(&self) -> &Path {
         &self.cargo_target
     }
 
-    /// `.yalper/bisect/`.
-    pub(super) fn bisect_dir(&self) -> &OwnedDir {
-        &self.bisect
+    /// The project's cache folder, which holds the copy.
+    pub fn cache(&self) -> &CacheDir {
+        &self.cache
     }
 
     /// Sets the paths of the copy, relative and `/`-separated, that Yalper puts there besides the files of
@@ -236,9 +234,9 @@ impl TestCopy {
         }
         let mut changes = checked(&changes.files)?;
 
-        // Checked right before writing: a test run could have replaced the copy's folder, or `.yalper/bisect/`,
+        // Checked right before writing: a test run could have replaced the copy's folder, or the cache folder,
         // which holds the bytecode folder cleaned below.
-        self.bisect.check_still_at_path()?;
+        self.cache.dir().check_still_at_path()?;
         self.dir.check_still_at_path()?;
         let root = self.dir.path();
         make_owner_writable(root, &fs::symlink_metadata(root)?)?;
@@ -322,7 +320,7 @@ impl TestCopy {
         switched.deleted = sweep(root, &placed, &self.extra, self.info_exclude.as_deref())?;
 
         // The local clock if the file system's cannot be read.
-        self.clean_at = file_system_clock(&self.bisect, CLOCK_FILE)
+        self.clean_at = file_system_clock(self.cache.dir(), CLOCK_FILE)
             .unwrap_or_else(|_| nanos_since_epoch(SystemTime::now()));
         self.placed = placed;
         self.tree = Some(to);
@@ -1048,8 +1046,8 @@ struct Bytecode {
 
 impl Bytecode {
     /// For a switch of the copy whose prefix folder is `pycache`, with `mirrors` (see [`prefix_mirrors`]).
-    /// The folder above `pycache` (`.yalper/bisect/pycache/`) must be a real folder too: a test run can put a
-    /// link there.
+    /// The folder above `pycache` (`pycache/` in the project's cache folder) must be a real folder too: a test
+    /// run can put a link there.
     fn new(pycache: &Path, mirrors: &[PathBuf]) -> Self {
         let parent_is_real = pycache.parent().is_some_and(is_real_dir_no_follow);
         let roots = mirrors
@@ -1272,36 +1270,30 @@ mod tests {
     }
 
     #[test]
-    fn copies_are_real_private_folders_in_yalper_bisect() {
+    fn copies_are_real_private_folders_in_the_cache_folder() {
         let project = Project::new();
-        let copy = TestCopy::open(&project.yalper, 3).unwrap();
-        let bisect = project.path().join(".yalper").join(BISECT_DIR);
-        assert!(fs::symlink_metadata(&bisect).unwrap().is_dir());
+        let copy = TestCopy::open(&project.cache, 3).unwrap();
+        let cache = project.cache.path();
         assert_eq!(
             fs::canonicalize(copy.path()).unwrap(),
-            fs::canonicalize(bisect.join("copy-3")).unwrap()
+            fs::canonicalize(cache.join("copy-3")).unwrap()
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for dir in [&bisect, &bisect.join("copy-3")] {
-                let mode = fs::metadata(dir).unwrap().permissions().mode();
-                assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
-            }
+            let mode = fs::metadata(copy.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
         }
         // Opening it again reuses it.
-        TestCopy::open(&project.yalper, 3).unwrap();
+        TestCopy::open(&project.cache, 3).unwrap();
     }
 
     #[test]
-    fn a_link_at_the_bisect_folder_is_refused() {
+    fn a_link_at_a_copy_folder_is_refused() {
         let project = Project::new();
         let outside = tempfile::tempdir().unwrap();
-        link_dir(
-            outside.path(),
-            &project.path().join(".yalper").join(BISECT_DIR),
-        );
-        assert!(TestCopy::open(&project.yalper, 0).is_err());
+        link_dir(outside.path(), &project.cache.path().join("copy-0"));
+        assert!(TestCopy::open(&project.cache, 0).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
@@ -2517,7 +2509,7 @@ mod tests {
         let mut copy = project.copy();
         copy.switch(&project.store, project.typed_tree(&a)).unwrap();
 
-        // A test run replaces `.yalper/bisect/pycache` with a link to a canary holding bytecode at the path the
+        // A test run replaces the `pycache` folder with a link to a canary holding bytecode at the path the
         // copy's own prefix folder would have.
         let canary = tempfile::tempdir().unwrap();
         let text = copy.path().to_string_lossy().into_owned();
@@ -2541,19 +2533,19 @@ mod tests {
         );
     }
 
-    /// Unix only: on Windows the copy holds `.yalper/bisect/` open, so it cannot be renamed.
+    /// Unix only: on Windows the copy holds the project's cache folder open, so it cannot be renamed.
     #[cfg(unix)]
     #[test]
-    fn a_link_in_place_of_the_bisect_folder_is_refused() {
+    fn a_link_in_place_of_the_cache_folder_is_refused() {
         let project = Project::new();
         let tree = project.typed_tree(&[("pkg/mod.py", Regular, "")]);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         // The copy's own path still leads to the same folder, through the link.
-        let bisect = copy.path().parent().unwrap().to_owned();
-        let moved = bisect.with_file_name("moved");
-        fs::rename(&bisect, &moved).unwrap();
-        std::os::unix::fs::symlink(&moved, &bisect).unwrap();
+        let cache = copy.path().parent().unwrap().to_owned();
+        let moved = cache.with_file_name("moved");
+        fs::rename(&cache, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &cache).unwrap();
         let error = copy.switch(&project.store, tree).unwrap_err();
         assert!(error.to_string().contains("was replaced"), "{error}");
     }

@@ -9,29 +9,42 @@ use std::process::Command;
 use gix::ObjectId;
 use gix::objs::tree::{Entry, EntryKind};
 
-use super::TestCopy;
+use super::{CacheDir, TestCopy};
 use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 use crate::snapshot::{Change, FileKind, ShadowStore};
 
-/// A project folder with a `.yalper/` holding a snapshot store.
+/// A project folder with a `.yalper/` holding a snapshot store, and its cache folder in a temporary folder of
+/// its own, as `YALPER_CACHE_DIR` would give.
 pub struct Project {
-    root: tempfile::TempDir,
-    pub yalper: OwnedDir,
+    /// Dropped first: on Windows a folder held open cannot be deleted.
+    pub cache: CacheDir,
     pub store: ShadowStore,
+    _yalper: OwnedDir,
+    root: tempfile::TempDir,
+    _cache_base: tempfile::TempDir,
 }
 
 impl Project {
     pub fn new() -> Self {
+        Self::with_cache_base(tempfile::tempdir().unwrap())
+    }
+
+    /// A project whose Yalper cache folder is `yalper/` in `cache_base`.
+    pub fn with_cache_base(cache_base: tempfile::TempDir) -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".yalper")).unwrap();
         let yalper = OwnedDir::open(&root.path().join(".yalper")).unwrap();
         let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
         let store = ShadowStore::init(&yalper, &token).unwrap();
+        let folder = cache_base.path().join("yalper");
+        let cache = CacheDir::open_in(&folder, root.path(), &token).unwrap();
         Self {
-            root,
-            yalper,
+            cache,
             store,
+            _yalper: yalper,
+            root,
+            _cache_base: cache_base,
         }
     }
 
@@ -86,7 +99,16 @@ impl Project {
 
     /// Test copy number 0.
     pub fn copy(&self) -> TestCopy {
-        TestCopy::open(&self.yalper, 0).unwrap()
+        TestCopy::open(&self.cache, 0).unwrap()
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        // Bisect data never goes into the project any more.
+        if !std::thread::panicking() {
+            assert!(!self.path().join(".yalper").join("bisect").exists());
+        }
     }
 }
 
@@ -138,6 +160,22 @@ pub fn tool(names: &[&'static str]) -> Option<&'static str> {
         "{names:?} is required (YALPER_REQUIRE_TOOLS=1) but does not run"
     );
     found
+}
+
+/// The short 8.3 form of the existing `path`, as `cmd.exe` gives it: `None` if the file system keeps no short
+/// names, `path` needs none, or what `cmd.exe` printed does not exist.
+#[cfg(windows)]
+pub fn short_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let output = Command::new("cmd")
+        .raw_arg(format!(
+            "/d /c for %I in (\"{}\") do @echo %~sI",
+            path.display()
+        ))
+        .output()
+        .unwrap();
+    let short = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    (short.to_string_lossy().contains('~') && short != path && short.exists()).then_some(short)
 }
 
 /// The Python interpreter of the virtual environment at `venv`.

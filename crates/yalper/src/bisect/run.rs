@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::BISECT_DIR;
+use super::CacheDir;
 use super::copy::{open_private_dir, remove_entry};
 use crate::safe_fs::{Access, OwnedDir};
 
@@ -50,8 +50,8 @@ pub const SKIP_EXIT_CODE: i32 = 125;
 /// than any test suite prints, so only a run stuck printing in a loop reaches it.
 pub const MAX_LOG_BYTES: u64 = 1 << 30;
 
-/// The folder inside `.yalper/bisect/` that holds the output logs of the latest bisect.
-const LOGS_DIR: &str = "logs";
+/// The folder in the project's cache folder that holds the output logs of the latest bisect.
+pub(super) const LOGS_DIR: &str = "logs";
 
 /// The longest pause between two checks of the main process. Pauses start at 1 ms and double, so a command
 /// that ends quickly is not kept waiting.
@@ -502,20 +502,21 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// The folder `.yalper/bisect/logs/`, which holds one output log per run of the latest bisect. Logs may hold
-/// values the tests print (secrets from env files included): they stay inside `.yalper/`, private to their
-/// owner on Unix, and each bisect removes the logs of the one before.
+/// The folder `logs/` in the project's cache folder, which holds one output log per run of the latest bisect.
+/// Logs may hold values the tests print (secrets from env files included): they stay in the project's cache
+/// folder, outside the project, private to their owner on Unix, and each bisect removes the logs of the one
+/// before.
 #[derive(Debug)]
 pub struct Logs {
     dir: OwnedDir,
 }
 
 impl Logs {
-    /// Opens the logs folder of the `.yalper/` folder `yalper_dir`, creating it and `.yalper/bisect/` if they
-    /// are missing (real folders, 0700 on Unix), and removes everything in it, never following a link.
-    pub fn open(yalper_dir: &OwnedDir) -> io::Result<Self> {
-        let bisect = open_private_dir(&yalper_dir.path().join(BISECT_DIR))?;
-        let dir = open_private_dir(&bisect.path().join(LOGS_DIR))?;
+    /// Opens the logs folder of the project's cache folder `cache`, creating it if it is missing (a real folder,
+    /// 0700 on Unix), and removes everything in it, never following a link.
+    pub fn open(cache: &CacheDir) -> io::Result<Self> {
+        cache.dir().check_still_at_path()?;
+        let dir = open_private_dir(&cache.path().join(LOGS_DIR))?;
         for entry in fs::read_dir(dir.path())? {
             let path = entry?.path();
             remove_entry(&path, &fs::symlink_metadata(&path)?)?;
@@ -1011,14 +1012,14 @@ mod tests {
         let canary = tempfile::tempdir().unwrap();
         write(canary.path(), "keep.txt", "keep me");
         let before = state(canary.path());
-        let logs = Logs::open(&project.yalper).unwrap();
-        assert!(logs.path().ends_with(".yalper/bisect/logs"));
+        let logs = Logs::open(&project.cache).unwrap();
+        assert_eq!(logs.path().parent(), Some(project.cache.path()));
         write(logs.path(), "1.log", "old");
         write(logs.path(), "folder/2.log", "old");
         let linked = crate::bisect::link::make_link(canary.path(), &logs.path().join("link"));
         linked.unwrap();
 
-        let logs = Logs::open(&project.yalper).unwrap();
+        let logs = Logs::open(&project.cache).unwrap();
         assert_eq!(fs::read_dir(logs.path()).unwrap().count(), 0);
         assert_eq!(state(canary.path()), before);
         #[cfg(unix)]
@@ -1032,7 +1033,7 @@ mod tests {
     #[test]
     fn a_log_is_created_empty_and_only_as_a_plain_file() {
         let project = Project::new();
-        let logs = Logs::open(&project.yalper).unwrap();
+        let logs = Logs::open(&project.cache).unwrap();
         write(logs.path(), "run-1.log", "from before");
         let mut log = logs.create("run-1.log").unwrap();
         let mut text = String::new();
@@ -1060,7 +1061,7 @@ mod tests {
     #[test]
     fn a_run_writes_into_a_created_log() {
         let project = Project::new();
-        let logs = Logs::open(&project.yalper).unwrap();
+        let logs = Logs::open(&project.cache).unwrap();
         let log = logs.create("step-1.log").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let run = run(

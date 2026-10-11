@@ -1,11 +1,15 @@
 //! `yalper bisect`: finds the step of a session that broke the tests by running them against the snapshots
 //! of its steps.
 //!
-//! The tests never run in the project: each run happens in a test copy inside `.yalper/bisect/` that holds
-//! the code of one step (see [`TestCopy`]), and is started by [`run`] with the environment of [`run_env`]. The
-//! boundary files of [`write_boundaries`] stop tools from searching the project above the copy.
+//! The tests never run in the project: each run happens in a test copy that holds the code of one step (see
+//! [`TestCopy`]), and is started by [`run`] with the environment of [`run_env`]. The copies, and all other
+//! working data of bisect, live outside the project in its folder of the user's cache folder (see
+//! [`CacheDir`]), so tools that search the folders above a copy never reach the project. The boundary files of
+//! [`write_boundaries`] stop those searches before the user's home folder, and [`clean_root`] removes what tools
+//! and tests leave next to them.
 
 mod boundary;
+mod cache;
 mod copy;
 mod env;
 mod link;
@@ -16,6 +20,7 @@ mod run;
 mod testing;
 
 pub use boundary::write_boundaries;
+pub use cache::{CACHE_DIR_VAR, CacheDir, clean_root};
 pub use copy::{Switched, TestCopy};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
@@ -24,6 +29,3 @@ pub use python::{LinkedEnvs, PythonEnvs};
 pub use run::{
     Exit, Logs, Outcome, Run, SKIP_EXIT_CODE, STOP, STOPPED_EXIT_CODE, handle_ctrl_c, run,
 };
-
-/// The folder inside `.yalper/` that holds the test copies.
-pub const BISECT_DIR: &str = "bisect";

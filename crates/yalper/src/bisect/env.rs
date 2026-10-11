@@ -3,22 +3,23 @@
 //!
 //! - `PYTHONPATH` starts with the copy's own folders of the project's editable installs (see
 //!   [`PythonEnvs::python_path`]);
-//! - `PYTHONPYCACHEPREFIX` sends Python's bytecode to the copy's folder `.yalper/bisect/pycache/copy-<n>/`
-//!   (Python 3.8 and later), so none is written into the project's virtual environment through the copy's
-//!   link to it;
+//! - `PYTHONPYCACHEPREFIX` sends Python's bytecode to the copy's folder `pycache/copy-<n>/` in the project's
+//!   cache folder (Python 3.8 and later), so none is written into the project's virtual environment through
+//!   the copy's link to it;
 //! - `UV_NO_SYNC=1` stops `uv run` from syncing, and so writing into, that environment;
-//! - `CARGO_TARGET_DIR` is the copy's folder `.yalper/bisect/cargo-target/copy-<n>/`, reused by every step and
-//!   every bisect of that copy: the project's `target/` is never used, and cargo's own fingerprints decide
-//!   what to rebuild. The first bisect of a Rust project compiles its dependencies there once per copy (see
-//!   [`TestCopy::cargo_target_path`] for why copies do not share one). `CARGO_BUILD_BUILD_DIR` names the same
-//!   folder, for cargo's intermediate build files.
+//! - `CARGO_TARGET_DIR` is the copy's folder `cargo-target/copy-<n>/` in the project's cache folder, reused by
+//!   every step and every bisect of that copy: the project's `target/` is never used, and cargo's own
+//!   fingerprints decide what to rebuild. The first bisect of a Rust project compiles its dependencies there
+//!   once per copy (see [`TestCopy::cargo_target_path`] for why copies do not share one).
+//!   `CARGO_BUILD_BUILD_DIR` names the same folder, for cargo's intermediate build files.
 //!
 //! [`run_env`] builds the complete environment of a run from the user's, so that the tools it runs stay in the
-//! copy even though the copy sits inside the project (see also [`write_boundaries`](super::write_boundaries)):
+//! copy, which lives outside the project, in the project's cache folder (see [`CacheDir`](super::CacheDir)):
 //!
 //! - the variables that tell git which repository to use are removed, and `GIT_CEILING_DIRECTORIES` stops git
-//!   from searching for one above the copy: a test running `git stash` or `git clean` fails with "not a git
-//!   repository" instead of acting on the user's repository;
+//!   from searching for one above the copy or the project's cache folder: a test running `git stash` or `git
+//!   clean` fails with "not a git repository" instead of acting on the user's repository or on one around the
+//!   cache folder (a home folder kept in git);
 //! - every variable whose value is a path into the project, or a known list of paths holding one (an activated
 //!   virtual environment in `PATH` and `VIRTUAL_ENV`, `NODE_PATH`, `UV_PROJECT_ENVIRONMENT`, npm's `INIT_CWD`),
 //!   points to the same place in the copy instead.
@@ -30,9 +31,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::copy::remove_entry;
 use super::link::{has_special_prefix, is_under, normalize, plain};
-use super::{BISECT_DIR, PythonEnvs, TestCopy};
-use crate::hook::YALPER_DIR;
-use crate::snapshot::CASE_INSENSITIVE;
+use super::{PythonEnvs, TestCopy};
 
 /// The variables that tell git which repository, index or objects to use, removed from the environment of a
 /// test run: the ones git itself clears before it runs a command in another repository (`local_repo_env` in
@@ -63,7 +62,7 @@ const GIT_CEILING_DIRECTORIES: &str = "GIT_CEILING_DIRECTORIES";
 
 /// The variables, besides `PYTHONPATH`, whose value is a list of paths: each entry is redirected on its own.
 /// Any other variable is redirected only when its whole value is one path (see [`Redirect::single`]).
-const PATH_LISTS: [&str; 7] = [
+const PATH_LISTS: [&str; 21] = [
     "PATH",
     "NODE_PATH",
     "LD_LIBRARY_PATH",
@@ -71,6 +70,20 @@ const PATH_LISTS: [&str; 7] = [
     "DYLD_FALLBACK_LIBRARY_PATH",
     "MANPATH",
     "CLASSPATH",
+    "GOPATH",
+    "PKG_CONFIG_PATH",
+    "CPATH",
+    "LIBRARY_PATH",
+    "PERL5LIB",
+    "RUBYLIB",
+    "GEM_PATH",
+    "MYPYPATH",
+    "CMAKE_PREFIX_PATH",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_DIRS",
+    "KUBECONFIG",
+    "JULIA_LOAD_PATH",
+    "PSModulePath",
 ];
 
 /// The longest `PYTHONPATH` a run may get, name and `=` included: the limit of one environment variable on
@@ -89,13 +102,13 @@ pub struct EnvAdditions {
 
 /// The environment additions for a test run in `copy`, whose Python environments are `python`. Call it
 /// before every run, after [`PythonEnvs::link`]: it also makes sure that the folders the variables name are
-/// real folders inside `.yalper/bisect/`, since a test run could have put a link in their place.
+/// real folders inside the project's cache folder, since a test run could have put a link in their place.
 pub fn env_additions(copy: &TestCopy, python: &PythonEnvs) -> io::Result<EnvAdditions> {
-    copy.bisect_dir().check_still_at_path()?;
+    copy.cache().dir().check_still_at_path()?;
     let pycache = plain(&std::path::absolute(copy.pycache_path())?);
     let cargo_target = plain(&std::path::absolute(copy.cargo_target_path())?);
     for folder in [&pycache, &cargo_target] {
-        // `.yalper/bisect/pycache/` or `.yalper/bisect/cargo-target/` first.
+        // `pycache/` or `cargo-target/` of the cache folder first.
         if let Some(parent) = folder.parent() {
             make_real_dir(parent)?;
         }
@@ -139,52 +152,74 @@ fn make_real_dir(path: &Path) -> io::Result<()> {
 /// The complete environment of a test run in `copy` of the project at `project`, for [`run`](super::run):
 /// the user's environment `user` (usually `std::env::vars_os()`) with
 ///
-/// - the git variables of [`GIT_REPOSITORY_VARS`] removed, and `GIT_CEILING_DIRECTORIES` set to
-///   `.yalper/bisect/` and to the project folder: git never searches above the copy for a repository, and a
-///   command run one folder above the copy does not reach the project either;
+/// - the git variables of [`GIT_REPOSITORY_VARS`] removed, and `GIT_CEILING_DIRECTORIES` set to the project's
+///   cache folder and Yalper's cache folder above it, each as computed and as resolved: git always looks for a
+///   repository in the folder it starts in but never moves up into a listed one, so neither a run in the copy
+///   nor one at the top of the project's cache folder finds a repository above (a home folder kept in git);
 /// - the entries of the path lists of [`PATH_LISTS`] and `PYTHONPATH`, and the value of any other variable that
-///   is as a whole one path, pointing to the same place in the copy when they point into the project, outside
-///   `.yalper/` (see [`Redirect`]); on Windows, the hidden variables holding the current folder of each drive
-///   (`=C:`) are left out when they point into the project;
+///   is as a whole one path, pointing to the same place in the copy when they point into the project (see
+///   [`Redirect`]); on Windows, the hidden variables holding the current folder of each drive (`=C:`) are left
+///   out when they point into the project;
 /// - `PYTHONPATH` starting with the folders of `additions`, and the variables of `additions` in place of the
 ///   user's.
 ///
-/// Fails if `PYTHONPATH` would be longer than [`MAX_PYTHONPATH`]; if the project's path holds the separator of
-/// path lists (`;` on Windows, `:` elsewhere), since git would then read a wrong `GIT_CEILING_DIRECTORIES`; and
-/// if the project is the user's home folder or holds it, since tools keep their settings and caches there.
+/// Fails if `PYTHONPATH` would be longer than [`MAX_PYTHONPATH`]; if the path of the cache folder holds the
+/// separator of path lists (`;` on Windows, `:` elsewhere), since git would then read a wrong
+/// `GIT_CEILING_DIRECTORIES`; and if the project is the user's home folder or holds it, since tools keep their
+/// settings and caches there.
 pub fn run_env(
     user: impl IntoIterator<Item = (OsString, OsString)>,
     project: &Path,
     copy: &TestCopy,
     additions: EnvAdditions,
 ) -> io::Result<Vec<(OsString, OsString)>> {
-    let project = forms(project)?;
+    let mut ceilings: Vec<PathBuf> = Vec::new();
+    for spelling in copy.cache().spellings() {
+        for form in forms(spelling)? {
+            for folder in [form.parent().map(Path::to_owned), Some(form)]
+                .into_iter()
+                .flatten()
+            {
+                if !ceilings.contains(&folder) {
+                    ceilings.push(folder);
+                }
+            }
+        }
+    }
     let separator = if cfg!(windows) { ';' } else { ':' };
-    if let Some(path) = project
+    if let Some(path) = ceilings
         .iter()
         .find(|path| path.to_string_lossy().contains(separator))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "cannot keep the test runs inside the test copy: the project's path holds {separator:?}, which \
-                 cannot be written in a list of paths for git: {}",
-                path.display()
+                "cannot keep the test runs inside the test copy: the path of the cache folder holds \
+                 {separator:?}, which cannot be written in a list of paths for git: {}. Set {} to another \
+                 folder",
+                path.display(),
+                super::CACHE_DIR_VAR
             ),
         ));
     }
-    let ceilings: Vec<PathBuf> = project
-        .iter()
-        .flat_map(|root| [root.join(YALPER_DIR).join(BISECT_DIR), root.clone()])
-        .collect();
     let ceilings = join(&ceilings)?;
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut project = forms(project)?;
+    #[cfg(unix)]
+    for form in through_top_level_links(&project) {
+        if !project.contains(&form) {
+            project.push(form);
+        }
+    }
     let redirect = Redirect {
         project,
         copy: plain(&std::path::absolute(copy.path())?),
     };
 
     let user: Vec<(OsString, OsString)> = user.into_iter().collect();
-    // Yalper's own home folder too: on Unix it falls back to the password database when `HOME` is not set.
+    // Yalper's own home folder too: on Unix it falls back to the password database when `HOME` is not set. Each
+    // is also resolved, in case it is written through a link (`/home` is a link to `/var/home` on Fedora
+    // Silverblue); nothing else in the environment is looked up.
     let homes = user
         .iter()
         .filter(|(name, _)| {
@@ -193,9 +228,15 @@ pub fn run_env(
                 .any(|home| same_name(name, home))
         })
         .map(|(_, value)| PathBuf::from(value))
-        .chain(std::env::home_dir());
+        .chain(std::env::home_dir())
+        .filter(|home| !home.as_os_str().is_empty())
+        .flat_map(|home| {
+            let real = home.is_absolute().then(|| fs::canonicalize(&home).ok());
+            let real = real.flatten().map(|real| plain(&real));
+            [Some(home), real].into_iter().flatten()
+        });
     for home in homes {
-        if !home.as_os_str().is_empty() && redirect.relative(&home).is_some() {
+        if redirect.relative(&home).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -283,6 +324,36 @@ fn forms(path: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(forms)
 }
 
+/// The project's forms `forms` also written through each link at the top of `/` that leads to a folder above
+/// it: `/home/me/proj` for `/var/home/me/proj` when `/home` is a link to `var/home` (Fedora Silverblue), and
+/// `/tmp/proj` for `/private/tmp/proj` on macOS. Paths in the environment may be written that way. Only the
+/// entries of `/` are listed and only links are read, never resolved: no automount is ever triggered.
+#[cfg(unix)]
+fn through_top_level_links(forms: &[PathBuf]) -> Vec<PathBuf> {
+    let root = Path::new("/");
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            continue;
+        }
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = normalize(&root.join(target));
+        for form in forms {
+            if target != root && is_under(form, &target) {
+                let mut through = entry.path();
+                through.extend(form.components().skip(target.components().count()));
+                found.push(through);
+            }
+        }
+    }
+    found
+}
+
 /// `paths` joined with the system's separator for path lists (`;` on Windows, `:` elsewhere).
 fn join(paths: &[PathBuf]) -> io::Result<OsString> {
     std::env::join_paths(paths).map_err(|error| {
@@ -303,20 +374,10 @@ struct Redirect {
 }
 
 impl Redirect {
-    /// The path in the copy for `path`, if `path` is the project folder or inside it, outside `.yalper/` (see
+    /// The path in the copy for `path`, if `path` is the project folder or inside it (see
     /// [`relative`](Self::relative)).
     fn path(&self, path: &Path) -> Option<PathBuf> {
         let rest = self.relative(path)?;
-        if let Some(first) = rest.first() {
-            let in_yalper = if CASE_INSENSITIVE {
-                first.eq_ignore_ascii_case(YALPER_DIR)
-            } else {
-                first == YALPER_DIR
-            };
-            if in_yalper {
-                return None;
-            }
-        }
         let mut redirected = self.copy.clone();
         for name in &rest {
             redirected.push(name);
@@ -445,11 +506,16 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    use crate::bisect::CacheDir;
     use crate::bisect::link::make_link;
+    #[cfg(windows)]
+    use crate::bisect::testing::short_path;
     use crate::bisect::testing::{Project, state, tool, write};
+    use crate::repo::Token;
+    use crate::snapshot::CASE_INSENSITIVE;
 
     #[test]
-    fn the_variables_name_folders_of_yalper_bisect() {
+    fn the_variables_name_folders_of_the_cache_folder() {
         let project = Project::new();
         let mut copy = project.copy();
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
@@ -460,7 +526,10 @@ mod tests {
 
         // The copy's folder: canonical on Unix, where `/var` may be a link to `/private/var`.
         let bisect = plain(&std::path::absolute(copy.path().parent().unwrap()).unwrap());
-        assert!(bisect.ends_with(".yalper/bisect"));
+        assert_eq!(
+            fs::canonicalize(&bisect).unwrap(),
+            fs::canonicalize(project.cache.path()).unwrap()
+        );
         let pycache = bisect.join("pycache").join("copy-0");
         let cargo_target = bisect.join("cargo-target").join("copy-0");
         assert_eq!(
@@ -498,16 +567,16 @@ mod tests {
         }
     }
 
-    /// The project `/proj`, also reached as `/real/proj`, and its copy `/proj/.yalper/bisect/copy-0`.
+    /// The project `/proj`, also reached as `/real/proj`, and its copy `/cache/proj-1/copy-0`.
     fn redirect() -> Redirect {
         Redirect {
             project: vec![p("/proj"), p("/real/proj")],
-            copy: p("/proj/.yalper/bisect/copy-0"),
+            copy: p("/cache/proj-1/copy-0"),
         }
     }
 
     fn in_copy(path: &str) -> PathBuf {
-        let mut in_copy = p("/proj/.yalper/bisect/copy-0");
+        let mut in_copy = p("/cache/proj-1/copy-0");
         in_copy.extend(path.split('/').filter(|name| !name.is_empty()));
         in_copy
     }
@@ -532,18 +601,16 @@ mod tests {
         assert_eq!(path("/pro"), None);
         assert_eq!(path("/"), None);
         assert_eq!(path("/real"), None);
-        // Yalper's own folder, the copies included, is left as it is.
-        assert_eq!(path("/proj/.yalper/bin"), None);
-        assert_eq!(path("/proj/.yalper/bisect/copy-0/bin"), None);
-        assert_eq!(path("/proj/.yalperx/bin"), Some(in_copy(".yalperx/bin")));
+        // No folder of the project is left out, `.yalper` included: the copies are no longer there.
+        assert_eq!(path("/proj/.yalper/bin"), Some(in_copy(".yalper/bin")));
+        // The copy itself is outside the project.
+        assert_eq!(path("/cache/proj-1/copy-0/bin"), None);
         // Relative paths already lead into the copy, where the run starts.
         assert_eq!(redirect.path(Path::new("node_modules/.bin")), None);
         assert_eq!(redirect.path(Path::new("")), None);
         // Case, where the file system ignores it.
         let upper = path("/PROJ/Bin");
         assert_eq!(upper, CASE_INSENSITIVE.then(|| in_copy("Bin")));
-        let yalper = path("/proj/.YALPER/bin");
-        assert_eq!(yalper, (!CASE_INSENSITIVE).then(|| in_copy(".YALPER/bin")));
     }
 
     #[cfg(windows)]
@@ -575,14 +642,15 @@ mod tests {
     fn a_project_on_a_network_share_is_matched_in_both_unc_forms() {
         let redirect = Redirect {
             project: vec![PathBuf::from(r"\\server\share\proj")],
-            copy: PathBuf::from(r"\\server\share\proj\.yalper\bisect\copy-0"),
+            copy: PathBuf::from(r"C:\cache\proj-1\copy-0"),
         };
         let in_copy = |rest: &str| Some(redirect.copy.join(rest));
         let path = |text: &str| redirect.path(Path::new(text));
         assert_eq!(path(r"\\server\share\proj\bin"), in_copy("bin"));
         assert_eq!(path(r"\\?\UNC\server\share\proj\bin"), in_copy("bin"));
         assert_eq!(path(r"\\SERVER\Share\proj\bin"), in_copy("bin"));
-        assert_eq!(path(r"\proj\bin"), in_copy("bin"));
+        // From the root of the copy's drive, not the share.
+        assert_eq!(path(r"\proj\bin"), None);
         // Not resolved: network paths are never looked up.
         assert_eq!(path(r"\\server\share\other\bin"), None);
         assert_eq!(path(r"\\server\other\proj\bin"), None);
@@ -677,11 +745,22 @@ mod tests {
         }
         let ceilings: Vec<PathBuf> =
             std::env::split_paths(value(&env, "GIT_CEILING_DIRECTORIES").unwrap()).collect();
+        // The project's cache folder and Yalper's above it, as held open and resolved; not the project.
+        let cache = project.cache.path();
+        let real = plain(&fs::canonicalize(cache).unwrap());
+        for folder in [
+            cache,
+            cache.parent().unwrap(),
+            &real,
+            real.parent().unwrap(),
+        ] {
+            let folder = plain(&std::path::absolute(folder).unwrap());
+            assert!(ceilings.contains(&folder), "{folder:?} not in {ceilings:?}");
+        }
         assert!(
-            ceilings.contains(&root.join(".yalper").join("bisect")),
+            !ceilings.iter().any(|ceiling| is_under(ceiling, &root)),
             "{ceilings:?}"
         );
-        assert!(ceilings.contains(&root), "{ceilings:?}");
         assert_eq!(
             value(&env, "GIT_CONFIG_GLOBAL"),
             Some(OsStr::new("my-gitconfig"))
@@ -735,20 +814,33 @@ mod tests {
             ("npm_config_local_prefix", ""),
             ("npm_package_json", "package.json"),
             ("YALPER_TEST_ANY_NAME", "anything"),
+            ("YALPER_TEST_YALPER", ".yalper"),
         ];
         let mut user: Vec<(OsString, OsString)> = moved
             .iter()
             .map(|(name, rest)| ((*name).into(), root.join(rest).into()))
             .collect();
-        user.push((
-            "NODE_PATH".into(),
-            list(&[root.join("node_modules"), outside.join("lib")]),
-        ));
+        let lists = [
+            "NODE_PATH",
+            "GOPATH",
+            "PKG_CONFIG_PATH",
+            "CPATH",
+            "LIBRARY_PATH",
+            "PERL5LIB",
+            "RUBYLIB",
+            "GEM_PATH",
+            "MYPYPATH",
+            "CMAKE_PREFIX_PATH",
+            "XDG_DATA_DIRS",
+            "XDG_CONFIG_DIRS",
+            "KUBECONFIG",
+            "JULIA_LOAD_PATH",
+            "PSModulePath",
+        ];
+        for name in lists {
+            user.push((name.into(), list(&[root.join("lib"), outside.join("lib")])));
+        }
         user.push(("YALPER_TEST_OUTSIDE".into(), outside.join("x").into()));
-        user.push((
-            "YALPER_TEST_YALPER".into(),
-            root.join(".yalper").join("x").into(),
-        ));
         user.push(("YALPER_TEST_WORD".into(), "proj".into()));
         let env = run_env(user, project.path(), &copy, additions).unwrap();
 
@@ -760,17 +852,16 @@ mod tests {
             };
             assert_eq!(value(&env, name), Some(expected.as_os_str()), "{name}");
         }
-        assert_eq!(
-            value(&env, "NODE_PATH"),
-            Some(list(&[copy_root.join("node_modules"), outside.join("lib")]).as_os_str())
-        );
+        for name in lists {
+            assert_eq!(
+                value(&env, name),
+                Some(list(&[copy_root.join("lib"), outside.join("lib")]).as_os_str()),
+                "{name}"
+            );
+        }
         assert_eq!(
             value(&env, "YALPER_TEST_OUTSIDE"),
             Some(outside.join("x").as_os_str())
-        );
-        assert_eq!(
-            value(&env, "YALPER_TEST_YALPER"),
-            Some(root.join(".yalper").join("x").as_os_str())
         );
         assert_eq!(value(&env, "YALPER_TEST_WORD"), Some(OsStr::new("proj")));
     }
@@ -822,22 +913,6 @@ mod tests {
         );
     }
 
-    /// The short 8.3 form of the existing `path`, as `cmd.exe` gives it: `None` if the file system keeps no short
-    /// names or `path` needs none.
-    #[cfg(windows)]
-    fn short_path(path: &Path) -> Option<PathBuf> {
-        use std::os::windows::process::CommandExt;
-        let output = Command::new("cmd")
-            .raw_arg(format!(
-                "/d /c for %I in (\"{}\") do @echo %~sI",
-                path.display()
-            ))
-            .output()
-            .unwrap();
-        let short = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
-        (short.to_string_lossy().contains('~') && short != path).then_some(short)
-    }
-
     #[cfg(windows)]
     #[test]
     fn a_short_8_3_name_of_the_project_points_into_the_copy() {
@@ -858,7 +933,10 @@ mod tests {
             redirect.path(&short.join("bin")),
             Some(copy_root.join("bin"))
         );
-        assert_eq!(redirect.path(&short.join(".yalper")), None);
+        assert_eq!(
+            redirect.path(&short.join(".yalper")),
+            Some(copy_root.join(".yalper"))
+        );
     }
 
     #[test]
@@ -872,9 +950,36 @@ mod tests {
                 assert!(error.to_string().contains("home folder"), "{error}");
             }
         }
+        // A home folder written through a link to the project, or to a folder inside it.
+        let links = tempfile::tempdir().unwrap();
+        for (index, target) in [root.clone(), root.join("me")].iter().enumerate() {
+            fs::create_dir_all(target).unwrap();
+            let link = links.path().join(index.to_string());
+            make_link(target, &link).unwrap();
+            let user = vec![("HOME".into(), link.into())];
+            let error = run_env(user, project.path(), &copy, additions.clone()).unwrap_err();
+            assert!(error.to_string().contains("home folder"), "{error}");
+        }
         // A project inside the home folder, the usual case.
         let user = vec![("HOME".into(), root.parent().unwrap().into())];
         run_env(user, project.path(), &copy, additions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_project_is_also_matched_through_the_links_at_the_top_of_the_root() {
+        // `/bin` is a link to `usr/bin` on most Linux systems, `/tmp` to `private/tmp` on macOS.
+        let link = fs::read_dir("/").unwrap().flatten().find_map(|entry| {
+            let target = fs::read_link(entry.path()).ok()?;
+            let target = normalize(&Path::new("/").join(target));
+            (target != Path::new("/") && target.is_dir()).then(|| (entry.path(), target))
+        });
+        let Some((link, target)) = link else {
+            return;
+        };
+        let forms = through_top_level_links(&[target.join("proj")]);
+        assert!(forms.contains(&link.join("proj")), "{forms:?}");
+        assert!(through_top_level_links(&[PathBuf::from("/nowhere-yalper/proj")]).is_empty());
     }
 
     #[cfg(windows)]
@@ -947,22 +1052,24 @@ mod tests {
     }
 
     #[test]
-    fn a_project_path_that_cannot_be_written_in_a_path_list_is_an_error() {
-        let parent = tempfile::tempdir().unwrap();
-        let root = parent
-            .path()
-            .join(if cfg!(windows) { "a;b" } else { "a:b" });
-        fs::create_dir_all(root.join(".yalper")).unwrap();
-        let yalper = crate::safe_fs::OwnedDir::open(&root.join(".yalper")).unwrap();
-        let mut copy = TestCopy::open(&yalper, 0).unwrap();
+    fn a_cache_path_that_cannot_be_written_in_a_path_list_is_an_error() {
         let project = Project::new();
+        let base = tempfile::tempdir().unwrap();
+        let folder = base
+            .path()
+            .join(if cfg!(windows) { "a;b" } else { "a:b" })
+            .join("yalper");
+        let token = Token::parse(&"c".repeat(32)).unwrap();
+        let cache = CacheDir::open_in(&folder, project.path(), &token).unwrap();
+        let mut copy = TestCopy::open(&cache, 0).unwrap();
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
-        let python = PythonEnvs::new(&root).unwrap();
+        let python = PythonEnvs::new(project.path()).unwrap();
         let additions = env_additions(&copy, &python).unwrap();
-        let error = run_env(Vec::new(), &root, &copy, additions).unwrap_err();
+        let error = run_env(Vec::new(), project.path(), &copy, additions).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("git"), "{error}");
+        assert!(error.to_string().contains("YALPER_CACHE_DIR"), "{error}");
     }
 
     #[test]
@@ -978,7 +1085,7 @@ mod tests {
         env_additions(&copy, &python).unwrap();
 
         // A test run replaces the folders with links to the canary, then the copy's own folders with files.
-        let bisect = project.path().join(".yalper/bisect");
+        let bisect = project.cache.path().to_owned();
         for folder in ["pycache", "cargo-target"] {
             let path = bisect.join(folder);
             fs::remove_dir_all(&path).unwrap();
@@ -1136,7 +1243,7 @@ mod tests {
 
         // Copy 1 gets its step first, so its sources are older than the build copy 0 makes next: with one
         // target folder shared by both, cargo would take that build as fresh for copy 1.
-        let mut second = TestCopy::open(&project.yalper, 1).unwrap();
+        let mut second = TestCopy::open(&project.cache, 1).unwrap();
         second.switch(&project.store, tree(1)).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         for file in ["Cargo.toml", "src/main.rs"] {
