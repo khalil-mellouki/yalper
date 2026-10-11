@@ -16,9 +16,11 @@
 
 mod boundary;
 mod cache;
+mod command;
 mod copy;
 mod deps;
 mod engine;
+mod entries;
 mod env;
 mod link;
 mod node_modules;
@@ -32,12 +34,14 @@ pub use cache::{
     CACHE_DIR_KEY, CACHE_DIR_VAR, CacheDir, ProjectFolder, ProjectFolders, clean_root,
     find_project_folders, remove_stale,
 };
+pub use command::{Ended, MAX_RETRIES, Options, Screen, command, parse_timeout};
 pub use copy::{Switched, TestCopy};
 pub use deps::{COPIES_KEY, DependencySets, InstallFailure, Prepared, SetCopy};
 pub use engine::{
     Answer, End, Failure, LINKER_RERUNS, Reason, Report, Settings, Skip, Tested, Trial,
     automatic_limit, bisect,
 };
+pub use entries::{Entries, Entry, session_entries};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
 pub use node_modules::{Linked, NodeModules};

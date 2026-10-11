@@ -328,11 +328,12 @@ impl Store {
         })
     }
 
-    /// Opens the database in `dir` for reading only, for commands such as `yalper log`: it never creates the
-    /// database, migrates it or stores a token, never takes the [`WriterLock`], and writes nothing when it
-    /// closes. A missing or empty database gives [`Error::MissingSchema`], an older schema
-    /// [`Error::OlderSchema`], a newer one [`Error::NewerSchema`]. The schema and token checks of
-    /// [`open`](Self::open) apply. SQLite may still create its empty WAL and shared memory files, as it does
+    /// Opens the database in `dir` for commands that do not record, such as `yalper log`: it never creates the
+    /// database, migrates it or stores a token, never takes the [`WriterLock`], and does not empty the WAL when
+    /// it closes. Such commands mostly read; the connection can still write small values with
+    /// [`set_meta`](Self::set_meta), as `yalper bisect` does. A missing or empty database gives
+    /// [`Error::MissingSchema`], an older schema [`Error::OlderSchema`], a newer one [`Error::NewerSchema`]. The
+    /// schema and token checks of [`open`](Self::open) apply. SQLite may still create its empty WAL and shared memory files, as it does
     /// for any reader of a WAL database.
     pub fn open_for_reading(dir: &OwnedDir, token: &Token) -> Result<Self> {
         // On Windows `guard_path` creates a missing file, so a missing database is caught first.
