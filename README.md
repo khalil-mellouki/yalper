@@ -12,7 +12,8 @@ so when something breaks you can see exactly which step did it.
   whether it failed.
 - **Snapshots your code after each step**, including files changed by shell commands (`sed`, scripts, code
   generators), not only edits made through the agent's file tools.
-- **Masks secrets** (API keys, tokens, passwords) before anything is written to disk.
+- **Masks secrets** in known formats (API keys, tokens, passwords) before anything is recorded. It cannot
+  catch every possible secret.
 - **`yalper log`** lists the steps of a session. **`yalper show <step>`** shows what one step did, with a diff
   of the files it changed.
 - **`yalper bisect`** runs your tests against the code of the steps and names the step that broke them, with
@@ -21,7 +22,8 @@ so when something breaks you can see exactly which step did it.
   the agent.
 
 Everything stays on your machine: recordings in a `.yalper/` folder inside your project, bisect's test copies
-in your cache folder. Nothing is sent anywhere.
+in your cache folder. Yalper itself sends nothing. When bisect installs a step's dependencies, your package
+manager downloads them as it normally would.
 
 ## What we want to build next
 
@@ -106,8 +108,8 @@ Write, succeeded in 3 ms
  module.exports = { seconds };
 ```
 
-When a step changed your lockfile, Yalper installs that step's dependencies once, in a copy of their own, and
-reuses them. Running the same bisect again installs nothing.
+Steps whose lockfiles differ from your project's get their dependencies installed once, in a test copy of
+their own, and reused. Running the same bisect again installs nothing.
 
 Options:
 
@@ -120,21 +122,27 @@ Options:
   runs.
 - `--retries <n>`: repeat a failing run up to `n` times (at most 10) to rule out flaky tests.
 - `--session <id>`: bisect another session than the latest one.
-- `--good <step>`, `--bad <step>`: a step where the tests pass, and one where they fail. `<session>:<step>`
-  names a step of another session.
+- `--good <step>`, `--bad <step>`: a step where the tests pass, and one where they fail. With `--all` or
+  `--since`, `<session>:<step>` names a step of another session.
 - `--all`: bisect every recorded session of the project, and the changes made between them.
 - `--since <date>`: the same, from a date (`2026-10-01` or `"2026-10-01 14:30"`).
 
-Exit codes: 0 when a step was named, 1 when none could be, 130 when you stopped it with Ctrl-C.
+Exit codes: 0 when a step (or a short range of steps) was named, 1 when none could be, 130 when you stopped it with Ctrl-C.
 
 ### Is it safe?
 
 - **Bisect runs the code of each step**, including its scripts and its installs. Only bisect projects you
   trust.
-- **Your project is never changed.** Tests run in a copy outside your project.
-- **Your test command is never printed**, in case it holds a secret.
+- **Yalper never changes your project.** Tests run in a copy outside it. A few cases can still reach your
+  real files: see [Known limits](#known-limits).
+- **Your test command is never printed.** It is still visible in your shell history and to an agent that runs
+  bisect, so keep secrets in `.env` and use `--with-env` rather than putting them in the command.
 - **Secrets are masked** in the test output and the result Yalper prints. The full run logs in the cache
-  folder are kept as your tests wrote them, until the next bisect.
+  folder are not masked; they stay until the next bisect of the project, `yalper uninstall --purge`, or
+  deleting the folder.
+- **Copied files are private and short-lived.** Env files and `--with` files are copied into test copies only
+  you can read, and deleted when the bisect ends (after a crash or kill, at the next bisect or
+  `yalper uninstall --purge`).
 - **One bisect per project at a time.** A second one is refused until the first ends.
 
 ### Where the bisect data lives
@@ -145,8 +153,13 @@ Test copies and run logs live in your cache folder, one folder per project:
 - macOS: `~/Library/Caches/yalper/`
 - Windows: `%LOCALAPPDATA%\yalper\`
 
-You can delete it at any time; the next bisect rebuilds what it needs. Set `YALPER_CACHE_DIR` to move it, for
-example to a faster drive on Windows. `yalper uninstall --purge` removes the project's folder.
+Delete it with `yalper uninstall --purge`, or by hand while no bisect runs, with a tool that does not follow
+links (Explorer, `rm -rf`, `rmdir /s`): a test copy can hold links to your project's installed packages. The
+next bisect rebuilds what it needs.
+
+Set `YALPER_CACHE_DIR` to move it, for example to a faster drive on Windows. Outside your user profile,
+Yalper does not check Windows access rights: pick a folder only you can read and write (other users could
+read the run logs).
 
 Because tests run outside your project, ignored local configuration (an ignored `.cargo/config.toml` or
 `.npmrc`) only reaches them if you pass it with `--with`.
@@ -157,10 +170,14 @@ Because tests run outside your project, ignored local configuration (an ignored 
 - Absolute paths into your project inside settings or files (a `DATABASE_URL` such as
   `sqlite:///path/to/project/dev.db`) still point at your project.
 - A test that writes inside an installed package folder, or runs `pip install`, changes your real environment.
+- On macOS and Linux, links in a step's code stay links in the copy, so a test that writes through one changes
+  what it points to.
 - A step that needs its own install and holds a link pointing outside the project is not tested.
-- A `package.json` or `pyproject.toml` without a lockfile installs nothing unless you pass `--setup`.
+- A `package.json` or `pyproject.toml` without a lockfile installs nothing unless you pass `--setup`. Ruby,
+  PHP and Go lockfiles are not checked: those steps run with your current dependencies.
 - Packages that take their version from git (setuptools-scm, for example) may fail to install in a copy.
-- Ruby, PHP and Go lockfiles are not checked: those steps run with your current dependencies.
+- With `YALPER_CACHE_DIR` on a FAT32 or exFAT drive, a read-only file a test leaves in a copy (for example
+  from `git commit`) stops the next bisect with an error.
 - On Windows, when Claude Code runs the bisect for you, call a project script with a path: `.\check.cmd`.
 
 ## How it works
