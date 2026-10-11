@@ -714,16 +714,18 @@ fn env_files_are_copied_only_when_asked_remembered_and_never_recorded() {
     let (name, content) = env_script();
     fs::write(project.root.join(name), content).unwrap();
     fs::write(project.root.join(".gitignore"), ".env\n").unwrap();
-    // Not shaped like any known token, so redaction cannot be what keeps it out of the recordings.
-    let secret: String = "env-value-"
-        .chars()
-        .chain("k3m9x2".chars().cycle().take(18))
-        .collect();
+    // No secret keyword in its key and a low-entropy value, so redaction would leave it as it is: redaction
+    // cannot be what keeps it out of the recordings.
+    let secret = "plainnote".repeat(4);
     fs::write(
         project.root.join(".env"),
-        format!("READY=ready\nSECRET={secret}\n"),
+        format!("READY=ready\nREADY_NOTE={secret}\n"),
     )
     .unwrap();
+    assert_eq!(
+        yalper::redact::redact_str(&format!("READY_NOTE={secret}")),
+        None
+    );
     record(&project, SESSION, &notes_steps(8));
 
     // Without --with-env the test copies have no `.env`.

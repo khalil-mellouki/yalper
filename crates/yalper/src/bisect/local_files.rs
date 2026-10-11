@@ -22,9 +22,15 @@
 //!   its path that is not the same regular file is removed (a link itself, never what it points to) and the
 //!   file is created anew, 0600 on Unix: nothing is ever written through what a test left there;
 //! - where the step's tree has a file or folder at its path, or a file above it, the tree's entry wins, and so
-//!   does an extra path someone else registered (a folder of links to the project's `node_modules`);
-//! - every copied file is deleted when the bisect ends: when [`LocalFiles`] is dropped (normal end, error,
-//!   first Ctrl-C), and by [`remove_all_copied`] when a second Ctrl-C makes Yalper exit at once.
+//!   does an extra path someone else registered (a folder of links to the project's `node_modules`).
+//!
+//! Every copied file is deleted when the bisect ends: when [`LocalFiles`] is dropped or
+//! [`remove`](LocalFiles::remove)d (normal end, error, first Ctrl-C), and by [`remove_all_copied`] when a
+//! second Ctrl-C makes Yalper exit at once. Yalper can also end without either (killed, crashed, or its
+//! console closed on Windows), so before a file is first written into a copy, its copy and path (never its
+//! content) are recorded in the event log ([`COPIED_KEY`]); the next bisect deletes what is listed there
+//! before it uses any copy ([`remove_left_over`]). Otherwise a file left in a copy would apply to later
+//! bisects, even with `--no-env`: switches keep the files the step's rules ignore.
 //!
 //! They are never written to the snapshot store or the event log: the copies are in the user's cache folder,
 //! outside the project, where recording never looks, and bisect records no events. Known limits: a copy that a
@@ -39,7 +45,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
-use ignore::WalkBuilder;
+use gix::ObjectId;
+use ignore::{WalkBuilder, WalkState};
+use serde_json::{Value, json};
 
 use super::copy::{native, parents, remove_entry};
 use super::link::{is_real_dir_no_follow, is_under, normalize, plain};
@@ -47,7 +55,8 @@ use super::{CacheDir, TestCopy};
 use crate::hook::YALPER_DIR;
 use crate::safe_fs::open_regular_file;
 use crate::snapshot::{
-    Excludes, FileKind, MAX_DEPTH, MAX_FILE_BYTES, is_racy, nanos_since_epoch, validate_path,
+    Excludes, FileKind, MAX_DEPTH, MAX_FILE_BYTES, WALK_THREADS, is_racy, nanos_since_epoch,
+    validate_path,
 };
 use crate::store::Store;
 
@@ -57,6 +66,11 @@ pub const WITH_ENV_KEY: &str = "bisect.with_env";
 /// The `meta` key of the event log that remembers the `--with` paths: a JSON array of paths relative to the
 /// project root, `/`-separated, or no row.
 pub const WITH_KEY: &str = "bisect.with";
+
+/// The `meta` key of the event log that lists the files copied into test copies and maybe not deleted yet:
+/// `{"instance": <the cache folder's instance id>, "files": [{"copy": "copy-0", "path": ".env"}, ...]}`, or no
+/// row. Names only, never content.
+pub const COPIED_KEY: &str = "bisect.copied";
 
 /// The largest env file copied. Env files hold a few settings; a larger file named like one is something else.
 const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
@@ -74,8 +88,11 @@ const LARGE_FILES_NAMED: usize = 5;
 /// The size of the pieces in which two files are compared.
 const COMPARE_CHUNK: usize = 64 * 1024;
 
+const MIB: u64 = 1 << 20;
+
 /// Every file copied into a test copy and not deleted yet, as the canonical path of the copy and the file's
-/// path in it, for [`remove_all_copied`].
+/// path in it, for [`remove_all_copied`]. Held while a file is listed and written, so that
+/// [`remove_all_copied`] waits for a write going on and then deletes its file.
 static COPIED: Mutex<BTreeSet<(PathBuf, String)>> = Mutex::new(BTreeSet::new());
 
 /// What the user asked for on the command line.
@@ -89,22 +106,24 @@ pub struct Choice {
     pub no_with: bool,
 }
 
-/// What is copied into the test copies of a bisect, remembered for the next ones.
+/// What is copied into the test copies of a bisect.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Chosen {
     /// Copy the env files.
     pub env: bool,
-    /// The `--with` paths, relative to the project root and `/`-separated, in the order they were given.
+    /// The `--with` paths copied, relative to the project root and `/`-separated, in the order they were given.
     pub with: Vec<String>,
     /// The files of the `--with` paths (the files inside a folder), sorted.
     pub with_files: Vec<String>,
+    /// Warnings to show: remembered `--with` paths that no longer exist.
+    pub warnings: Vec<String>,
 }
 
 /// Applies `choice`, given in the folder `start`, to the choice remembered in `events` for the project at
-/// `project`, and remembers the result. Every `--with` path, remembered or given, must be an ignored file or
-/// folder inside the project, reached and made of real folders and regular files only, or a file over the
-/// snapshot size limit (see [`check_with`]). Returns the message to show when one is refused: nothing is
-/// remembered then.
+/// `project`, and remembers the result. Every `--with` path must be an ignored file or folder inside the
+/// project, reached and made of real folders and regular files only, or a file over the snapshot size limit
+/// (see [`check_with`]). Returns the message to show when one is refused: nothing is remembered then. A
+/// remembered path that no longer exists is skipped with a warning, and stays remembered.
 pub fn choose(
     events: &Store,
     project: &Path,
@@ -127,24 +146,39 @@ pub fn choose(
             .unwrap_or_default()
     };
 
-    let mut with: Vec<String> = Vec::new();
+    // `kept` is remembered; `with` is copied in this bisect.
+    let (mut kept, mut with, mut warnings) = (Vec::new(), Vec::new(), Vec::new());
     for path in remembered {
-        check_with(project, &path).map_err(|why| {
-            format!(
-                "--with {path}, remembered for this project, {why}. `yalper bisect --no-with` forgets the \
-                 remembered paths."
-            )
-        })?;
-        if !with.contains(&path) {
-            with.push(path);
+        if kept.contains(&path) {
+            continue;
         }
+        let missing = fs::symlink_metadata(native(project, &path))
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+        if missing && !path.is_empty() {
+            warnings.push(format!(
+                "--with {path}, remembered for this project, does not exist in the project now, so it is not \
+                 copied. `yalper bisect --no-with` forgets the remembered paths."
+            ));
+        } else {
+            check_with(project, &path).map_err(|why| {
+                format!(
+                    "--with {path}, remembered for this project, {why}. `yalper bisect --no-with` forgets \
+                     the remembered paths."
+                )
+            })?;
+            with.push(path.clone());
+        }
+        kept.push(path);
     }
     for given in &choice.with {
         let refused = |why: String| format!("--with {}: {why}.", given.display());
         let path = in_project(project, start, given).map_err(refused)?;
         check_with(project, &path).map_err(refused)?;
         if !with.contains(&path) {
-            with.push(path);
+            with.push(path.clone());
+        }
+        if !kept.contains(&path) {
+            kept.push(path);
         }
     }
     let with_files = files_of(project, &with)?;
@@ -154,12 +188,13 @@ pub fn choose(
     events
         .set_meta(WITH_ENV_KEY, env.then_some("true"))
         .map_err(saved)?;
-    let value = (!with.is_empty()).then(|| serde_json::Value::from(with.clone()).to_string());
+    let value = (!kept.is_empty()).then(|| Value::from(kept).to_string());
     events.set_meta(WITH_KEY, value.as_deref()).map_err(saved)?;
     Ok(Chosen {
         env,
         with,
         with_files,
+        warnings,
     })
 }
 
@@ -228,7 +263,7 @@ fn check_with(project: &Path, path: &str) -> Result<(), String> {
     Err(format!(
         "the project's ignore rules do not ignore it, so the snapshots already hold it. --with copies \
          ignored files and folders, and files over {} MiB, which snapshots skip",
-        MAX_FILE_BYTES >> 20
+        MAX_FILE_BYTES / MIB
     ))
 }
 
@@ -274,7 +309,7 @@ fn files_of(project: &Path, with: &[String]) -> Result<Vec<String>, String> {
                 if bytes > MAX_WITH_BYTES {
                     return Err(refused(format!(
                         "the --with paths hold more than {} MiB",
-                        MAX_WITH_BYTES >> 20
+                        MAX_WITH_BYTES / MIB
                     )));
                 }
                 continue;
@@ -314,13 +349,19 @@ fn is_env_name(name: &OsStr) -> bool {
     name == ".env" || name.as_encoded_bytes().starts_with(b".env.")
 }
 
+/// `size` in whole MiB, rounded up, so a file just over a limit never reads as the limit itself.
+fn mib(size: u64) -> u64 {
+    size.div_ceil(MIB)
+}
+
 /// Walks the project at `project` like a snapshot does (the files its ignore rules do not ignore, without
-/// `.git` and `.yalper`, never following links), listing the files over the snapshot size limit and, if
-/// `env`, the env files the rules ignore in the folders it enters.
+/// `.git` and `.yalper`, never following links, in several threads), listing the files over the snapshot size
+/// limit and, if `env`, the env files the rules ignore in the folders it enters.
 fn walk_project(project: &Path, env: bool) -> Found {
     let excludes = Arc::new(Excludes::new(project));
     let filter = Arc::clone(&excludes);
-    let walk = WalkBuilder::new(project)
+    let found = Mutex::new(Found::default());
+    WalkBuilder::new(project)
         .hidden(false)
         .ignore(false)
         .parents(false)
@@ -339,71 +380,89 @@ fn walk_project(project: &Path, env: bool) -> Found {
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
             (!is_dir && is_env_name(name)) || !filter.is_ignored(entry.path(), is_dir)
         })
-        .build();
+        .threads(WALK_THREADS)
+        .build_parallel()
+        .run(|| {
+            let (excludes, found) = (&excludes, &found);
+            Box::new(move |entry| visit(project, excludes, found, env, entry))
+        });
 
-    let mut found = Found::default();
-    for entry in walk {
-        if excludes.exceeded() {
-            found.notes.push(
-                "the project's ignore files are too large for Yalper to read, so it does not look for env \
-                 files or large files"
-                    .to_owned(),
-            );
-            return Found {
-                notes: found.notes,
-                ..Found::default()
-            };
-        }
-        let Ok(entry) = entry else { continue };
-        let Some(kind) = entry.file_type() else {
-            continue;
+    let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if excludes.exceeded() {
+        let note = "the project's ignore files are too large for Yalper to read, so it does not look for env \
+                    files or large files";
+        return Found {
+            notes: vec![note.to_owned()],
+            ..Found::default()
         };
-        if kind.is_dir() {
-            // Before anything inside it is checked: the walk lists a folder's entries after the folder.
-            excludes.add_dir(entry.path(), true);
-            continue;
-        }
-        let Some(path) = entry.path().strip_prefix(project).ok().and_then(|path| {
-            let names = path.components().map(|name| name.as_os_str().to_str());
-            names
-                .collect::<Option<Vec<&str>>>()
-                .map(|names| names.join("/"))
-        }) else {
-            continue;
-        };
-        if is_env_name(entry.file_name()) && excludes.is_ignored(entry.path(), false) {
-            if !env {
-                continue;
-            }
-            if kind.is_symlink() {
-                found.notes.push(format!(
-                    "{path} is a link, so it is not copied: Yalper never follows links in the project"
-                ));
-            } else if kind.is_file()
-                && let Ok(metadata) = entry.metadata()
-            {
-                if metadata.len() <= MAX_ENV_FILE_BYTES {
-                    found.env.push(path);
-                } else {
-                    found.notes.push(format!(
-                        "{path} is not copied: it holds {} bytes, more than an env file ({} MiB at most)",
-                        metadata.len(),
-                        MAX_ENV_FILE_BYTES >> 20
-                    ));
-                }
-            }
-            continue;
-        }
-        if kind.is_file()
-            && let Ok(metadata) = entry.metadata()
-            && metadata.len() > MAX_FILE_BYTES
-        {
-            found.large.push((path, metadata.len()));
-        }
     }
     found.env.sort();
     found.large.sort();
+    found.notes.sort();
     found
+}
+
+/// Handles one entry of [`walk_project`]. The walker calls this for a folder before any entry inside it is
+/// checked, so its `.gitignore` is read in time.
+fn visit(
+    project: &Path,
+    excludes: &Excludes,
+    found: &Mutex<Found>,
+    env: bool,
+    entry: Result<ignore::DirEntry, ignore::Error>,
+) -> WalkState {
+    if excludes.exceeded() {
+        return WalkState::Quit;
+    }
+    let Ok(entry) = entry else {
+        return WalkState::Continue;
+    };
+    let Some(kind) = entry.file_type() else {
+        return WalkState::Continue;
+    };
+    if kind.is_dir() {
+        excludes.add_dir(entry.path(), true);
+        return WalkState::Continue;
+    }
+    let Some(path) = entry.path().strip_prefix(project).ok().and_then(|path| {
+        let names = path.components().map(|name| name.as_os_str().to_str());
+        names
+            .collect::<Option<Vec<&str>>>()
+            .map(|names| names.join("/"))
+    }) else {
+        return WalkState::Continue;
+    };
+    let found = || found.lock().unwrap_or_else(PoisonError::into_inner);
+    if is_env_name(entry.file_name()) && excludes.is_ignored(entry.path(), false) {
+        if !env {
+            return WalkState::Continue;
+        }
+        if kind.is_symlink() {
+            found().notes.push(format!(
+                "{path} is a link, so it is not copied: Yalper never follows links in the project"
+            ));
+        } else if kind.is_file()
+            && let Ok(metadata) = entry.metadata()
+        {
+            if metadata.len() <= MAX_ENV_FILE_BYTES {
+                found().env.push(path);
+            } else {
+                found().notes.push(format!(
+                    "{path} is not copied: it holds {} bytes, more than an env file ({} MiB at most)",
+                    metadata.len(),
+                    MAX_ENV_FILE_BYTES / MIB
+                ));
+            }
+        }
+        return WalkState::Continue;
+    }
+    if kind.is_file()
+        && let Ok(metadata) = entry.metadata()
+        && metadata.len() > MAX_FILE_BYTES
+    {
+        found().large.push((path, metadata.len()));
+    }
+    WalkState::Continue
 }
 
 /// The files of the tree a copy holds, for deciding where Yalper may put a file.
@@ -488,6 +547,8 @@ struct Same {
 /// What Yalper put in one test copy.
 #[derive(Debug, Default)]
 struct Held {
+    /// The copy's folder name, such as `copy-0`.
+    name: String,
     /// The copy's canonical path, which holds no link: files are deleted through it only while the copy is
     /// still there (see [`remove_copied`]).
     canonical: PathBuf,
@@ -495,6 +556,8 @@ struct Held {
     files: BTreeMap<String, Option<Same>>,
     /// The folders created to hold them, which are not folders of the tree.
     dirs: BTreeSet<String>,
+    /// The tree the copy held at the last sync, with its files.
+    tree: Option<(ObjectId, Tree)>,
 }
 
 /// Which kinds of files were put in a test copy for a run.
@@ -511,22 +574,30 @@ pub struct Used {
 #[derive(Debug)]
 pub struct LocalFiles {
     project: PathBuf,
+    /// The event log, which lists the copied files (see [`COPIED_KEY`]).
+    events: Store,
+    /// The instance id of the project's cache folder.
+    instance: String,
     chosen: Chosen,
     /// The env files found, each copied for a step whose tree has files in its folder.
     env: Vec<String>,
     /// What each copy holds, by the copy's path.
     copies: HashMap<PathBuf, Held>,
+    /// The files listed in the event log: copy name and path.
+    listed: BTreeSet<(String, String)>,
     used: Used,
 }
 
 impl LocalFiles {
     /// The files `chosen` for the project whose cache folder is `cache`, found by one walk of the project, with
-    /// warnings to show: env files that are links or too large, and files the snapshots skip because they are
-    /// too large (and that no `--with` path brings in).
-    pub fn new(cache: &CacheDir, chosen: &Chosen) -> (Self, Vec<String>) {
+    /// warnings to show: those of `chosen`, env files that are links or too large, and files the snapshots skip
+    /// because they are too large (and that no `--with` path brings in). `events` is the project's event log,
+    /// where the copied files are listed; files already listed there stay listed.
+    pub fn new(cache: &CacheDir, chosen: &Chosen, events: Store) -> (Self, Vec<String>) {
         let project = cache.project().to_owned();
         let found = walk_project(&project, chosen.env);
-        let mut notes = found.notes;
+        let mut warnings = chosen.warnings.clone();
+        warnings.extend(found.notes);
         let covered = |path: &str| {
             chosen.with.iter().any(|with| {
                 path == with
@@ -544,7 +615,7 @@ impl LocalFiles {
             let mut named: Vec<String> = large
                 .iter()
                 .take(LARGE_FILES_NAMED)
-                .map(|(path, size)| format!("{path} ({} MiB)", size >> 20))
+                .map(|(path, size)| format!("{path} ({} MiB)", mib(*size)))
                 .collect();
             if large.len() > LARGE_FILES_NAMED {
                 named.push(format!("and {} more", large.len() - LARGE_FILES_NAMED));
@@ -553,21 +624,25 @@ impl LocalFiles {
                 1 => ("1 file of the project is".to_owned(), "it"),
                 n => (format!("{n} files of the project are"), "them"),
             };
-            notes.push(format!(
+            warnings.push(format!(
                 "{count} over {} MiB, so the snapshots skip {verb} and the test copies lack {verb}: {}. \
                  If the tests need one, add it with --with <path>.",
-                MAX_FILE_BYTES >> 20,
+                MAX_FILE_BYTES / MIB,
                 named.join(", ")
             ));
         }
+        let listed = read_listed(&events, cache.instance()).unwrap_or_default();
         let files = Self {
             project,
+            events,
+            instance: cache.instance().to_owned(),
             chosen: chosen.clone(),
             env: found.env,
             copies: HashMap::new(),
+            listed,
             used: Used::default(),
         };
-        (files, notes)
+        (files, warnings)
     }
 
     /// The line that tells what is copied, or `None` when nothing is.
@@ -601,29 +676,46 @@ impl LocalFiles {
     }
 
     /// Makes `copy`, which holds a step, hold the env files and `--with` files that step gets: those whose path
-    /// the step's tree leaves free and, for env files, whose folder holds files of the tree. Each one is written
-    /// only if it differs from the project's file; files copied for an earlier step that this one does not get
-    /// are deleted. Call it after every switch, before every run and install. Returns how many files were
-    /// written.
+    /// the step's tree and the other extra paths of the copy leave free and, for env files, whose folder holds
+    /// files of the tree. Each one is listed in the event log before it is first written, and written only if
+    /// it differs from the project's file; files copied for an earlier step that this one does not get are
+    /// deleted. Call it after every switch, before every run and install. Returns how many files were written.
     pub fn sync(&mut self, copy: &mut TestCopy) -> io::Result<usize> {
+        let root = copy.path().to_owned();
+        if self.env.is_empty()
+            && self.chosen.with_files.is_empty()
+            && !self.copies.contains_key(&root)
+        {
+            return Ok(0);
+        }
         let Self {
             project,
+            events,
+            instance,
             chosen,
             env,
             copies,
+            listed,
             used,
         } = self;
-        let root = copy.path().to_owned();
-        if env.is_empty() && chosen.with_files.is_empty() && !copies.contains_key(&root) {
-            return Ok(0);
-        }
-        let tree = Tree::of(copy)?;
         let held = match copies.entry(root.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Held {
+                name: root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
                 canonical: plain(&fs::canonicalize(&root)?),
                 ..Held::default()
             }),
+        };
+        let id = copy
+            .tree()
+            .ok_or_else(|| io::Error::other("the test copy holds no step yet"))?;
+        let (id, tree) = match held.tree.take() {
+            Some((cached, tree)) if cached == id => (id, tree),
+            _ => (id, Tree::of(copy)?),
         };
         // The extra paths others put in the copy (a folder of links to the project's packages, a link to its
         // Python environment): what is there is theirs, never replaced.
@@ -659,13 +751,16 @@ impl LocalFiles {
                 continue;
             }
             // Where the tree or another extra path now has an entry, it was put there by its owner.
-            if !taken(path) {
-                remove_copied(&held.canonical, path)
+            let gone = taken(path)
+                || remove_copied(&held.canonical, path)
                     .map_err(|error| in_copy(error, "delete", path))?;
+            if gone {
+                listed.remove(&(held.name.clone(), path.clone()));
             }
             unregister(&held.canonical, path);
             held.files.remove(path);
         }
+        save_listed(events, instance, listed)?;
         // Registered before anything is written, so a switch keeps a file left half made by an error.
         let mut extra = copy.extra_paths().clone();
         extra.retain(|path| !before.contains(path));
@@ -674,13 +769,19 @@ impl LocalFiles {
 
         let mut written = 0;
         for &path in &wanted {
-            register(&held.canonical, path);
+            // Held until the file is written: a second Ctrl-C waits for it, then deletes it.
+            let mut copied = copied();
+            copied.insert((held.canonical.clone(), path.clone()));
+            if listed.insert((held.name.clone(), path.clone())) {
+                save_listed(events, instance, listed)?;
+            }
             let same = held.files.entry(path.clone()).or_default();
             if refresh(project, &root, path, same, &mut held.dirs, &tree)
                 .map_err(|error| in_copy(error, "copy", path))?
             {
                 written += 1;
             }
+            drop(copied);
             if env.contains(path) {
                 used.env = true;
             }
@@ -688,20 +789,27 @@ impl LocalFiles {
                 used.with = true;
             }
         }
+        held.tree = Some((id, tree));
         Ok(written)
     }
 
     /// Deletes every file copied into a test copy, and the folders made for them once empty. Returns a message
-    /// for each file that could not be deleted. Dropping it does the same, without the messages.
+    /// for each file that could not be deleted, or that was not looked for because a test moved or replaced a
+    /// folder on its way: those stay listed in the event log, for the next bisect. Dropping it does the same,
+    /// without the messages.
     pub fn remove(&mut self) -> Vec<String> {
         let mut failed = Vec::new();
         for (root, held) in &mut self.copies {
             for path in std::mem::take(&mut held.files).into_keys() {
-                if let Err(error) = remove_copied(&held.canonical, &path) {
-                    failed.push(format!(
+                match remove_copied(&held.canonical, &path) {
+                    Ok(true) => {
+                        self.listed.remove(&(held.name.clone(), path.clone()));
+                    }
+                    Ok(false) => failed.push(not_looked_for(&path, root)),
+                    Err(error) => failed.push(format!(
                         "cannot delete {path} from the test copy {}: {error}. Delete it by hand.",
                         root.display()
-                    ));
+                    )),
                 }
                 unregister(&held.canonical, &path);
             }
@@ -709,6 +817,9 @@ impl LocalFiles {
             for dir in std::mem::take(&mut held.dirs).iter().rev() {
                 remove_empty_dir(&held.canonical, dir);
             }
+        }
+        if let Err(error) = save_listed(&self.events, &self.instance, &self.listed) {
+            failed.push(error.to_string());
         }
         failed
     }
@@ -718,6 +829,106 @@ impl Drop for LocalFiles {
     fn drop(&mut self) {
         self.remove();
     }
+}
+
+/// The message for a copied file at `path` in the copy `root` that was not looked for (see [`remove_copied`]).
+fn not_looked_for(path: &str, root: &Path) -> String {
+    format!(
+        "{path} was not deleted from the test copy {}: a test moved or replaced the copy or a folder on its way \
+         with a link, and Yalper does not follow it. Delete the file by hand if it is still there.",
+        root.display()
+    )
+}
+
+/// The files listed in `events` (see [`COPIED_KEY`]) for the cache folder whose instance id is `instance`:
+/// none if the list is for another cache folder.
+fn read_listed(events: &Store, instance: &str) -> io::Result<BTreeSet<(String, String)>> {
+    let value = events.meta(COPIED_KEY).map_err(|error| {
+        io::Error::other(format!(
+            "cannot read the list of copied files in the event log: {error}"
+        ))
+    })?;
+    let Some(value) = value.and_then(|value| serde_json::from_str::<Value>(&value).ok()) else {
+        return Ok(BTreeSet::new());
+    };
+    if value.get("instance").and_then(Value::as_str) != Some(instance) {
+        return Ok(BTreeSet::new());
+    }
+    let files = value.get("files").and_then(Value::as_array);
+    Ok(files
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            let copy = file.get("copy")?.as_str()?;
+            let path = file.get("path")?.as_str()?;
+            Some((copy.to_owned(), path.to_owned()))
+        })
+        .collect())
+}
+
+/// Writes `listed` into `events` (see [`COPIED_KEY`]), or deletes the row when it is empty.
+fn save_listed(
+    events: &Store,
+    instance: &str,
+    listed: &BTreeSet<(String, String)>,
+) -> io::Result<()> {
+    let value = (!listed.is_empty()).then(|| {
+        let files: Vec<Value> = listed
+            .iter()
+            .map(|(copy, path)| json!({"copy": copy, "path": path}))
+            .collect();
+        json!({"instance": instance, "files": files}).to_string()
+    });
+    events
+        .set_meta(COPIED_KEY, value.as_deref())
+        .map_err(|error| {
+            io::Error::other(format!(
+                "cannot record the copied files in the event log: {error}"
+            ))
+        })
+}
+
+/// Whether `name` is the name of a test copy: `copy-<digits>`.
+fn is_copy_name(name: &str) -> bool {
+    name.strip_prefix("copy-")
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Deletes the files that `events` lists as copied into the test copies of the project's cache folder `cache`
+/// (see [`COPIED_KEY`]): an earlier bisect ended without deleting them (Yalper was killed, crashed, or its
+/// console was closed). Call it at the start of a bisect, under the bisect lock, before any copy is used.
+/// Files that could not be deleted stay listed. Returns a warning for each of them.
+pub fn remove_left_over(cache: &CacheDir, events: &Store) -> Vec<String> {
+    let listed = match read_listed(events, cache.instance()) {
+        Ok(listed) => listed,
+        Err(error) => return vec![error.to_string()],
+    };
+    let mut kept = BTreeSet::new();
+    let mut warnings = Vec::new();
+    for (copy, path) in listed {
+        if !is_copy_name(&copy) || validate_path(&path, FileKind::Regular).is_err() {
+            continue;
+        }
+        let root = cache.path().join(&copy);
+        // A copy that is gone was deleted with its files.
+        let Ok(canonical) = fs::canonicalize(&root) else {
+            continue;
+        };
+        match remove_copied(&plain(&canonical), &path) {
+            Ok(true) => continue,
+            Ok(false) => warnings.push(not_looked_for(&path, &root)),
+            Err(error) => warnings.push(format!(
+                "cannot delete {path}, left by an earlier bisect, from the test copy {}: {error}. Delete it \
+                 by hand.",
+                root.display()
+            )),
+        }
+        kept.insert((copy, path));
+    }
+    if let Err(error) = save_listed(events, cache.instance(), &kept) {
+        warnings.push(error.to_string());
+    }
+    warnings
 }
 
 /// Adds the file's path to an error.
@@ -876,37 +1087,44 @@ fn copy_file(source: &Path, target: &Path) -> io::Result<()> {
     if copied > MAX_WITH_BYTES {
         return Err(io::Error::other(format!(
             "it holds more than {} MiB",
-            MAX_WITH_BYTES >> 20
+            MAX_WITH_BYTES / MIB
         )));
     }
     Ok(())
 }
 
-/// Whether `root` is still the canonical path of a folder: no link was put on its way since.
-fn still_canonical(root: &Path) -> bool {
-    fs::canonicalize(root).is_ok_and(|now| plain(&now) == root)
-}
-
 /// Deletes the file Yalper copied at `path` in the copy whose canonical path is `root`, or whatever a test put
-/// in its place, never following a link. If the copy or a folder above the file is no longer a real folder
-/// on its way (a test moved or replaced it), the file is not there, and nothing is deleted.
-fn remove_copied(root: &Path, path: &str) -> io::Result<()> {
-    if !still_canonical(root)
-        || !parents(path).all(|parent| is_real_dir_no_follow(&native(root, parent)))
-    {
-        return Ok(());
+/// in its place, never following a link. Returns `true` when the file is gone (deleted, or not there, with the
+/// copy or a folder above it), and `false` when it was not looked for: the copy is no longer at its canonical
+/// path, or a folder on the way is a link or a file. A test moved or replaced it; the file may be elsewhere.
+fn remove_copied(root: &Path, path: &str) -> io::Result<bool> {
+    match fs::canonicalize(root) {
+        Ok(now) if plain(&now) == root => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        _ => return Ok(false),
+    }
+    for parent in parents(path) {
+        match fs::symlink_metadata(native(root, parent)) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        }
     }
     let full = native(root, path);
     match fs::symlink_metadata(&full) {
-        Ok(metadata) => remove_entry(&full, &metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Ok(metadata) => remove_entry(&full, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
+    Ok(true)
 }
 
-/// Deletes the folder `dir` of the copy whose canonical path is `root` if it is an empty real folder.
+/// Deletes the folder `dir` of the copy whose canonical path is `root` if it is an empty real folder reached
+/// through real folders.
 fn remove_empty_dir(root: &Path, dir: &str) {
-    if still_canonical(root)
+    let still_there = fs::canonicalize(root).is_ok_and(|now| plain(&now) == root);
+    if still_there
         && parents(dir)
             .chain([dir])
             .all(|folder| is_real_dir_no_follow(&native(root, folder)))
@@ -919,17 +1137,14 @@ fn copied() -> MutexGuard<'static, BTreeSet<(PathBuf, String)>> {
     COPIED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn register(root: &Path, path: &str) {
-    copied().insert((root.to_owned(), path.to_owned()));
-}
-
 fn unregister(root: &Path, path: &str) {
     copied().remove(&(root.to_owned(), path.to_owned()));
 }
 
 /// Deletes every file copied into a test copy by any bisect of this process, for a second Ctrl-C, which makes
-/// Yalper exit without dropping anything. Returns the list, locked and empty: held until Yalper exits, it keeps
-/// a bisect still going from copying anything more.
+/// Yalper exit without dropping anything. A file being written is waited for, then deleted. Returns the list,
+/// locked and empty: held until Yalper exits, it keeps a bisect still going from copying anything more. The
+/// event log still lists the files, which the next bisect finds gone.
 pub(super) fn remove_all_copied() -> MutexGuard<'static, BTreeSet<(PathBuf, String)>> {
     let mut copied = copied();
     for (root, path) in std::mem::take(&mut *copied) {
@@ -991,7 +1206,7 @@ mod tests {
         project.write("ignored/.env", "IGNORED=1\n");
         // A Python environment named `.env` is a folder, not an env file.
         project.write("venv/.env/pyvenv.cfg", "home = /usr\n");
-        let (mut files, warnings) = LocalFiles::new(&project.cache, &env_only());
+        let (mut files, warnings) = LocalFiles::new(&project.cache, &env_only(), project.events());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             files.summary().unwrap(),
@@ -1050,7 +1265,7 @@ mod tests {
         let project = Project::new();
         project.write(".gitignore", ".env\n");
         project.write(".env", "LOCAL=1\n");
-        let (mut files, _) = LocalFiles::new(&project.cache, &env_only());
+        let (mut files, _) = LocalFiles::new(&project.cache, &env_only(), project.events());
         let mut copy = project.copy();
         let tracked = project.tree(&[(".env", "TRACKED=1\n"), ("a.txt", "a")]);
         let untracked = project.tree(&[("a.txt", "b")]);
@@ -1088,7 +1303,7 @@ mod tests {
             &with(&["node_modules/pkg/settings.json"]),
         )
         .unwrap();
-        let (mut files, _) = LocalFiles::new(&project.cache, &chosen);
+        let (mut files, _) = LocalFiles::new(&project.cache, &chosen, project.events());
         let mut copy = project.copy();
         copy.switch(&project.store, project.tree(&[("a.txt", "a")]))
             .unwrap();
@@ -1253,7 +1468,7 @@ mod tests {
         {
             std::os::unix::fs::symlink(canary.path().join("config.toml"), root.join(".env"))
                 .unwrap();
-            let (files, warnings) = LocalFiles::new(&project.cache, &env_only());
+            let (files, warnings) = LocalFiles::new(&project.cache, &env_only(), project.events());
             assert_eq!(
                 warnings,
                 [".env is a link, so it is not copied: Yalper never follows links in the project"]
@@ -1269,7 +1484,7 @@ mod tests {
         fs::write(canary.path().join(".env"), "CANARY=1\n").unwrap();
         project.write(".gitignore", ".env\n");
         project.write("api/.env", "API=1\n");
-        let (mut files, _) = LocalFiles::new(&project.cache, &env_only());
+        let (mut files, _) = LocalFiles::new(&project.cache, &env_only(), project.events());
         let mut copy = project.copy();
         let tree = project.tree(&[("api/main.py", "")]);
         copy.switch(&project.store, tree).unwrap();
@@ -1288,14 +1503,99 @@ mod tests {
             "CANARY=1\n"
         );
 
-        // Again before the bisect ends: nothing is deleted through the link.
+        // Again before the bisect ends: nothing is deleted through the link, and that is reported. The file stays
+        // listed for the next bisect.
         fs::remove_dir_all(&api).unwrap();
         make_link(canary.path(), &api).unwrap();
-        drop(files);
+        let warnings = files.remove();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("api/.env was not deleted from the test copy "),
+            "{warnings:?}"
+        );
         assert_eq!(
             fs::read_to_string(canary.path().join(".env")).unwrap(),
             "CANARY=1\n"
         );
+        assert!(project.events().meta(COPIED_KEY).unwrap().is_some());
+        drop(files);
+        // The next bisect does not follow the link either.
+        let warnings = remove_left_over(&project.cache, &project.events());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            fs::read_to_string(canary.path().join(".env")).unwrap(),
+            "CANARY=1\n"
+        );
+    }
+
+    #[test]
+    fn files_left_by_a_bisect_that_did_not_end_are_deleted_by_the_next_one() {
+        let project = Project::new();
+        project.write(".gitignore", ".env\n");
+        project.write(".env", "LOCAL=1\n");
+        let (mut files, _) = LocalFiles::new(&project.cache, &env_only(), project.events());
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&[("a.txt", "a")]))
+            .unwrap();
+        assert_eq!(files.sync(&mut copy).unwrap(), 1);
+        // Listed, by name only, before it was written.
+        let listed = project.events().meta(COPIED_KEY).unwrap().unwrap();
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            listed,
+            json!({
+                "instance": project.cache.instance(),
+                "files": [{"copy": "copy-0", "path": ".env"}]
+            })
+        );
+        // Yalper ends without deleting anything (killed, or its console closed).
+        std::mem::forget(files);
+        assert!(exists(&copy, ".env"));
+
+        assert!(remove_left_over(&project.cache, &project.events()).is_empty());
+        assert!(!exists(&copy, ".env"));
+        assert_eq!(project.events().meta(COPIED_KEY).unwrap(), None);
+        assert!(remove_left_over(&project.cache, &project.events()).is_empty());
+
+        // A normal end leaves nothing listed. A new bisect opens its copies anew.
+        drop(copy);
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&[("a.txt", "a")]))
+            .unwrap();
+        let (mut files, _) = LocalFiles::new(&project.cache, &env_only(), project.events());
+        assert_eq!(files.sync(&mut copy).unwrap(), 1);
+        assert!(files.remove().is_empty());
+        assert!(!exists(&copy, ".env"));
+        assert_eq!(project.events().meta(COPIED_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn a_remembered_with_path_that_is_gone_is_skipped_with_a_warning() {
+        let project = Project::new();
+        project.write(".gitignore", "*.key\n");
+        project.write("a.key", "a");
+        project.write("b.key", "b");
+        let events = project.events();
+        let root = project.path();
+        choose(&events, root, root, &with(&["a.key", "b.key"])).unwrap();
+        fs::remove_file(root.join("a.key")).unwrap();
+        let chosen = choose(&events, root, root, &Choice::default()).unwrap();
+        assert_eq!(chosen.with, ["b.key"]);
+        assert_eq!(chosen.with_files, ["b.key"]);
+        assert_eq!(
+            chosen.warnings,
+            [
+                "--with a.key, remembered for this project, does not exist in the project now, so it is not \
+                 copied. `yalper bisect --no-with` forgets the remembered paths."
+            ]
+        );
+        let (_, warnings) = LocalFiles::new(&project.cache, &chosen, project.events());
+        assert_eq!(warnings, chosen.warnings);
+        // Still remembered: it is copied again once it is back.
+        project.write("a.key", "a");
+        let chosen = choose(&events, root, root, &Choice::default()).unwrap();
+        assert_eq!(chosen.with, ["a.key", "b.key"]);
+        assert!(chosen.warnings.is_empty());
     }
 
     #[test]
@@ -1308,7 +1608,7 @@ mod tests {
         let events = project.events();
         let root = project.path();
         let chosen = choose(&events, root, root, &with(&[".cargo/config.toml", "local"])).unwrap();
-        let (mut files, warnings) = LocalFiles::new(&project.cache, &chosen);
+        let (mut files, warnings) = LocalFiles::new(&project.cache, &chosen, project.events());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             files.summary().unwrap(),
@@ -1351,12 +1651,12 @@ mod tests {
         project.write("data/big.bin", &big);
         project.write(".gitignore", "ignored.bin\n");
         project.write("ignored.bin", &big);
-        let (_, warnings) = LocalFiles::new(&project.cache, &Chosen::default());
+        let (_, warnings) = LocalFiles::new(&project.cache, &Chosen::default(), project.events());
         assert_eq!(
             warnings,
             [
                 "1 file of the project is over 10 MiB, so the snapshots skip it and the test copies lack it: \
-                 data/big.bin (10 MiB). If the tests need one, add it with --with <path>."
+                 data/big.bin (11 MiB). If the tests need one, add it with --with <path>."
             ]
         );
         let events = project.events();
@@ -1364,7 +1664,7 @@ mod tests {
         let refused = choose(&events, root, root, &with(&["data"])).unwrap_err();
         assert!(refused.contains("do not ignore it"), "{refused}");
         let chosen = choose(&events, root, root, &with(&["data/big.bin"])).unwrap();
-        let (_, warnings) = LocalFiles::new(&project.cache, &chosen);
+        let (_, warnings) = LocalFiles::new(&project.cache, &chosen, project.events());
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

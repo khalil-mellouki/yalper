@@ -77,7 +77,7 @@ pub(crate) fn file_system_clock(dir: &OwnedDir, name: &str) -> io::Result<i64> {
 
 /// Threads of the directory walk. Listing directories is mostly waiting on the file system, so a few threads
 /// help, and more only cost time to start.
-const WALK_THREADS: usize = 4;
+pub(crate) const WALK_THREADS: usize = 4;
 
 /// Changed files the walk can read ahead of the thread that stores them. Each carries its content (at most
 /// [`MAX_FILE_BYTES`]), so this bounds memory when many files changed at once.

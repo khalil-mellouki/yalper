@@ -28,8 +28,8 @@ use super::entries::{Entries, Entry, session_entries};
 use super::{
     Answer, BisectLock, CACHE_DIR_KEY, CacheDir, Choice, DependencySets, End, Exit, Failure,
     InstallFailure, LocalFiles, Logs, Outcome, Prepared, Reason, Report, Run, SKIP_EXIT_CODE,
-    Settings, Skip, Tested, Trial, Used, bisect, choose, clean_root, log_tail, remove_stale, run,
-    write_boundaries,
+    Settings, Skip, Tested, Trial, Used, bisect, choose, clean_root, log_tail, remove_left_over,
+    remove_stale, run, write_boundaries,
 };
 use crate::init::{printable, say};
 use crate::log::{NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars};
@@ -192,6 +192,10 @@ fn command_in(
     if let Some(warning) = cache.warning() {
         say(out, &printable(&format!("warning: {warning}")));
     }
+    // Before any copy is used: files an earlier bisect could not delete would apply to this one.
+    for warning in remove_left_over(&cache, &store) {
+        say(out, &printable(&format!("warning: {warning}")));
+    }
     write_missing(out, &missing);
     store
         .set_meta(CACHE_DIR_KEY, Some(&cache.meta_value()))
@@ -202,7 +206,9 @@ fn command_in(
     write_boundaries(&cache).map_err(io_failed)?;
     let logs = Logs::open(&cache).map_err(io_failed)?;
     let existed = copies_in(&cache).map_err(io_failed)?;
-    let (local_files, warnings) = LocalFiles::new(&cache, &chosen);
+    // Its own connection, so it can update the list of copied files until it is dropped.
+    let files_events = Store::open_for_reading(&yalper.dir, &yalper.token).map_err(failed)?;
+    let (local_files, warnings) = LocalFiles::new(&cache, &chosen, files_events);
     for warning in warnings {
         say(out, &printable(&format!("warning: {warning}")));
     }
@@ -246,8 +252,16 @@ fn command_in(
         history: History::default(),
     };
     let trees: Vec<_> = entries.iter().map(|entry| entry.tree).collect();
-    let report = bisect(&trees, options.settings, |trial| tester.test(trial))
-        .map_err(|error| error.to_string())?;
+    let report = match bisect(&trees, options.settings, |trial| tester.test(trial)) {
+        Ok(report) => report,
+        Err(error) => {
+            let mut message = error.to_string();
+            for not_deleted in tester.sets.remove_local_files() {
+                message.push_str(&format!(". Also: {not_deleted}"));
+            }
+            return Err(message);
+        }
+    };
     // Deleted before the result is shown, so they stay no longer than the runs need them.
     let used = tester.sets.local_files().map(LocalFiles::used);
     let not_deleted = tester.sets.remove_local_files();
@@ -853,6 +867,7 @@ fn ticking<T>(heading: &str, live: bool, work: impl FnOnce() -> T) -> (T, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bisect::COPIED_KEY;
     use crate::bisect::testing::{state, token, write};
     use crate::repo::{GIT_ID_FILE, ID_FILE};
     use crate::safe_fs::OwnedDir;
@@ -1078,5 +1093,82 @@ mod tests {
                     .is_ok_and(|bytes| bytes.windows(16).any(|w| w == b"stop-test-secret"))),
             "{cached:#?}"
         );
+    }
+
+    #[test]
+    fn env_files_left_by_a_bisect_that_did_not_end_are_deleted_before_the_next_one_runs() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        // From step 2 on, the step's rules ignore `.env`, so switches keep one left in a copy.
+        recorded(
+            project.path(),
+            &[
+                &[(".gitignore", ".env\n")],
+                &[("a.txt", "a")],
+                &[("b.txt", "b")],
+            ],
+        );
+        write(project.path(), ".gitignore", ".env\n");
+        write(project.path(), ".env", "LEFT=1\n");
+        let folder = cache_base.path().join("yalper");
+        let copy_env = {
+            let cache = CacheDir::open_in(&folder, project.path(), &token()).unwrap();
+            let yalper = OwnedDir::open(&project.path().join(".yalper")).unwrap();
+            let shadow = ShadowStore::open(&yalper, &token()).unwrap();
+            let events = Store::open(&yalper, &token()).unwrap();
+            let chosen = crate::bisect::Chosen {
+                env: true,
+                ..Default::default()
+            };
+            let (mut files, _) = LocalFiles::new(&cache, &chosen, events);
+            let mut copy = crate::bisect::TestCopy::open(&cache, 0).unwrap();
+            copy.switch(&shadow, shadow.empty_tree()).unwrap();
+            assert_eq!(files.sync(&mut copy).unwrap(), 1);
+            // Yalper ends without deleting it: killed, or its console closed.
+            std::mem::forget(files);
+            copy.path().join(".env")
+        };
+        assert!(copy_env.is_file());
+
+        // The test fails when the copy holds an `.env`.
+        let test = if cfg!(windows) {
+            "if exist .env (exit /b 1)"
+        } else {
+            "test ! -f .env"
+        };
+        let options = Options {
+            test: test.to_owned(),
+            good: Some(2),
+            files: Choice {
+                env: Some(false),
+                ..Choice::default()
+            },
+            ..Options::default()
+        };
+        let screen = Screen {
+            live: false,
+            time_zone: TimeZone::UTC,
+        };
+        let open_cache = |project: &Path, token: &Token| CacheDir::open_in(&folder, project, token);
+        let mut out = Vec::new();
+        let ended = command_in(
+            project.path(),
+            &options,
+            &screen,
+            &mut out,
+            &AtomicBool::new(false),
+            &open_cache,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(ended, Ok(Ended::NotNamed), "{out}");
+        assert!(
+            out.contains("Testing step 2, the good end (about 2 runs left)... passed"),
+            "{out}"
+        );
+        assert!(out.contains("The bad end, step 4, passes"), "{out}");
+        assert!(!copy_env.exists());
+        let yalper = OwnedDir::open(&project.path().join(".yalper")).unwrap();
+        let events = Store::open(&yalper, &token()).unwrap();
+        assert_eq!(events.meta(COPIED_KEY).unwrap(), None);
     }
 }

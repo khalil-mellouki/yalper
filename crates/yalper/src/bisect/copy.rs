@@ -193,6 +193,11 @@ impl TestCopy {
         &self.extra
     }
 
+    /// The tree the copy holds, or `None` until a switch succeeded.
+    pub fn tree(&self) -> Option<ObjectId> {
+        self.tree
+    }
+
     /// The files of the tree the copy holds, relative and `/`-separated, or `None` until a switch succeeded.
     pub fn tree_files(&self) -> Option<impl Iterator<Item = &str>> {
         self.tree.map(|_| self.placed.keys().map(String::as_str))

@@ -48,7 +48,9 @@ pub use engine::{
 pub use entries::{Entries, Entry, session_entries};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
-pub use local_files::{Choice, Chosen, LocalFiles, Used, WITH_ENV_KEY, WITH_KEY, choose};
+pub use local_files::{
+    COPIED_KEY, Choice, Chosen, LocalFiles, Used, WITH_ENV_KEY, WITH_KEY, choose, remove_left_over,
+};
 pub use node_modules::{Linked, NodeModules};
 pub use python::{LinkedEnvs, PythonEnvs};
 pub use run::{
