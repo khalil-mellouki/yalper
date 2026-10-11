@@ -53,8 +53,9 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
-    /// Find the step of a session that broke the tests: run the test command against the code of its steps, in a
-    /// test copy outside the project, and name the first step where they fail.
+    /// Find the step of a session (or of several, with --all or --since) that broke the tests: run the test
+    /// command against the code of its steps, in a test copy outside the project, and name the first step where
+    /// they fail.
     Bisect(BisectArgs),
 }
 
@@ -65,14 +66,25 @@ struct BisectArgs {
     #[arg(long, value_name = "COMMAND")]
     test: String,
     /// Bisect the session whose id starts with this, instead of the most recent one.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", conflicts_with_all = ["all", "since"])]
     session: Option<String>,
-    /// A step where the tests pass (default: the start of the session).
-    #[arg(long, value_name = "STEP")]
-    good: Option<u32>,
-    /// A step where the tests fail (default: the last step of the session).
-    #[arg(long, value_name = "STEP")]
-    bad: Option<u32>,
+    /// Bisect every session of the project, in the order their snapshots were taken. Changes made between
+    /// sessions, outside any of them, are tested too.
+    #[arg(long)]
+    all: bool,
+    /// Bisect the sessions since this local date, or date and time ("YYYY-MM-DD HH:MM"): from the first
+    /// snapshot taken then. Like --all, changes made between sessions are tested too.
+    #[arg(long, value_name = "DATE", value_parser = yalper::bisect::parse_since, conflicts_with = "good")]
+    since: Option<jiff::civil::DateTime>,
+    /// A step where the tests pass (default: the start of the session, or of the sessions bisected).
+    /// <session>:<step> names a step of another session (with --all or --since); a plain step is of the session
+    /// bisected, or of the most recent one.
+    #[arg(long, value_name = "STEP", value_parser = yalper::bisect::parse_step)]
+    good: Option<yalper::bisect::StepRef>,
+    /// A step where the tests fail (default: the last step of the session, or of the sessions bisected). Takes
+    /// <session>:<step> like --good.
+    #[arg(long, value_name = "STEP", value_parser = yalper::bisect::parse_step)]
+    bad: Option<yalper::bisect::StepRef>,
     /// The command that installs the dependencies in a test copy, instead of the one Yalper picks from the
     /// lockfiles.
     #[arg(long, value_name = "COMMAND")]
@@ -194,6 +206,8 @@ fn bisect(args: BisectArgs) -> ExitCode {
         let options = yalper::bisect::Options {
             test: args.test,
             session: args.session,
+            all: args.all,
+            since: args.since,
             good: args.good,
             bad: args.bad,
             setup: args.setup,
