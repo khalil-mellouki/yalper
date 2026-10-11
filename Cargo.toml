@@ -15,7 +15,8 @@ rust-version = "1.89"
 aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
 # Catches Ctrl-C during a bisect, so that Yalper kills the processes of the test run before it stops.
-ctrlc = "3.5"
+# `termination`: SIGTERM and SIGHUP too, on Unix.
+ctrlc = { version = "3.5", features = ["termination"] }
 # The operating system's secure random number generator, for the init token. Already built for gix.
 getrandom = "0.4"
 # Only SHA-1 object hashing: Yalper writes blobs and trees and diffs trees, and needs none of the other
@@ -29,9 +30,6 @@ ignore = "0.4"
 insta = { version = "1", default-features = false }
 # Dates and times in the user's time zone for `yalper log`. Already built, with the same features, for gix.
 jiff = "0.2"
-# Starts a bisect test run in its own process group (Unix) or job object (Windows), so that its whole process
-# tree can be killed.
-process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group", "job-object", "creation-flags"] }
 # `bundled` compiles SQLite into the binary, so users install nothing else.
 rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
 # The engine behind the `regex` crate, used directly to tune how secret rules compile. Unicode is off for

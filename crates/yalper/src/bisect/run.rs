@@ -3,17 +3,21 @@
 //! - The shell is `/bin/sh -c "<command>"` on Unix and `cmd.exe /d /s /c "<command>"` on Windows (PowerShell
 //!   takes about 0.9 s to start, and Windows PowerShell 5.1 has no `&&`).
 //! - The command runs in its own process group (Unix) or job object (Windows), so that the whole tree of
-//!   processes it starts can be killed: when the time limit is reached, when the stop flag is set, and as soon
-//!   as its main process exits, so that whatever it left running (a server, a watcher) cannot leak into the
-//!   next run. It is not in the terminal's foreground process group (Unix) and its process group is a new one
-//!   (Windows, `CREATE_NEW_PROCESS_GROUP`): the terminal's Ctrl-C does not reach the tests, Yalper kills them
-//!   itself (see [`STOP`]).
+//!   processes it starts can be killed: when the time limit is reached, when the stop flag is set, when its
+//!   output grows over [`MAX_LOG_BYTES`], and as soon as its main process exits, so that whatever it left
+//!   running (a server, a watcher) cannot leak into the next run. On Windows the job is also closed, and so its
+//!   processes killed, when Yalper exits in any way, a crash included.
+//! - It is not in the terminal's foreground process group (Unix) and its process group is a new one (Windows,
+//!   `CREATE_NEW_PROCESS_GROUP`): the terminal's Ctrl-C does not reach the tests, Yalper kills them itself (see
+//!   [`handle_ctrl_c`]).
 //! - Its stdin is empty, so test runners do not start a watch mode, and stdout and stderr both go to the log
 //!   file through the same handle, in the order they were written: no pipes, no reader threads.
 //! - Yalper waits on the main process itself, polling it every few milliseconds, with no extra thread.
 //!
-//! Known limit: on Unix, a process that moves itself to another process group or session (`setsid`, a
-//! daemon) is not killed. On Windows a process cannot leave the job.
+//! Known limits: on Unix, a process that moves itself to another process group or session (`setsid`, a
+//! daemon) is not killed, and if Yalper itself is killed (SIGKILL) or crashes during a run, the run's
+//! processes keep running. On Windows, processes that a system service starts for the tests (WMI, the Task
+//! Scheduler, a COM server) are outside the job.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -21,11 +25,9 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use process_wrap::std::{ChildWrapper, CommandWrap};
 
 use super::BISECT_DIR;
 use super::copy::{open_private_dir, remove_entry};
@@ -35,11 +37,18 @@ use crate::safe_fs::{Access, OwnedDir};
 /// killed, and the bisect ends.
 pub static STOP: AtomicBool = AtomicBool::new(false);
 
+/// The number of runs going on, for the Ctrl-C handler.
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
 /// The exit code of Yalper after Ctrl-C, like a shell's for a command stopped by SIGINT.
 pub const STOPPED_EXIT_CODE: i32 = 130;
 
 /// The exit code with which a test command says it cannot test the code it was given, as in `git bisect run`.
 pub const SKIP_EXIT_CODE: i32 = 125;
+
+/// The most output a run may write to its log before it is stopped (see [`Outcome::OutputTooLarge`]): far more
+/// than any test suite prints, so only a run stuck printing in a loop reaches it.
+pub const MAX_LOG_BYTES: u64 = 1 << 30;
 
 /// The folder inside `.yalper/bisect/` that holds the output logs of the latest bisect.
 const LOGS_DIR: &str = "logs";
@@ -48,15 +57,21 @@ const LOGS_DIR: &str = "logs";
 /// that ends quickly is not kept waiting.
 const MAX_PAUSE: Duration = Duration::from_millis(50);
 
+/// How long a second Ctrl-C waits for a run going on to kill its processes before Yalper exits.
+const SECOND_PRESS_WAIT: Duration = Duration::from_secs(1);
+
 /// How much of the end of a failed run's log is searched for a linker error (see [`Run::linker_file_held`]).
 /// Cargo stops after the error, so it is near the end.
 const LOG_TAIL_BYTES: u64 = 1 << 20;
 
-/// Installs the Ctrl-C handler of a bisect: the first Ctrl-C sets [`STOP`], a second one makes Yalper exit
-/// at once with [`STOPPED_EXIT_CODE`]. Install it once per process.
+/// Installs the handler of Ctrl-C, and also of SIGTERM and SIGHUP on Unix and of closing the console on
+/// Windows. The first one sets [`STOP`]: the run going on is stopped and its processes killed, and the bisect
+/// ends. A second one makes Yalper exit at once with [`STOPPED_EXIT_CODE`], after giving a run going on up to
+/// 1 s to kill its processes. Install it once per process.
 pub fn handle_ctrl_c() -> io::Result<()> {
     ctrlc::set_handler(|| {
         if pressed_before(&STOP) {
+            wait_for_runs(&RUNNING, SECOND_PRESS_WAIT);
             std::process::exit(STOPPED_EXIT_CODE);
         }
     })
@@ -66,6 +81,30 @@ pub fn handle_ctrl_c() -> io::Result<()> {
 /// Sets `flag`, returning whether it was already set.
 fn pressed_before(flag: &AtomicBool) -> bool {
     flag.swap(true, Ordering::SeqCst)
+}
+
+/// Waits until no run is going on (each one saw [`STOP`] and killed its processes), or at most `bound`.
+fn wait_for_runs(running: &AtomicUsize, bound: Duration) {
+    let start = Instant::now();
+    while running.load(Ordering::SeqCst) > 0 && start.elapsed() < bound {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Counts a run in [`RUNNING`] while it lives.
+struct Running;
+
+impl Running {
+    fn start() -> Self {
+        RUNNING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// How a test run ended.
@@ -81,6 +120,9 @@ pub enum Outcome {
     TimedOut,
     /// The stop flag was set (Ctrl-C); the processes were killed.
     Stopped,
+    /// The run wrote more than [`MAX_LOG_BYTES`] of output; the processes were killed. It tells nothing about
+    /// the code: count it as "cannot test".
+    OutputTooLarge,
 }
 
 impl Outcome {
@@ -108,8 +150,9 @@ pub enum Exit {
 impl fmt::Display for Exit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            // Windows crash codes are NTSTATUS values, known by their hexadecimal form (0xC0000005).
-            Self::Code(code) if cfg!(windows) && !(0..=255).contains(&code) => {
+            // Windows crash codes are NTSTATUS values, negative as an `i32` and known by their hexadecimal form
+            // (0xC0000005).
+            Self::Code(code) if cfg!(windows) && code < 0 => {
                 write!(f, "exit code 0x{:08X}", code as u32)
             }
             Self::Code(code) => write!(f, "exit code {code}"),
@@ -124,19 +167,20 @@ pub struct Run {
     pub outcome: Outcome,
     /// From the start of the command to its end, or to the time limit or the stop.
     pub elapsed: Duration,
-    /// The run failed and its output shows that the MSVC linker could not open a program or library it had
-    /// to write (`LNK1104` naming an `.exe`, `.dll` or `.pdb`). On Windows this happens when a test program
-    /// that ran a moment before is still held by the system or a virus scanner: the failure then says nothing
-    /// about the code, and the run is worth repeating or counting as "cannot test". A missing `.lib` (also
-    /// `LNK1104`) is a real build failure and does not set it.
+    /// The run failed and its output shows that the MSVC linker could not write a program or its debug
+    /// information (`LNK1104`, `LNK1168` or `LNK1201` naming an `.exe`, `.dll` or `.pdb` file). On Windows this
+    /// happens when a test program that ran a moment before is still held by the system or a virus scanner:
+    /// the failure then says nothing about the code, and the run is worth repeating or counting as "cannot
+    /// test". A missing `.lib` (also `LNK1104`) is a real build failure and does not set it.
     pub linker_file_held: bool,
 }
 
 /// Runs `command` through the system shell in the folder `cwd`, with exactly the environment variables `env`,
 /// its output in `log` (opened for reading and writing, as [`Logs::create`] does), and kills its whole
-/// process tree when it ends, when `limit` is reached, or when `stop` is set.
+/// process tree when it ends, when `limit` is reached, when `stop` is set, or when the log grows over
+/// [`MAX_LOG_BYTES`].
 ///
-/// Fails only when the command cannot be started or waited for; whatever was started is then killed.
+/// Fails only when the command cannot be started, waited for or killed; whatever was started is then killed.
 pub fn run(
     command: &str,
     cwd: &Path,
@@ -145,7 +189,19 @@ pub fn run(
     limit: Option<Duration>,
     stop: &AtomicBool,
 ) -> io::Result<Run> {
-    let mut shell = shell(command);
+    run_capped(command, cwd, env, log, limit, stop, MAX_LOG_BYTES)
+}
+
+fn run_capped(
+    command: &str,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    log: &File,
+    limit: Option<Duration>,
+    stop: &AtomicBool,
+    max_log_bytes: u64,
+) -> io::Result<Run> {
+    let mut shell = shell(command)?;
     shell
         .current_dir(cwd)
         .env_clear()
@@ -153,29 +209,23 @@ pub fn run(
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?);
-    let mut shell = CommandWrap::from(shell);
-    #[cfg(unix)]
-    shell.wrap(process_wrap::std::ProcessGroup::leader());
-    #[cfg(windows)]
-    shell
-        .wrap(process_wrap::std::JobObject)
-        .wrap(process_wrap::std::CreationFlags(
-            windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP,
-        ));
+    let _running = Running::start();
     let started = Instant::now();
-    let mut child = shell.spawn().map_err(|error| {
+    let mut tree = Tree::spawn(shell).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("cannot start the test command: {error}"),
         )
     })?;
-    let waited = wait(&mut *child, started, limit, stop);
+    let stopped = wait(&mut tree, started, limit, stop, log, max_log_bytes);
     let elapsed = started.elapsed();
-    let killed = kill(&mut *child);
-    let outcome = waited?;
-    killed?;
+    let status = tree.kill();
+    let stopped = stopped?;
+    let status = status?;
+    let outcome = stopped.unwrap_or_else(|| outcome(status));
+    // The log is only read to tell a held file apart: if that fails, the failure stands as it is.
     let linker_file_held =
-        matches!(outcome, Outcome::Failed(_)) && log_shows_linker_file_held(log)?;
+        matches!(outcome, Outcome::Failed(_)) && log_shows_linker_file_held(log).unwrap_or(false);
     Ok(Run {
         outcome,
         elapsed,
@@ -184,70 +234,208 @@ pub fn run(
 }
 
 /// The shell command that runs `command`.
-fn shell(command: &str) -> Command {
+fn shell(command: &str) -> io::Result<Command> {
     #[cfg(unix)]
     {
         let mut shell = Command::new("/bin/sh");
         shell.arg("-c").arg(command);
-        shell
+        Ok(shell)
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // `ComSpec` is the full path of cmd.exe: a bare `cmd.exe` would first be searched in the run's `PATH`,
-        // which can name folders of the copy.
-        let program = std::env::var_os("ComSpec")
-            .filter(|path| Path::new(path).is_absolute())
-            .unwrap_or_else(|| OsString::from("cmd.exe"));
+        let program = cmd_path(|name| std::env::var_os(name)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot find cmd.exe: neither ComSpec nor SystemRoot is set to a full path",
+            )
+        })?;
         let mut shell = Command::new(program);
         // `/d`: no AutoRun command from the registry. `/s /c "<command>"`: cmd removes the outer quotes and
         // runs the rest exactly as typed, inner quotes included.
         shell.raw_arg(format!("/d /s /c \"{command}\""));
-        shell
+        Ok(shell)
     }
 }
 
-/// Waits until the main process of `child` exits, `limit` is reached or `stop` is set.
-///
-/// It waits on the main process itself, not through `process-wrap`, whose wait also waits for the rest of the
-/// group or job: on Windows that wait reads one message of the job, and can block forever once the polls read
-/// them all.
+/// The full path of `cmd.exe`, from Yalper's own environment (`var`): `ComSpec`, else
+/// `%SystemRoot%\System32\cmd.exe`. Never a bare `cmd.exe`, which would first be searched in the run's
+/// `PATH`, where folders of the copy can be.
+#[cfg(any(windows, test))]
+fn cmd_path(var: impl Fn(&str) -> Option<OsString>) -> Option<std::path::PathBuf> {
+    let full_path = |name| {
+        var(name)
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    full_path("ComSpec")
+        .or_else(|| full_path("SystemRoot").map(|root| root.join("System32").join("cmd.exe")))
+}
+
+/// Waits until the main process of `tree` exits (`None`), or until the run must be stopped: the reason.
 fn wait(
-    child: &mut dyn ChildWrapper,
+    tree: &mut Tree,
     started: Instant,
     limit: Option<Duration>,
     stop: &AtomicBool,
-) -> io::Result<Outcome> {
+    log: &File,
+    max_log_bytes: u64,
+) -> io::Result<Option<Outcome>> {
     let mut pause = Duration::from_millis(1);
     loop {
-        if let Some(status) = child.inner_mut().try_wait()? {
-            return Ok(outcome(status));
+        if tree.main_exited()? {
+            return Ok(None);
         }
         if stop.load(Ordering::SeqCst) {
-            return Ok(Outcome::Stopped);
+            return Ok(Some(Outcome::Stopped));
+        }
+        if log.metadata()?.len() > max_log_bytes {
+            return Ok(Some(Outcome::OutputTooLarge));
         }
         let elapsed = started.elapsed();
         if limit.is_some_and(|limit| elapsed >= limit) {
-            return Ok(Outcome::TimedOut);
+            return Ok(Some(Outcome::TimedOut));
         }
         thread::sleep(limit.map_or(pause, |limit| pause.min(limit - elapsed)));
         pause = (pause * 2).min(MAX_PAUSE);
     }
 }
 
-/// Kills every process left in the group or job of `child`, and its main process if it still runs, then
-/// waits for the main process.
-fn kill(child: &mut dyn ChildWrapper) -> io::Result<()> {
-    // Fails only when nothing is left to kill (Unix: no process in the group).
-    let _ = child.start_kill();
-    // The main process may have left the group (`exec setsid ...`). Once waited for, it is never signalled:
-    // its process id could belong to another process by then.
-    let main = child.inner_mut();
-    if main.try_wait()?.is_none() {
-        let _ = main.start_kill();
-        main.wait()?;
+/// The processes of a run (Unix): the main process leads a process group of its own, which holds every
+/// process it starts.
+#[cfg(unix)]
+struct Tree {
+    main: std::process::Child,
+    /// The main process id, which is also the group id.
+    pid: rustix::process::Pid,
+}
+
+#[cfg(unix)]
+impl Tree {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let main = command.spawn()?;
+        let pid = rustix::process::Pid::from_child(&main);
+        Ok(Self { main, pid })
     }
-    Ok(())
+
+    /// Whether the main process exited. It is not reaped (`WNOWAIT`): until [`kill`](Self::kill) reaps it, its
+    /// process id, which is also the group id, cannot be given to another process, so killing the group can
+    /// only reach processes of the run.
+    fn main_exited(&mut self) -> io::Result<bool> {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        Ok(waitid(WaitId::Pid(self.pid), options)?.is_some())
+    }
+
+    /// Kills every process of the group, and the main process, then reaps the main process: its exit status.
+    fn kill(&mut self) -> io::Result<ExitStatus> {
+        use rustix::io::Errno;
+        use rustix::process::{Signal, kill_process, kill_process_group};
+        let group = match kill_process_group(self.pid, Signal::KILL) {
+            // Nothing is left in the group.
+            Err(Errno::SRCH) => Ok(()),
+            // macOS refuses to signal a group holding a zombie, as the exited main process is until it is
+            // reaped.
+            #[cfg(target_vendor = "apple")]
+            Err(Errno::PERM) if self.main_exited()? => Ok(()),
+            result => result,
+        };
+        // The main process may have moved itself to another group (`setpgid`). It is not reaped yet, so its
+        // process id is still its own.
+        if !self.main_exited()? {
+            match kill_process(self.pid, Signal::KILL) {
+                Ok(()) => {}
+                // It exited in the meantime (macOS refuses to signal a zombie).
+                Err(_) if self.main_exited()? => {}
+                // Waiting for it would never end.
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let status = self.main.wait()?;
+        group?;
+        Ok(status)
+    }
+}
+
+/// The processes of a run (Windows): the main process, started suspended in a job object of `process-wrap`
+/// (which then resumes it), so that every process it starts is in that job too.
+#[cfg(windows)]
+struct Tree {
+    child: Box<dyn process_wrap::std::ChildWrapper>,
+    /// A second job, holding the first. Its limit `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` kills every process of
+    /// the run when its last handle is closed: when the run ends, or when Yalper exits in any way, a crash
+    /// included.
+    job: std::sync::Arc<win32job::Job>,
+}
+
+#[cfg(windows)]
+impl Tree {
+    fn spawn(command: Command) -> io::Result<Self> {
+        use process_wrap::std::{CommandWrap, CreationFlags, JobObject};
+        use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        let mut limits = win32job::ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close();
+        let job = win32job::Job::create_with_limit_info(&limits).map_err(io::Error::other)?;
+        let job = std::sync::Arc::new(job);
+        let mut command = CommandWrap::from(command);
+        command
+            .wrap(KillOnClose(std::sync::Arc::clone(&job)))
+            .wrap(JobObject)
+            .wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+        let child = command.spawn()?;
+        Ok(Self { child, job })
+    }
+
+    /// Whether the main process exited. It is checked itself, not through `process-wrap`, whose wait also
+    /// reads the messages of its job and can block forever once they were all read.
+    fn main_exited(&mut self) -> io::Result<bool> {
+        Ok(self.child.inner_mut().try_wait()?.is_some())
+    }
+
+    /// Kills every process of the job, the main process included, then waits for the main process (its exit
+    /// status) and, at most 2 s, until no process of the job is left, so that none still holds a file of the
+    /// copy at the next switch. If this fails, dropping the tree closes the job, which kills its processes.
+    fn kill(&mut self) -> io::Result<ExitStatus> {
+        const BOUND: Duration = Duration::from_secs(2);
+        self.child.start_kill()?;
+        let status = self.child.inner_mut().wait()?;
+        let start = Instant::now();
+        while start.elapsed() < BOUND
+            && !self
+                .job
+                .query_process_id_list()
+                .is_ok_and(|ids| ids.is_empty())
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(status)
+    }
+}
+
+/// Puts the main process into the kill-on-close job right after it is created, while it is still suspended:
+/// `post_spawn` runs before the `JobObject` wrapper resumes it.
+#[cfg(windows)]
+#[derive(Debug)]
+struct KillOnClose(std::sync::Arc<win32job::Job>);
+
+#[cfg(windows)]
+impl process_wrap::std::CommandWrapper for KillOnClose {
+    fn post_spawn(
+        &mut self,
+        _command: &mut Command,
+        child: &mut std::process::Child,
+        _core: &process_wrap::std::CommandWrap,
+    ) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        if let Err(error) = self.0.assign_process(child.as_raw_handle() as isize) {
+            // Never resumed, it would stay suspended forever.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(error));
+        }
+        Ok(())
+    }
 }
 
 fn outcome(status: ExitStatus) -> Outcome {
@@ -275,15 +463,22 @@ fn log_shows_linker_file_held(log: &File) -> io::Result<bool> {
     Ok(shows_linker_file_held(&tail))
 }
 
-/// Whether a line of `output` is a `LNK1104` error naming an `.exe`, `.dll` or `.pdb` file, such as
-/// `LINK : fatal error LNK1104: cannot open file 'C:\p\target\debug\deps\app-1a2b.exe'`.
+/// Whether a line of `output` is a `LNK1104`, `LNK1168` or `LNK1201` error naming an `.exe`, `.dll` or `.pdb`
+/// file, such as `LINK : fatal error LNK1104: cannot open file 'C:\p\target\debug\deps\app-1a2b.exe'`.
 fn shows_linker_file_held(output: &[u8]) -> bool {
     output.split(|&byte| byte == b'\n').any(|line| {
         let line = line.to_ascii_lowercase();
-        contains(&line, b"lnk1104")
-            && [&b".exe'"[..], b".dll'", b".pdb'"]
-                .iter()
-                .any(|end| contains(&line, end))
+        let held_error = [&b"lnk1104"[..], b"lnk1168", b"lnk1201"]
+            .iter()
+            .any(|code| contains(&line, code));
+        held_error
+            && line
+                .split(|&byte| byte.is_ascii_whitespace() || byte == b'\'' || byte == b'"')
+                .any(|word| {
+                    [&b".exe"[..], b".dll", b".pdb"]
+                        .iter()
+                        .any(|end| word.ends_with(end))
+                })
     })
 }
 
@@ -350,6 +545,7 @@ impl Logs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use crate::bisect::testing::{Project, state, write};
@@ -414,6 +610,11 @@ mod tests {
         // Above 127: a failure, not an abort as in `git bisect run`.
         assert_eq!(outcome_of("exit 200"), Outcome::Failed(Exit::Code(200)));
         assert_eq!(Exit::Code(200).to_string(), "exit code 200");
+        // Unix exit codes stop at 255; on Windows a positive code is shown as it is.
+        if cfg!(windows) {
+            assert_eq!(outcome_of("exit 300"), Outcome::Failed(Exit::Code(300)));
+        }
+        assert_eq!(Exit::Code(300).to_string(), "exit code 300");
     }
 
     #[cfg(windows)]
@@ -541,12 +742,13 @@ mod tests {
             Some(limit),
             &AtomicBool::new(false),
         );
+        // From the start to the return, killing included.
+        let returned_after = started.elapsed();
         assert_eq!(run.outcome, Outcome::TimedOut);
         assert!(run.elapsed >= limit, "{:?}", run.elapsed);
         assert!(
-            run.elapsed < limit + Duration::from_secs(1),
-            "{:?}",
-            run.elapsed
+            returned_after < limit + Duration::from_secs(1),
+            "{returned_after:?}"
         );
         assert_grandchild_killed(dir.path(), started);
     }
@@ -569,12 +771,15 @@ mod tests {
     fn the_stop_flag_kills_the_whole_tree_within_a_second() {
         let dir = tempfile::tempdir().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        // Sets the flag once the grandchild runs.
+        // Sets the flag once the grandchild runs. Without the grandchild, it fails after 10 s; the run then ends
+        // by itself.
         let setter = {
             let stop = Arc::clone(&stop);
             let started = dir.path().join("started");
+            let deadline = Instant::now() + Duration::from_secs(10);
             thread::spawn(move || {
                 while !started.exists() {
+                    assert!(Instant::now() < deadline, "the grandchild never started");
                     thread::sleep(Duration::from_millis(10));
                 }
                 stop.store(true, Ordering::SeqCst);
@@ -598,6 +803,116 @@ mod tests {
     }
 
     #[test]
+    fn a_second_ctrl_c_gives_a_run_up_to_its_bound_to_kill_its_processes() {
+        // No run going on: no wait.
+        let started = Instant::now();
+        wait_for_runs(&AtomicUsize::new(0), Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // A run that ends after 100 ms.
+        let running = Arc::new(AtomicUsize::new(1));
+        let ender = {
+            let running = Arc::clone(&running);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                running.store(0, Ordering::SeqCst);
+            })
+        };
+        let started = Instant::now();
+        wait_for_runs(&running, Duration::from_secs(10));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        ender.join().unwrap();
+
+        // A run that does not end: the bound.
+        let started = Instant::now();
+        wait_for_runs(&AtomicUsize::new(1), Duration::from_millis(200));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_run_printing_without_end_is_stopped_at_the_output_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = tempfile::tempfile().unwrap();
+        let command = by_os(
+            "while true; do echo 0123456789; done",
+            "for /l %i in (1,0,2) do @echo 0123456789",
+        );
+        let run = run_capped(
+            command,
+            dir.path(),
+            &environment(),
+            &log,
+            Some(Duration::from_secs(30)),
+            &AtomicBool::new(false),
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(run.outcome, Outcome::OutputTooLarge);
+        assert!(run.elapsed < Duration::from_secs(10), "{:?}", run.elapsed);
+        let mut output = String::new();
+        log.rewind().unwrap();
+        log.read_to_string(&mut output).unwrap();
+        assert!(output.len() > 10_000);
+        assert!(output.starts_with("0123456789"));
+    }
+
+    #[test]
+    fn cmd_exe_is_always_named_by_its_full_path() {
+        fn lookup(vars: Vec<(&'static str, PathBuf)>) -> impl Fn(&str) -> Option<OsString> {
+            move |name| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, path)| path.clone().into_os_string())
+            }
+        }
+        // Full paths on this system.
+        let comspec = std::env::temp_dir().join("cmd.exe");
+        let root = std::env::temp_dir().join("Windows");
+        let both = lookup(vec![
+            ("ComSpec", comspec.clone()),
+            ("SystemRoot", root.clone()),
+        ]);
+        assert_eq!(cmd_path(both), Some(comspec));
+        let relative = lookup(vec![
+            ("ComSpec", "cmd.exe".into()),
+            ("SystemRoot", root.clone()),
+        ]);
+        assert_eq!(
+            cmd_path(relative),
+            Some(root.join("System32").join("cmd.exe"))
+        );
+        assert_eq!(
+            cmd_path(lookup(vec![("SystemRoot", "Windows".into())])),
+            None
+        );
+        assert_eq!(cmd_path(lookup(Vec::new())), None);
+    }
+
+    /// Yalper exiting in any way, a crash included, closes the second job, which kills the whole tree.
+    #[cfg(windows)]
+    #[test]
+    fn closing_the_job_kills_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = shell(GRANDCHILD.1).unwrap();
+        command
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let tree = Tree::spawn(command).unwrap();
+        let deadline = started + Duration::from_secs(10);
+        while !dir.path().join("started").exists() {
+            assert!(Instant::now() < deadline, "the grandchild never started");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Dropped without being killed: only the job's limit ends the processes.
+        drop(tree);
+        assert_grandchild_killed(dir.path(), started);
+    }
+
+    #[test]
     fn a_held_output_file_is_told_apart_from_a_missing_library() {
         let held = |output: &str| shows_linker_file_held(output.as_bytes());
         assert!(held(
@@ -609,8 +924,17 @@ mod tests {
         assert!(held(
             "LINK : fatal error LNK1104: cannot open file 'C:\\t\\deps\\app.dll'"
         ));
+        assert!(held(
+            "LINK : fatal error LNK1168: cannot open C:\\p\\target\\debug\\deps\\app-1a2b.exe for writing"
+        ));
+        assert!(held(
+            "LINK : fatal error LNK1201: error writing to program database 'C:\\p\\target\\debug\\deps\\app.pdb'; check for insufficient disk space"
+        ));
         assert!(!held(
             "LINK : fatal error LNK1104: cannot open file 'ws2_32.lib'"
+        ));
+        assert!(!held(
+            "LINK : fatal error LNK1181: cannot open input file 'app.exe'"
         ));
         assert!(!held(
             "error: linking with `link.exe` failed: exit code: 1181"
