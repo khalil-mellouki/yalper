@@ -173,7 +173,7 @@ fn command_in(
         if error.kind() == io::ErrorKind::ResourceBusy {
             format!("{error}. Only one bisect of a project runs at a time: wait for it to end, or stop it.")
         } else {
-            format!("cannot take the bisect lock: {error}")
+            error.to_string()
         }
     })?;
     say(

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{EXE, files, git};
@@ -580,18 +580,45 @@ fn wait_for(path: &Path, child: &mut Child) {
     }
 }
 
+/// A bisect running in the background, held by its test command until released. Dropping it releases and stops
+/// it, so a failed assertion never leaves processes running.
+struct Held {
+    child: Child,
+    release: PathBuf,
+}
+
+impl Held {
+    /// Releases the test command and waits for the bisect to end.
+    fn finish(&mut self) -> ExitStatus {
+        fs::write(&self.release, "").unwrap();
+        self.child.wait().unwrap()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[test]
-fn a_second_bisect_and_a_purge_wait_for_the_running_one() {
+fn a_second_bisect_and_a_purge_are_refused_while_one_runs() {
     let project = Project::new("good");
     record(&project, SESSION, &notes_steps(8));
     let hold = project.outside.path();
-    let mut running = project
+    let child = project
         .command(&["bisect", "--test", SCRIPT_TEST], &[("HOLD", hold)])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_for(&hold.join("started"), &mut running);
+    let mut running = Held {
+        child,
+        release: hold.join("release"),
+    };
+    wait_for(&hold.join("started"), &mut running.child);
 
     let second = project.yalper(&["bisect", "--test", TEST], &[]);
     assert_eq!(second.status.code(), Some(1));
@@ -615,8 +642,7 @@ fn a_second_bisect_and_a_purge_wait_for_the_running_one() {
     let cache = project.cache_folder();
     assert!(cache.join("copy-0").is_dir());
 
-    fs::write(hold.join("release"), "").unwrap();
-    let status = running.wait().unwrap();
+    let status = running.finish();
     // Once released, the runs go on to the status check and the bisect ends as usual.
     assert_eq!(status.code(), Some(0));
 

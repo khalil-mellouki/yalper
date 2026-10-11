@@ -79,10 +79,8 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
                          again. Nothing was changed."
                     )
                 } else {
-                    format!(
-                        "cannot lock the bisect data in {}: {error}. Nothing was changed.",
-                        folder.path().display()
-                    )
+                    // The error names the lock file.
+                    format!("{error}. Nothing was changed.")
                 }
             })?;
         }
