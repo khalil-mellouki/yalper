@@ -236,7 +236,9 @@ impl TestCopy {
         }
         let mut changes = checked(&changes.files)?;
 
-        // Checked right before writing: a test run could have replaced the copy's folder.
+        // Checked right before writing: a test run could have replaced the copy's folder, or `.yalper/bisect/`,
+        // which holds the bytecode folder cleaned below.
+        self.bisect.check_still_at_path()?;
         self.dir.check_still_at_path()?;
         let root = self.dir.path();
         make_owner_writable(root, &fs::symlink_metadata(root)?)?;
@@ -2537,6 +2539,23 @@ mod tests {
             fs::read(planted.join("pkg").join("mod.cpython-312.pyc")).unwrap(),
             b"keep me"
         );
+    }
+
+    /// Unix only: on Windows the copy holds `.yalper/bisect/` open, so it cannot be renamed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_place_of_the_bisect_folder_is_refused() {
+        let project = Project::new();
+        let tree = project.typed_tree(&[("pkg/mod.py", Regular, "")]);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        // The copy's own path still leads to the same folder, through the link.
+        let bisect = copy.path().parent().unwrap().to_owned();
+        let moved = bisect.with_file_name("moved");
+        fs::rename(&bisect, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &bisect).unwrap();
+        let error = copy.switch(&project.store, tree).unwrap_err();
+        assert!(error.to_string().contains("was replaced"), "{error}");
     }
 
     #[test]

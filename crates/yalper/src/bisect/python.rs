@@ -298,6 +298,8 @@ impl PythonEnvs {
                     return Ok(roots);
                 }
                 files_read += 1;
+                // A file larger than the bytes left is skipped and later, smaller ones are still read: the
+                // total stays within MAX_ENV_BYTES.
                 let Some(bytes) =
                     safe_fs::read_small_regular_file(path, MAX_READ_BYTES.min(bytes_left))
                 else {
@@ -972,29 +974,17 @@ mod tests {
         // Past the number of files or the bytes read, nothing more is read: `zz.pth` is left out.
         let many_files = with_env();
         for file in 0..MAX_FILES_READ {
-            many_files.write(
-                &format!("{site}/a{file:05}.pth"),
-                "# nothing
-",
-            );
+            many_files.write(&format!("{site}/a{file:05}.pth"), "# nothing\n");
         }
         let many_bytes = with_env();
-        let comment = format!(
-            "#{}
-",
-            "x".repeat(MAX_READ_BYTES as usize - 2)
-        );
+        let comment = format!("#{}\n", "x".repeat(MAX_READ_BYTES as usize - 2));
         for file in 0..MAX_ENV_BYTES / MAX_READ_BYTES {
             many_bytes.write(&format!("{site}/a{file}.pth"), &comment);
         }
         for project in [&many_files, &many_bytes] {
             project.write(
                 &format!("{site}/zz.pth"),
-                &format!(
-                    "{}
-",
-                    project.path().join("late").display()
-                ),
+                &format!("{}\n", project.path().join("late").display()),
             );
             assert!(envs_of(project).editable_roots(".venv").unwrap().is_empty());
         }
