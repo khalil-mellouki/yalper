@@ -153,9 +153,10 @@ fn make_real_dir(path: &Path) -> io::Result<()> {
 /// the user's environment `user` (usually `std::env::vars_os()`) with
 ///
 /// - the git variables of [`GIT_REPOSITORY_VARS`] removed, and `GIT_CEILING_DIRECTORIES` set to the project's
-///   cache folder and Yalper's cache folder above it, each as computed and as resolved: git always looks for a
-///   repository in the folder it starts in but never moves up into a listed one, so neither a run in the copy
-///   nor one at the top of the project's cache folder finds a repository above (a home folder kept in git);
+///   cache folder and Yalper's cache folder above it, and to the project, each as computed and as resolved: git
+///   always looks for a repository in the folder it starts in but never moves up into a listed one, so neither
+///   a run in the copy nor one at the top of the project's cache folder finds a repository above (a home folder
+///   kept in git), and neither does one that enters the project through a link of the copy;
 /// - the entries of the path lists of [`PATH_LISTS`] and `PYTHONPATH`, and the value of any other variable that
 ///   is as a whole one path, pointing to the same place in the copy when they point into the project (see
 ///   [`Redirect`]); on Windows, the hidden variables holding the current folder of each drive (`=C:`) are left
@@ -163,34 +164,44 @@ fn make_real_dir(path: &Path) -> io::Result<()> {
 /// - `PYTHONPATH` starting with the folders of `additions`, and the variables of `additions` in place of the
 ///   user's.
 ///
-/// Fails if `PYTHONPATH` would be longer than [`MAX_PYTHONPATH`]; if the path of the cache folder holds the
-/// separator of path lists (`;` on Windows, `:` elsewhere), since git would then read a wrong
-/// `GIT_CEILING_DIRECTORIES`; and if the project is the user's home folder or holds it, since tools keep their
-/// settings and caches there.
+/// Fails if `PYTHONPATH` would be longer than [`MAX_PYTHONPATH`]; if the path of the project or of the cache
+/// folder holds the separator of path lists (`;` on Windows, `:` elsewhere), since git would then read a wrong
+/// `GIT_CEILING_DIRECTORIES` and a variable holding such a path could not be redirected; and if the project is
+/// the user's home folder or holds it, since tools keep their settings and caches there.
 pub fn run_env(
     user: impl IntoIterator<Item = (OsString, OsString)>,
     project: &Path,
     copy: &TestCopy,
     additions: EnvAdditions,
 ) -> io::Result<Vec<(OsString, OsString)>> {
-    let mut ceilings: Vec<PathBuf> = Vec::new();
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let holding_separator = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .find(|path| path.to_string_lossy().contains(separator))
+            .cloned()
+    };
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut project = forms(project)?;
+    if let Some(path) = holding_separator(&project) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot keep the test runs inside the test copy: the project's path holds {separator:?}, the \
+                 separator of lists of paths, so paths into the project could not be told apart in the \
+                 environment of the tests: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut cache_folders: Vec<PathBuf> = Vec::new();
     for spelling in copy.cache().spellings() {
         for form in forms(spelling)? {
-            for folder in [form.parent().map(Path::to_owned), Some(form)]
-                .into_iter()
-                .flatten()
-            {
-                if !ceilings.contains(&folder) {
-                    ceilings.push(folder);
-                }
-            }
+            cache_folders.extend(form.parent().map(Path::to_owned));
+            cache_folders.push(form);
         }
     }
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    if let Some(path) = ceilings
-        .iter()
-        .find(|path| path.to_string_lossy().contains(separator))
-    {
+    if let Some(path) = holding_separator(&cache_folders) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -202,9 +213,15 @@ pub fn run_env(
             ),
         ));
     }
+    // The project too: a run that enters it through a link of the copy (`cd node_modules/<package>`, whose
+    // real path is in the project) finds no repository above that folder.
+    let mut ceilings: Vec<PathBuf> = Vec::new();
+    for folder in cache_folders.into_iter().chain(project.iter().cloned()) {
+        if !ceilings.contains(&folder) {
+            ceilings.push(folder);
+        }
+    }
     let ceilings = join(&ceilings)?;
-    #[cfg_attr(windows, allow(unused_mut))]
-    let mut project = forms(project)?;
     #[cfg(unix)]
     for form in through_top_level_links(&project) {
         if !project.contains(&form) {
@@ -745,7 +762,7 @@ mod tests {
         }
         let ceilings: Vec<PathBuf> =
             std::env::split_paths(value(&env, "GIT_CEILING_DIRECTORIES").unwrap()).collect();
-        // The project's cache folder and Yalper's above it, as held open and resolved; not the project.
+        // The project's cache folder and Yalper's above it, as held open and resolved, and the project.
         let cache = project.cache.path();
         let real = plain(&fs::canonicalize(cache).unwrap());
         for folder in [
@@ -757,10 +774,7 @@ mod tests {
             let folder = plain(&std::path::absolute(folder).unwrap());
             assert!(ceilings.contains(&folder), "{folder:?} not in {ceilings:?}");
         }
-        assert!(
-            !ceilings.iter().any(|ceiling| is_under(ceiling, &root)),
-            "{ceilings:?}"
-        );
+        assert!(ceilings.contains(&root), "{ceilings:?}");
         assert_eq!(
             value(&env, "GIT_CONFIG_GLOBAL"),
             Some(OsStr::new("my-gitconfig"))
@@ -1049,6 +1063,27 @@ mod tests {
         additions.python_path.push(folder(fits));
         let error = run_env(Vec::new(), project.path(), &copy, additions).unwrap_err();
         assert!(error.to_string().contains("PYTHONPATH"), "{error}");
+    }
+
+    #[test]
+    fn a_project_path_that_cannot_be_written_in_a_path_list_is_an_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent
+            .path()
+            .join(if cfg!(windows) { "a;b" } else { "a:b" });
+        fs::create_dir(&root).unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let token = Token::parse(&"c".repeat(32)).unwrap();
+        let cache = CacheDir::open_in(&base.path().join("yalper"), &root, &token).unwrap();
+        let mut copy = TestCopy::open(&cache, 0).unwrap();
+        let project = Project::new();
+        copy.switch(&project.store, project.tree(&[("README.md", "")]))
+            .unwrap();
+        let python = PythonEnvs::new(&root).unwrap();
+        let additions = env_additions(&copy, &python).unwrap();
+        let error = run_env(Vec::new(), &root, &copy, additions).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("project's path"), "{error}");
     }
 
     #[test]

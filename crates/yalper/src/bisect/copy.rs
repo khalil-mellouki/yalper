@@ -319,7 +319,10 @@ impl TestCopy {
         }
         switched.deleted = sweep(root, &placed, &self.extra, self.info_exclude.as_deref())?;
 
-        // The local clock if the file system's cannot be read.
+        // Removed first, so that the clock is always a file Yalper creates: on Windows, a hard link a test put
+        // at its name (which `open_file` cannot tell there) would have Yalper write into a project file. The
+        // local clock if the file system's cannot be read.
+        clear(&self.cache.path().join(CLOCK_FILE))?;
         self.clean_at = file_system_clock(self.cache.dir(), CLOCK_FILE)
             .unwrap_or_else(|_| nanos_since_epoch(SystemTime::now()));
         self.placed = placed;
@@ -984,24 +987,10 @@ pub(super) fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<(
             }
         });
     }
-    match fs::remove_file(path) {
-        // The read-only attribute belongs to the file, not to this name: with a second hard link outside the
-        // copy, clearing it changes that file too. So it is cleared only when the file cannot be removed
-        // otherwise.
-        #[cfg(windows)]
-        Err(error)
-            if error.kind() == io::ErrorKind::PermissionDenied
-                && metadata.permissions().readonly() =>
-        {
-            let mut permissions = metadata.permissions();
-            // Clears the Windows read-only attribute; this code does not run on Unix.
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            fs::set_permissions(path, permissions)?;
-            fs::remove_file(path)
-        }
-        result => result,
-    }
+    // On Windows the standard library removes a read-only file without clearing its attribute (since Rust
+    // 1.86). The attribute is never cleared here: it belongs to the file, not to this name, so with a second
+    // hard link outside the copy (a project file) clearing it would change that file too.
+    fs::remove_file(path)
 }
 
 /// Removes the folder `dir` and everything in it one entry at a time, making each folder writable by its
@@ -2531,6 +2520,30 @@ mod tests {
             fs::read(planted.join("pkg").join("mod.cpython-312.pyc")).unwrap(),
             b"keep me"
         );
+    }
+
+    #[test]
+    fn a_hard_link_at_the_clock_is_replaced_never_written_through() {
+        let project = Project::new();
+        let tree = project.typed_tree(&[("a.txt", Regular, "a")]);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        // A test run puts a hard link to a project file at the clock's name.
+        let canary = tempfile::tempdir().unwrap();
+        let target = canary.path().join("keep.txt");
+        fs::write(&target, "keep me").unwrap();
+        let clock = project.cache.path().join(CLOCK_FILE);
+        fs::remove_file(&clock).unwrap();
+        fs::hard_link(&target, &clock).unwrap();
+
+        copy.switch(&project.store, tree).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(fs::symlink_metadata(&clock).unwrap().is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&clock).unwrap().nlink(), 1);
+        }
     }
 
     /// Unix only: on Windows the copy holds the project's cache folder open, so it cannot be renamed.

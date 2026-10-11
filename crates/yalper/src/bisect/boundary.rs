@@ -214,6 +214,25 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_hard_link_in_place_of_a_boundary_file_leaves_its_file_as_it_was() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        let target = canary.path().join("keep.txt");
+        fs::write(&target, "keep me").unwrap();
+        let mut permissions = fs::metadata(&target).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&target, permissions).unwrap();
+        fs::hard_link(&target, project.cache.path().join("package.json")).unwrap();
+        let before = state(canary.path());
+
+        assert_eq!(write_boundaries(&project.cache).unwrap(), FILES.len());
+        assert_eq!(read(&project, "package.json"), FILES[0].1);
+        assert_eq!(state(canary.path()), before);
+        // The attribute belongs to the file, so clearing it through the link would have cleared it there too.
+        assert!(fs::metadata(&target).unwrap().permissions().readonly());
+    }
+
+    #[test]
     fn switches_and_logs_leave_the_boundary_files_alone() {
         let project = Project::new();
         write_boundaries(&project.cache).unwrap();
@@ -365,6 +384,46 @@ mod tests {
         let user = environment_without(&["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]);
         let (outcome, output) = run_in_project(project.path(), "git status", &user);
         assert_eq!(outcome, Outcome::Passed, "{output}");
+    }
+
+    #[test]
+    fn git_entering_the_project_through_a_link_of_the_copy_finds_no_repository() {
+        let Some(git) = tool(&["git"]) else {
+            return;
+        };
+        let project = Project::new();
+        project.write(".gitignore", "node_modules/\n");
+        project.write("node_modules/pkg/index.js", "");
+        git_in(git, project.path(), &["init", "-q"]);
+        let before = state(project.path());
+        let files = [(".gitignore", "node_modules/\n"), ("package.json", "{}")];
+        let mut copy = copy_with(&project, &files);
+        let mut node_modules = NodeModules::new(project.path()).unwrap();
+        node_modules.link(&mut copy).unwrap();
+        let user = environment_without(&[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+        ]);
+        // The package's folder in the copy is a link to the project's.
+        let command = if cfg!(windows) {
+            r"cd node_modules\pkg && git stash"
+        } else {
+            "cd node_modules/pkg && git stash"
+        };
+        let (outcome, output) = run_as_bisect(&mut copy, command, user.clone());
+        assert_failed(outcome, &output, "not a git repository");
+        assert_eq!(state(project.path()), before);
+
+        // Without the environment of a run, git finds the project's repository from the package's real folder,
+        // where the shell is on Unix (on Windows it stays in the copy's path of the junction).
+        #[cfg(unix)]
+        {
+            let command = "cd node_modules/pkg && git status";
+            let (outcome, output) = run_with(copy.path(), command, &user);
+            assert_eq!(outcome, Outcome::Passed, "{output}");
+        }
     }
 
     #[test]

@@ -30,7 +30,7 @@ use super::copy::{CARGO_TARGET_DIR, CLOCK_FILE, PYCACHE_DIR, open_private_dir, r
 use super::link::{has_special_prefix, is_under, normalize, plain};
 use super::run::LOGS_DIR;
 use crate::repo::Token;
-use crate::safe_fs::{self, Access, OwnedDir};
+use crate::safe_fs::{self, OwnedDir};
 use crate::snapshot::CASE_INSENSITIVE;
 
 /// The variable that names Yalper's cache folder, in place of `<cache>/yalper/`.
@@ -39,11 +39,16 @@ pub const CACHE_DIR_VAR: &str = "YALPER_CACHE_DIR";
 /// The marker at the top of a project's folder: see [`CacheDir`].
 const MARKER_FILE: &str = "project";
 
-/// The lock that lets one bisect of a project run at a time.
+/// The lock that lets one bisect of a project run at a time. Like `clock`, it must never be written through an
+/// existing file at its name (remove it and create it with `create_new` instead): on Windows a hard link a test
+/// put there cannot be told from a plain file, so a write would reach the file it links to.
 const LOCK_FILE: &str = "lock";
 
 /// A marker larger than this was not written by Yalper (it holds a digest, an id and a path).
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
+
+/// How many times an empty marker is read, 10 ms apart, before it counts as never written.
+const MARKER_READS: usize = 20;
 
 /// The most characters of the project folder's name in the name of its cache folder: paths stay short for
 /// tools that do not handle long Windows paths.
@@ -149,6 +154,7 @@ pub struct CacheDir {
     given: PathBuf,
     instance: String,
     project: PathBuf,
+    warning: Option<String>,
 }
 
 impl CacheDir {
@@ -172,7 +178,19 @@ impl CacheDir {
         })?);
         let (name, digest) = folder_name(&project_real, token)?;
         let given = folder.join(&name);
-        check_place(folder, &name, &project_real)?;
+        let resolved = check_place(folder, &name, &project_real)?;
+        #[cfg(unix)]
+        check_parent(folder)?;
+        let warning = if cfg!(windows) {
+            let profile = std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .filter(|profile| profile.is_absolute())
+                .or_else(std::env::home_dir)
+                .map(|profile| fs::canonicalize(&profile).map_or(profile, |real| plain(&real)));
+            access_warning(&resolved, profile.as_deref())
+        } else {
+            None
+        };
 
         #[cfg_attr(windows, allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
@@ -193,7 +211,14 @@ impl CacheDir {
             given,
             instance,
             project: project.to_owned(),
+            warning,
         })
+    }
+
+    /// A warning for the user, to be printed when a bisect starts: on Windows, when the folder is outside the
+    /// user's profile folder, where other local users may be able to read it (see [`access_warning`]).
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
     }
 
     /// The folder's path (canonical on Unix).
@@ -227,6 +252,7 @@ impl CacheDir {
             given: self.given.clone(),
             instance: self.instance.clone(),
             project: self.project.clone(),
+            warning: self.warning.clone(),
         })
     }
 }
@@ -280,8 +306,8 @@ fn refusal(message: String) -> io::Error {
 /// Refuses Yalper's cache folder `folder` for the project at the canonical path `project` when the project's
 /// folder `name` in it would be the project, inside it, or hold it, or, on Windows, when `folder` is on a
 /// network share. Paths are compared once resolved (see [`resolve`]), without regard to case where the file
-/// system ignores it.
-fn check_place(folder: &Path, name: &str, project: &Path) -> io::Result<()> {
+/// system ignores it. Returns `folder` resolved.
+fn check_place(folder: &Path, name: &str, project: &Path) -> io::Result<PathBuf> {
     let set_it =
         format!("Set {CACHE_DIR_VAR} to the absolute path of a local folder outside the project");
     if !folder.is_absolute() {
@@ -315,7 +341,50 @@ fn check_place(folder: &Path, name: &str, project: &Path) -> io::Result<()> {
             project.display()
         )));
     }
+    Ok(resolved)
+}
+
+/// Unix: refuses Yalper's cache folder `folder` when the folder holding it exists and other users can create,
+/// rename or delete entries in it (group or world writable, without the sticky bit, as OpenSSH's StrictModes
+/// checks): they could put their own folder in place of Yalper's between two bisects. A missing one is created
+/// with mode 0700.
+#[cfg(unix)]
+fn check_parent(folder: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(parent) = folder.parent() else {
+        return Ok(());
+    };
+    let mode = match fs::metadata(parent) {
+        Ok(metadata) => metadata.permissions().mode(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(refusal(format!(
+            "cannot keep the bisect data in {}: other users can change the folder that holds it (it is group \
+             or world writable, without the sticky bit). Set {CACHE_DIR_VAR} to the absolute path of a folder \
+             that only you can change",
+            folder.display()
+        )));
+    }
     Ok(())
+}
+
+/// The warning for Yalper's cache folder `folder` (resolved) on Windows, where Yalper does not check access
+/// lists: a folder outside the user's profile folder `profile` (resolved) may be readable by other local users
+/// (a folder created under `C:\` lets every signed-in user read it), and run logs can hold secrets that tests
+/// print.
+fn access_warning(folder: &Path, profile: Option<&Path>) -> Option<String> {
+    if profile.is_some_and(|profile| is_under(folder, profile)) {
+        return None;
+    }
+    Some(format!(
+        "the bisect data is kept in {}, outside your user profile folder: Yalper does not check Windows access \
+         rights, so other users of this computer may be able to read it, run logs included (which can hold \
+         secrets that tests print). Set {CACHE_DIR_VAR} to a folder inside your profile folder to keep it \
+         private",
+        folder.display()
+    ))
 }
 
 /// How the project's cache folder `own` and the project `project`, both resolved, overlap, if they do.
@@ -391,8 +460,9 @@ fn slug(name: &str) -> String {
     }
 }
 
-/// Checks the marker of the project's cache folder `dir`, or writes it if the folder is empty, and returns the
-/// instance id it holds.
+/// Checks the marker of the project's cache folder `dir`, or writes it if the folder is empty (its creation was
+/// interrupted: nothing in it, or only an empty marker), and returns the instance id it holds. The marker is
+/// created exclusively: when two first opens of the folder race, the one that loses reads the winner's marker.
 fn bind(dir: &OwnedDir, digest: &str, project: &Path) -> io::Result<String> {
     let marker = dir.path().join(MARKER_FILE);
     let not_ours = || {
@@ -401,29 +471,85 @@ fn bind(dir: &OwnedDir, digest: &str, project: &Path) -> io::Result<String> {
             dir.path().display()
         ))
     };
-    match fs::symlink_metadata(&marker) {
-        Ok(_) => {
-            let bytes = safe_fs::read_small_regular_file(&marker, MAX_MARKER_BYTES);
-            return match bytes.as_deref().and_then(parse_marker) {
-                Some((found, instance)) if found == digest => Ok(instance),
-                _ => Err(not_ours()),
-            };
+    let only_marker = || -> io::Result<bool> {
+        for entry in fs::read_dir(dir.path())? {
+            if entry?.file_name() != MARKER_FILE {
+                return Ok(false);
+            }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Ok(true)
+    };
+    for _ in 0..2 {
+        match read_marker(&marker)? {
+            Marker::Valid { digest: found, .. } if found != digest => return Err(not_ours()),
+            Marker::Valid { instance, .. } => return Ok(instance),
+            Marker::Other => return Err(not_ours()),
+            Marker::Empty if only_marker()? => {
+                remove_entry(&marker, &fs::symlink_metadata(&marker)?)?
+            }
+            Marker::Empty => return Err(not_ours()),
+            Marker::Missing if !only_marker()? => return Err(not_ours()),
+            Marker::Missing => {}
+        }
+        dir.check_still_at_path()?;
+        let mut options = fs::File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = match options.open(&marker) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let instance = Token::generate()?.as_str().to_owned();
+        let text = format!(
+            "Bisect data of a project, kept by Yalper. This folder can be deleted at any time.\n\
+             digest {digest}\ninstance {instance}\nproject {}\n",
+            project.display()
+        );
+        file.write_all(text.as_bytes())?;
+        return Ok(instance);
     }
-    if fs::read_dir(dir.path())?.next().is_some() {
-        return Err(not_ours());
+    Err(not_ours())
+}
+
+/// What is at the marker's place.
+enum Marker {
+    Missing,
+    /// An empty regular file: a marker created but not written yet, or never (an interrupted creation).
+    Empty,
+    Valid {
+        digest: String,
+        instance: String,
+    },
+    /// Anything else: a link, a folder, a file Yalper did not write.
+    Other,
+}
+
+/// Reads the marker at `path`. An empty one is read again for a moment, since another first open of the folder
+/// may be writing it.
+fn read_marker(path: &Path) -> io::Result<Marker> {
+    for _ in 0..MARKER_READS {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Marker::Missing),
+            Err(error) => return Err(error),
+        }
+        match safe_fs::read_small_regular_file(path, MAX_MARKER_BYTES) {
+            None => return Ok(Marker::Other),
+            Some(bytes) if bytes.is_empty() => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Some(bytes) => {
+                return Ok(
+                    parse_marker(&bytes).map_or(Marker::Other, |(digest, instance)| {
+                        Marker::Valid { digest, instance }
+                    }),
+                );
+            }
+        }
     }
-    let instance = Token::generate()?.as_str().to_owned();
-    let text = format!(
-        "Bisect data of a project, kept by Yalper. This folder can be deleted at any time.\n\
-         digest {digest}\ninstance {instance}\nproject {}\n",
-        project.display()
-    );
-    dir.open_file(MARKER_FILE, Access::ReadWrite)?
-        .write_all(text.as_bytes())?;
-    Ok(instance)
+    Ok(Marker::Empty)
 }
 
 /// The digest and the instance id of a marker: the first lines starting with `digest ` and `instance `.
@@ -665,12 +791,18 @@ mod tests {
         drop(cache);
         let open = || CacheDir::open_in(&folder, project.path(), &token('a'));
 
-        // Emptied, as if its creation had stopped before the marker.
-        fs::remove_file(path.join(MARKER_FILE)).unwrap();
-        open().unwrap();
-
-        // Without the marker, or with a wrong one, or another kind of entry at its name.
+        // Its creation stopped before the marker was created, or before it was written.
         let marker = path.join(MARKER_FILE);
+        fs::remove_file(&marker).unwrap();
+        let instance = open().unwrap().instance().to_owned();
+        fs::write(&marker, "").unwrap();
+        let adopted = open().unwrap();
+        assert_ne!(adopted.instance(), instance);
+        assert_eq!(open().unwrap().instance(), adopted.instance());
+        drop(adopted);
+
+        // Without the marker, or with a wrong one, or another kind of entry at its name, or an empty one next
+        // to something else.
         let text = fs::read_to_string(&marker).unwrap();
         let wrong = text.replace("digest ", "digest 0");
         let cases: [&dyn Fn(); 4] = [
@@ -679,7 +811,10 @@ mod tests {
                 fs::write(path.join("other"), "").unwrap();
             },
             &|| fs::write(&marker, &wrong).unwrap(),
-            &|| fs::write(&marker, "").unwrap(),
+            &|| {
+                fs::write(&marker, "").unwrap();
+                fs::write(path.join("other"), "").unwrap();
+            },
             &|| {
                 fs::remove_file(&marker).unwrap();
                 fs::create_dir(&marker).unwrap();
@@ -695,6 +830,56 @@ mod tests {
             // Back to a good state for the next case.
             fs::remove_dir_all(&path).unwrap();
             open().unwrap();
+        }
+    }
+
+    #[test]
+    fn first_opens_that_race_share_one_marker() {
+        let (_base, folder) = base();
+        let project = tempfile::tempdir().unwrap();
+        let instances: Vec<String> = std::thread::scope(|scope| {
+            let opens: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let cache = CacheDir::open_in(&folder, project.path(), &token('a'));
+                        cache.unwrap().instance().to_owned()
+                    })
+                })
+                .collect();
+            opens.into_iter().map(|open| open.join().unwrap()).collect()
+        });
+        assert!(instances.iter().all(|instance| *instance == instances[0]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_others_can_change_above_the_cache_folder_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = Project::new();
+        let (base, folder) = base();
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let error = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap_err();
+        assert!(error.to_string().contains("other users"), "{error}");
+        assert!(error.to_string().contains(CACHE_DIR_VAR), "{error}");
+        // With the sticky bit, as `/tmp`: others cannot rename or delete what they do not own.
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+    }
+
+    #[test]
+    fn a_folder_outside_the_profile_folder_gets_a_warning() {
+        assert_eq!(
+            access_warning(&p("/Users/me/AppData/Local/yalper"), Some(&p("/Users/me"))),
+            None
+        );
+        for (folder, profile) in [
+            (p("/cache/yalper"), Some(p("/Users/me"))),
+            (p("/Users/me-other/yalper"), Some(p("/Users/me"))),
+            (p("/Users/me/yalper"), None),
+        ] {
+            let warning = access_warning(&folder, profile.as_deref()).unwrap();
+            assert!(warning.contains("other users"), "{warning}");
+            assert!(warning.contains(CACHE_DIR_VAR), "{warning}");
         }
     }
 
