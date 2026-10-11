@@ -5,10 +5,18 @@
 //! the code of one step (see [`TestCopy`]).
 
 mod copy;
+mod env;
+mod link;
 mod node_modules;
+mod python;
+#[cfg(test)]
+mod testing;
 
 pub use copy::{Switched, TestCopy};
-pub use node_modules::{CANNOT_LINK, Linked, NodeModules};
+pub use env::{EnvAdditions, env_additions};
+pub use link::CANNOT_LINK;
+pub use node_modules::{Linked, NodeModules};
+pub use python::{LinkedEnvs, PythonEnvs};
 
 /// The folder inside `.yalper/` that holds the test copies.
 pub const BISECT_DIR: &str = "bisect";
