@@ -17,9 +17,9 @@
 //!   installed once: with the `--setup` command at the top of the copy, or with the command of each lockfile
 //!   (see [`Tool`]) in its folder. In each ecosystem (Node, Python, Rust), only the lockfiles next to which the
 //!   project has an installed folder of that ecosystem (`node_modules`, `.venv` or `venv`, cargo's `target`) are
-//!   installed, or all of them when it has none. `cargo fetch` always runs for the topmost Cargo lockfiles: it
-//!   costs nothing when the crates are already downloaded, and offline a crate that cannot be downloaded then
-//!   makes the set "cannot test" instead of failing the tests. The copy is kept for the next steps and bisects
+//!   installed, or all of them when it has none. `cargo fetch` always runs for a `Cargo.lock` at the top of the
+//!   step: it costs nothing when the crates are already downloaded, and offline a crate that cannot be
+//!   downloaded then makes the set "cannot test" instead of failing the tests. The copy is kept for the next steps and bisects
 //!   of the set. When a set needs a copy and all three hold an install, the least recently used one is deleted,
 //!   with its Cargo target and Python bytecode folders. Which copy holds which set is recorded in the event log
 //!   (see [`Book`]).
@@ -27,8 +27,10 @@
 //!   (or a file) in the step's code where an install writes, such as a `.venv` that links to an environment
 //!   elsewhere on the machine: the install would write through it, so it is not run. Each command checks the
 //!   folders it writes in (a `--setup` command, all of them). On Unix, no install runs at all while the step's
-//!   code holds a link whose target is absolute or climbs above the top of the copy (a workspace package, a
-//!   `.yarn` folder or `src` linked elsewhere): package managers write through such links.
+//!   code holds a link that may point outside the copy (a workspace package, a `.yarn` folder or `src` linked
+//!   elsewhere): package managers write through such links. Targets are judged by their text only (see
+//!   [`leaves_tree`]): absolute, climbing above the top of the copy, or going through another link of the step
+//!   (chained links), which counts as outside.
 //!
 //! Installs get the protections of test runs: the root of the project's cache folder is cleaned and its
 //! boundary files written before each one, and they run with the environment of [`run_env`], through [`run`],
@@ -57,7 +59,7 @@
 //!   folders in a copy with its own install changes them for the next runs in that copy.
 
 use std::collections::btree_map;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -503,7 +505,7 @@ fn read_deps(
     }
     let mut files = Vec::new();
     let mut setup_scripts = Vec::new();
-    let mut link_out = None;
+    let mut links = Vec::new();
     for change in &listing.files {
         let Some(file) = change.new else { continue };
         // A path that is not UTF-8 is refused by the switch of the copy.
@@ -511,14 +513,7 @@ fn read_deps(
             continue;
         };
         if file.kind == FileKind::Symlink {
-            if link_out.is_none() {
-                let target = store
-                    .read_blob(file.blob)?
-                    .ok_or(Error::MissingObject(file.blob))?;
-                if leaves_tree(path, &target) {
-                    link_out = Some(path.to_owned());
-                }
-            }
+            links.push((path, file.blob));
             continue;
         }
         if path.split('/').any(|part| part == "node_modules") {
@@ -556,6 +551,15 @@ fn read_deps(
     for (path, digest) in &files {
         parts.extend([path.as_bytes(), b"\0", digest.as_bytes(), b"\n"]);
     }
+    let link_paths: HashSet<&str> = links.iter().map(|&(path, _)| path).collect();
+    let mut link_out = None;
+    for (path, blob) in links {
+        let target = store.read_blob(blob)?.ok_or(Error::MissingObject(blob))?;
+        if leaves_tree(path, &target, &link_paths) {
+            link_out = Some(path.to_owned());
+            break;
+        }
+    }
     let paths = || files.iter().map(|(path, _)| path.as_str());
     let installs = installs(paths());
     Ok(Deps {
@@ -567,22 +571,34 @@ fn read_deps(
     })
 }
 
-/// Whether the link at `path` (relative, `/`-separated) of a tree, whose target is `target`, points outside the
-/// tree: its target is absolute, or its `..` components climb above the top of the tree. An install could write
-/// through such a link to a place outside the test copy.
-fn leaves_tree(path: &str, target: &[u8]) -> bool {
+/// Whether the link at `path` (relative, `/`-separated) of a tree, whose target is `target`, may point outside
+/// the tree, where an install could write through it. The target is resolved by its text only, from the link's
+/// folder: it may leave if it is absolute, if its `..` parts climb above the top of the tree, or if a part
+/// before its last one names another link of the tree (`links`), whose own target would decide where the rest
+/// leads: chained links such as `r -> .` and `x -> r/r/../..` are caught that way.
+fn leaves_tree(path: &str, target: &[u8], links: &HashSet<&str>) -> bool {
     if target.first() == Some(&b'/') {
         return true;
     }
-    let mut depth = parents(path).count();
-    for part in target.split(|&byte| byte == b'/') {
-        match part {
-            b"" | b"." => {}
-            b".." => match depth.checked_sub(1) {
-                Some(up) => depth = up,
-                None => return true,
-            },
-            _ => depth += 1,
+    let mut at: Vec<&[u8]> = path.split('/').map(str::as_bytes).collect();
+    at.pop();
+    let parts: Vec<&[u8]> = target
+        .split(|&byte| byte == b'/')
+        .filter(|part| !part.is_empty() && *part != b".")
+        .collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == b".." {
+            if at.pop().is_none() {
+                return true;
+            }
+        } else {
+            at.push(part);
+        }
+        let last = i + 1 == parts.len();
+        if !last
+            && std::str::from_utf8(&at.join(&b'/')).is_ok_and(|through| links.contains(through))
+        {
+            return true;
         }
     }
     false
@@ -1040,9 +1056,9 @@ impl DependencySets {
     /// lockfiles, parent folders first. In each ecosystem (Node, Python, Rust), a lockfile is installed only
     /// where the project has installed that ecosystem's folder (`node_modules`, a Python environment, cargo's
     /// `target`), or everywhere if the project has none of them: lockfiles of documentation, examples or
-    /// fixtures are not installed when the project never installed them. `cargo fetch` also always runs for the
-    /// topmost Cargo lockfiles, so that a crate that cannot be downloaded makes the set "cannot test" instead of
-    /// failing its tests; it costs nothing when the crates are already downloaded.
+    /// fixtures are not installed when the project never installed them. `cargo fetch` also always runs for a
+    /// `Cargo.lock` at the top of the step, so that a crate that cannot be downloaded makes the set "cannot test"
+    /// instead of failing its tests; it costs nothing when the crates are already downloaded.
     fn own_installs(&mut self, deps: &Deps) -> Result<Vec<Planned>> {
         if let Some(setup) = &self.setup {
             return Ok(vec![Planned {
@@ -1065,11 +1081,8 @@ impl DependencySets {
                 }
             }
             for &i in &all {
-                let dir = &deps.installs[i].dir;
-                let topmost = !all
-                    .iter()
-                    .any(|&other| is_inside(dir, &deps.installs[other].dir));
-                if !any_installed || (ecosystem == Ecosystem::Rust && topmost) {
+                let at_top = deps.installs[i].dir.is_empty();
+                if !any_installed || (ecosystem == Ecosystem::Rust && at_top) {
                     chosen[i] = true;
                 }
             }
@@ -1181,9 +1194,10 @@ impl DependencySets {
     }
 
     /// Runs `commands` in copy `number`, which holds a step whose dependencies are `deps`, one after the other,
-    /// with the protections of a test run, their output in one new log of `logs`. Nothing runs, on Unix, while
-    /// the step has a link that points outside the copy. Before each command, the folders it writes in are
-    /// checked: a link or a file there, or above them, stops the install.
+    /// with the protections of a test run, their output in one new log of `logs`. With no command there is
+    /// nothing to install. Otherwise nothing runs, on Unix, while the step has a link that may point outside the
+    /// copy. Before each command, the folders it writes in are checked: a link or a file there, or above them,
+    /// stops the install.
     fn run_installs(
         &mut self,
         number: usize,
@@ -1192,6 +1206,9 @@ impl DependencySets {
         logs: &Logs,
         stop: &AtomicBool,
     ) -> Result<Installed> {
+        if commands.is_empty() {
+            return Ok(Installed::Done);
+        }
         // Windows writes the links of a tree as plain files, which nothing follows.
         if cfg!(unix)
             && let Some(path) = &deps.link_out
@@ -1263,16 +1280,6 @@ fn blocked(root: &Path, folder: &str) -> io::Result<Option<(String, bool)>> {
         }
     }
     Ok(None)
-}
-
-/// Whether the folder `dir` is inside the folder `other`, and not `other` itself (both relative,
-/// `/`-separated, `""` for the top).
-fn is_inside(dir: &str, other: &str) -> bool {
-    dir != other
-        && (other.is_empty()
-            || dir
-                .strip_prefix(other)
-                .is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// Deletes copy `number`, and its folders in `cargo-target/` and `pycache/`, from the project's cache folder
@@ -2247,7 +2254,7 @@ mod tests {
             .map(|planned| (planned.dir.as_str(), planned.command.as_str()))
             .collect();
         // Node where the project installed it; Python everywhere; Rust where the project built it and, always,
-        // for the topmost lockfile.
+        // for the lockfile at the top.
         assert_eq!(
             plan,
             [
@@ -2257,6 +2264,18 @@ mod tests {
                 ("examples/tool", "cargo fetch"),
             ]
         );
+
+        // Without a lockfile at the top, Rust follows the same rule as the others.
+        let crates = [("a/Cargo.lock", "1"), ("b/Cargo.lock", "1")];
+        let deps = read_deps(&project.store, project.tree(&crates), &mut HashMap::new()).unwrap();
+        let built: Vec<String> = dirs(&bisect.sets.own_installs(&deps).unwrap())
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(built, ["a", "b"]);
+        fs::create_dir_all(project.path().join("a/target")).unwrap();
+        let mut bisect = Bisect::new(&project, None);
+        assert_eq!(dirs(&bisect.sets.own_installs(&deps).unwrap()), ["a"]);
     }
 
     #[test]
@@ -2270,16 +2289,13 @@ mod tests {
             ("docs/venv", FileKind::Symlink, "../src"),
             ("src/lib.rs", regular, ""),
         ]);
+        // Whether `cargo fetch` itself succeeds here does not matter: the link must not stop it.
         let mut bisect = Bisect::new(&project, None);
-        match bisect.prepare(&project, tree) {
-            Prepared::Ready(_) => {}
-            Prepared::CannotTest(failure) => {
-                assert!(
-                    matches!(failure, InstallFailure::Failed { .. }),
-                    "{failure}"
-                );
-            }
-            Prepared::Stopped => panic!("stopped"),
+        if let Prepared::CannotTest(failure) = bisect.prepare(&project, tree) {
+            assert!(
+                !matches!(failure, InstallFailure::Blocked { .. }),
+                "{failure}"
+            );
         }
         drop(bisect);
 
@@ -2295,22 +2311,54 @@ mod tests {
 
     #[test]
     fn links_that_leave_the_tree_are_found() {
+        // The paths of the links of the tree (`r -> .` among them).
+        let links: HashSet<&str> = ["r", "lib", "x", "y"].into_iter().collect();
         for (path, target) in [
             ("packages/lib", "/home/me/lib"),
             ("vendor/x", "../../outside"),
             ("a", ".."),
             ("a/b", "../c/../../x"),
+            // Chained links: `r` resolves to the top, so `r/r/../..` climbs above it.
+            ("x", "r/r/../.."),
+            ("y", "./lib/package"),
         ] {
-            assert!(leaves_tree(path, target.as_bytes()), "{path} -> {target}");
+            assert!(
+                leaves_tree(path, target.as_bytes(), &links),
+                "{path} -> {target}"
+            );
         }
         for (path, target) in [
             ("docs/venv", "../src"),
             ("a", "b"),
             ("a/b/c", "../../d/./e"),
             ("a", "./b/"),
+            ("r", "."),
+            // A link to another link, as a whole, is judged by that link's own target.
+            ("z", "lib"),
         ] {
-            assert!(!leaves_tree(path, target.as_bytes()), "{path} -> {target}");
+            assert!(
+                !leaves_tree(path, target.as_bytes(), &links),
+                "{path} -> {target}"
+            );
         }
+    }
+
+    #[test]
+    fn a_step_with_nothing_to_install_is_ready_whatever_its_links() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        // A manifest the project does not have, without a lockfile: a copy of its own, with nothing to install.
+        let tree = project.typed_tree(&[
+            (
+                "package.json",
+                FileKind::Regular,
+                r#"{"dependencies": {"a": "1"}}"#,
+            ),
+            ("lib", FileKind::Symlink, canary.path().to_str().unwrap()),
+        ]);
+        let mut bisect = Bisect::new(&project, None);
+        assert_eq!(bisect.ready(&project, tree), "copy-1");
+        assert!(!bisect.logs.path().join("install-1.log").exists());
     }
 
     #[test]
