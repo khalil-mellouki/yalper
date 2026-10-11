@@ -10,11 +10,15 @@
 //!
 //! [`DependencySets`] picks the copy of each step: the one linked to the project's installed dependencies
 //! when the step's dependency files are the project's, otherwise one per dependency set, installed once.
+//!
+//! [`bisect`] is the search itself: it picks the entry to test next and its time limit, and reads what the
+//! runs say, without touching files or processes.
 
 mod boundary;
 mod cache;
 mod copy;
 mod deps;
+mod engine;
 mod env;
 mod link;
 mod node_modules;
@@ -30,6 +34,10 @@ pub use cache::{
 };
 pub use copy::{Switched, TestCopy};
 pub use deps::{COPIES_KEY, DependencySets, InstallFailure, Prepared, SetCopy};
+pub use engine::{
+    Answer, End, Failure, LINKER_RERUNS, Reason, Report, Settings, Skip, Tested, Trial,
+    automatic_limit, bisect,
+};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
 pub use node_modules::{Linked, NodeModules};
