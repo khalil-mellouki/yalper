@@ -1,5 +1,5 @@
-//! `yalper bisect`: finds the step of a session that broke the tests by running them against the snapshots
-//! of its steps.
+//! `yalper bisect`: finds the step of a session, or of several sessions, that broke the tests by running them
+//! against the snapshots of its steps.
 //!
 //! The tests never run in the project: each run happens in a test copy that holds the code of one step (see
 //! [`TestCopy`]), and is started by [`run`] with the environment of [`run_env`]. The copies, and all other
@@ -38,14 +38,16 @@ pub use cache::{
     BisectLock, CACHE_DIR_KEY, CACHE_DIR_VAR, CacheDir, ProjectFolder, ProjectFolders, clean_root,
     find_project_folders, remove_stale,
 };
-pub use command::{Ended, MAX_RETRIES, Options, Screen, command, parse_timeout};
+pub use command::{
+    Ended, MAX_RETRIES, Options, Screen, StepRef, command, parse_since, parse_step, parse_timeout,
+};
 pub use copy::{Switched, TestCopy};
 pub use deps::{COPIES_KEY, DependencySets, InstallFailure, Prepared, SetCopy};
 pub use engine::{
     Answer, End, Failure, LINKER_RERUNS, Reason, Report, Settings, Skip, Tested, Trial,
     automatic_limit, bisect,
 };
-pub use entries::{Entries, Entry, session_entries};
+pub use entries::{Entries, Entry, Kind, Scope, entries, others_between, step_name};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
 pub use local_files::{

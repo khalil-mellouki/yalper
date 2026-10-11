@@ -534,6 +534,19 @@ impl Store {
         Ok(events)
     }
 
+    /// The steps of every session in the order they were recorded, which is the order their snapshots were taken
+    /// (sessions that ran at the same time interleave), without their payloads (`Value::Null`).
+    pub fn steps_in_recorded_order(&self) -> Result<Vec<Event>> {
+        let columns = EVENT_COLUMNS.replace("payload", "NULL");
+        let mut statement = self
+            .conn
+            .prepare(&format!("SELECT {columns} FROM events ORDER BY id"))?;
+        let events = statement
+            .query_map([], event_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(events)
+    }
+
     /// One step of a session, if it exists.
     pub fn event(&self, session_id: &str, step: u32) -> Result<Option<Event>> {
         let event = self
@@ -1605,6 +1618,33 @@ mod tests {
         assert_eq!(store.events("a").unwrap(), [event("a", 1), event("a", 2)]);
         assert_eq!(store.event("b", 1).unwrap(), Some(sparse));
         assert_eq!(store.event("b", 2).unwrap(), None);
+    }
+
+    #[test]
+    fn steps_of_every_session_come_in_the_order_they_were_recorded_without_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let store = Store::open(&owned, &token()).unwrap();
+        for session in ["a", "b"] {
+            store.upsert_session(&Session::new(session, 1)).unwrap();
+        }
+        let order = [("b", 1), ("a", 1), ("b", 2), ("a", 2), ("a", 3)];
+        for (session, step) in order {
+            store.insert_event(&event(session, step)).unwrap();
+        }
+        let steps = store.steps_in_recorded_order().unwrap();
+        let found: Vec<(&str, u32)> = steps
+            .iter()
+            .map(|event| (event.session_id.as_str(), event.step))
+            .collect();
+        assert_eq!(found, order);
+        assert_eq!(
+            steps[0],
+            Event {
+                payload: Value::Null,
+                ..event("b", 1)
+            }
+        );
     }
 
     #[test]
