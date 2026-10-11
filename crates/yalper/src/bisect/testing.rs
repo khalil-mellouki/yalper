@@ -13,6 +13,7 @@ use super::{CacheDir, TestCopy};
 use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 use crate::snapshot::{Change, FileKind, ShadowStore};
+use crate::store::Store;
 
 /// A project folder with a `.yalper/` holding a snapshot store, and its cache folder in a temporary folder of
 /// its own, as `YALPER_CACHE_DIR` would give.
@@ -20,7 +21,7 @@ pub struct Project {
     /// Dropped first: on Windows a folder held open cannot be deleted.
     pub cache: CacheDir,
     pub store: ShadowStore,
-    _yalper: OwnedDir,
+    yalper: OwnedDir,
     root: tempfile::TempDir,
     _cache_base: tempfile::TempDir,
 }
@@ -35,14 +36,13 @@ impl Project {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".yalper")).unwrap();
         let yalper = OwnedDir::open(&root.path().join(".yalper")).unwrap();
-        let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
-        let store = ShadowStore::init(&yalper, &token).unwrap();
+        let store = ShadowStore::init(&yalper, &token()).unwrap();
         let folder = cache_base.path().join("yalper");
-        let cache = CacheDir::open_in(&folder, root.path(), &token).unwrap();
+        let cache = CacheDir::open_in(&folder, root.path(), &token()).unwrap();
         Self {
             cache,
             store,
-            _yalper: yalper,
+            yalper,
             root,
             _cache_base: cache_base,
         }
@@ -101,6 +101,16 @@ impl Project {
     pub fn copy(&self) -> TestCopy {
         TestCopy::open(&self.cache, 0).unwrap()
     }
+
+    /// The project's event log, opened for writing.
+    pub fn events(&self) -> Store {
+        Store::open(&self.yalper, &token()).unwrap()
+    }
+}
+
+/// The init token of every [`Project`].
+pub fn token() -> Token {
+    Token::parse("0123456789abcdef0123456789abcdef").unwrap()
 }
 
 impl Drop for Project {

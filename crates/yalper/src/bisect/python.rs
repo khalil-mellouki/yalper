@@ -935,7 +935,10 @@ mod tests {
             })
             .collect();
         assert_eq!(envs.python_path(&copy).unwrap(), expected);
-        assert_eq!(env_additions(&copy, &envs).unwrap().python_path, expected);
+        assert_eq!(
+            env_additions(&copy, Some(&envs)).unwrap().python_path,
+            expected
+        );
 
         // Without the link, no folders.
         copy.switch(&project.store, project.tree(&STEP[2..]))
@@ -1048,7 +1051,7 @@ mod tests {
 
     /// Runs `command` in the test copy with the environment additions, and returns what it printed.
     fn run_in_copy(mut command: Command, copy: &TestCopy, envs: &PythonEnvs) -> String {
-        let additions = env_additions(copy, envs).unwrap();
+        let additions = env_additions(copy, Some(envs)).unwrap();
         let python_path = std::env::join_paths(&additions.python_path).unwrap();
         let output = command
             .current_dir(copy.path())

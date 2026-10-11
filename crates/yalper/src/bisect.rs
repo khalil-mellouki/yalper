@@ -7,10 +7,14 @@
 //! [`CacheDir`]), so tools that search the folders above a copy never reach the project. The boundary files of
 //! [`write_boundaries`] stop those searches before the user's home folder, and [`clean_root`] removes what tools
 //! and tests leave next to them.
+//!
+//! [`DependencySets`] picks the copy of each step: the one linked to the project's installed dependencies
+//! when the step's dependency files are the project's, otherwise one per dependency set, installed once.
 
 mod boundary;
 mod cache;
 mod copy;
+mod deps;
 mod env;
 mod link;
 mod node_modules;
@@ -25,6 +29,7 @@ pub use cache::{
     find_project_folders, remove_stale,
 };
 pub use copy::{Switched, TestCopy};
+pub use deps::{COPIES_KEY, DependencySets, InstallFailure, Prepared, SetCopy};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
 pub use node_modules::{Linked, NodeModules};
