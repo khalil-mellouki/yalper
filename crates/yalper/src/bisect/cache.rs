@@ -419,7 +419,7 @@ fn find_in(
         match look(&path, accept) {
             Look::Missing => {}
             Look::Ours(dir) => found.ours.push(ProjectFolder(dir)),
-            Look::Other(why) => found.others.push((path, why)),
+            Look::Other(shown, why) => found.others.push((shown, why)),
         }
     }
     found
@@ -438,22 +438,25 @@ fn parse_meta_value(value: &str) -> Option<(PathBuf, String)> {
 enum Look {
     Missing,
     Ours(OwnedDir),
-    Other(String),
+    /// Not the project's: the path to show (as held open when it was opened, so that it is spelled like the
+    /// project's folders) and the reason.
+    Other(PathBuf, String),
 }
 
 /// Looks at `path`, the place of a project's cache folder, without following a link: it is the project's when
 /// it is a real folder in a real folder and is empty, or its marker's digest and instance id pass `accept`.
 fn look(path: &Path, accept: impl Fn(&str, &str) -> bool) -> Look {
+    let other = |why: String| Look::Other(path.to_owned(), why);
     // Checked before any lookup, so that a network path is never reached.
     if has_special_prefix(&plain(path)) {
-        return Look::Other("it is on a network share, which Yalper does not look at".to_owned());
+        return other("it is on a network share, which Yalper does not look at".to_owned());
     }
     for dir in [path.parent().unwrap_or(path), path] {
         match fs::symlink_metadata(dir) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Look::Missing,
-            Err(error) => return Look::Other(format!("cannot read {}: {error}", dir.display())),
+            Err(error) => return other(format!("cannot read {}: {error}", dir.display())),
             Ok(metadata) if !metadata.is_dir() => {
-                return Look::Other(format!(
+                return other(format!(
                     "{} is a link or a file, not a folder",
                     dir.display()
                 ));
@@ -463,18 +466,22 @@ fn look(path: &Path, accept: impl Fn(&str, &str) -> bool) -> Look {
     }
     let dir = match OwnedDir::open(path) {
         Ok(dir) => dir,
-        Err(error) => return Look::Other(error.to_string()),
+        Err(error) => return other(error.to_string()),
     };
-    match fs::read_dir(path).map(|mut entries| entries.next().is_none()) {
+    let opened = dir.path();
+    match fs::read_dir(opened).map(|mut entries| entries.next().is_none()) {
         Ok(true) => return Look::Ours(dir),
         Ok(false) => {}
-        Err(error) => return Look::Other(format!("cannot read it: {error}")),
+        Err(error) => return Look::Other(opened.to_owned(), format!("cannot read it: {error}")),
     }
-    let marker = safe_fs::read_small_regular_file(&path.join(MARKER_FILE), MAX_MARKER_BYTES)
+    let marker = safe_fs::read_small_regular_file(&opened.join(MARKER_FILE), MAX_MARKER_BYTES)
         .and_then(|bytes| parse_marker(&bytes));
     match marker {
         Some((digest, instance)) if accept(&digest, &instance) => Look::Ours(dir),
-        _ => Look::Other("it was not created by Yalper for this project".to_owned()),
+        _ => Look::Other(
+            opened.to_owned(),
+            "it was not created by Yalper for this project".to_owned(),
+        ),
     }
 }
 
