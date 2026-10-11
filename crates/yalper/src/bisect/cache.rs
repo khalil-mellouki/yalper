@@ -187,7 +187,7 @@ impl CacheDir {
         let given = folder.join(&name);
         let resolved = check_place(folder, &name, &project_real)?;
         #[cfg(unix)]
-        check_parent(folder)?;
+        check_parent(folder, folder)?;
         let warning = if cfg!(windows) {
             let profile = std::env::var_os("USERPROFILE")
                 .map(PathBuf::from)
@@ -211,6 +211,10 @@ impl CacheDir {
             )
         })?;
         let yalper = open_private_dir(folder)?;
+        // Again on the path held open, the one every later operation uses: a link in the path as written could
+        // lead elsewhere since the first check.
+        #[cfg(unix)]
+        check_parent(yalper.path(), folder)?;
         let dir = open_private_dir(&yalper.path().join(&name))?;
         let instance = bind(&dir, &digest, &project_real)?;
         Ok(Self {
@@ -351,13 +355,14 @@ fn check_place(folder: &Path, name: &str, project: &Path) -> io::Result<PathBuf>
     Ok(resolved)
 }
 
-/// Unix: refuses Yalper's cache folder `folder` when another user could replace it, or a folder above it,
-/// between two bisects, as OpenSSH's `safe_path` checks: every folder from the first existing one above `folder`
-/// (resolved) up to `/` must pass [`unsafe_folder`]. Missing folders are created with mode 0700.
+/// Unix: refuses Yalper's cache folder `folder` (spelled `path`, as written or as held open) when another user
+/// could replace it, or a folder above it, between two bisects, as OpenSSH's `safe_path` checks: every folder
+/// from the first existing one above `path` (resolved) up to `/` must pass [`unsafe_folder`]. Missing folders
+/// are created with mode 0700.
 #[cfg(unix)]
-fn check_parent(folder: &Path) -> io::Result<()> {
+fn check_parent(path: &Path, folder: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let Some(parent) = folder.parent() else {
+    let Some(parent) = path.parent() else {
         return Ok(());
     };
     let Some(existing) = parent
@@ -391,17 +396,19 @@ fn check_parent(folder: &Path) -> io::Result<()> {
 
 /// Why a folder with permission bits `mode`, owner `uid` and group `gid` lets another user than `me` (whose
 /// own group is `my_group`) replace what it holds, if it does: it is owned by someone other than `me` or root,
-/// or, without the sticky bit (which lets only owners rename or delete entries), writable by every user or by a
-/// group other than `my_group` (a user-private group, as `~/.cache` gets with umask 002, is fine).
+/// or, without the sticky bit (which lets only owners rename or delete entries), writable by every user or by
+/// its group. Group write is accepted only on a folder of `me` whose group is `my_group`, a user-private group
+/// as `~/.cache` gets with umask 002 on Linux; never on macOS, where every user's primary group is `staff`.
 #[cfg(unix)]
 fn unsafe_folder(mode: u32, uid: u32, gid: u32, me: u32, my_group: u32) -> Option<&'static str> {
     let sticky = mode & 0o1000 != 0;
+    let own_group = uid == me && gid == my_group && !cfg!(target_os = "macos");
     if uid != me && uid != 0 {
         Some("owned by another user")
     } else if mode & 0o002 != 0 && !sticky {
         Some("writable by every user")
-    } else if mode & 0o020 != 0 && gid != my_group && !sticky {
-        Some("writable by a group other than your own")
+    } else if mode & 0o020 != 0 && !sticky && !own_group {
+        Some("writable by its group")
     } else {
         None
     }
@@ -604,10 +611,15 @@ fn read_marker(path: &Path) -> io::Result<Marker> {
             }
         }
     }
-    // An mtime in the future, or none, does not keep the folder from being adopted forever.
-    let fresh = modified
-        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age < STALE_EMPTY_MARKER);
+    // No mtime, or one further ahead than the margin, does not keep the folder from being adopted forever.
+    let fresh = modified.is_some_and(|modified| {
+        let now = std::time::SystemTime::now();
+        match now.duration_since(modified) {
+            Ok(age) => age < STALE_EMPTY_MARKER,
+            // Ahead of this clock: fresh while within the same margin.
+            Err(ahead) => ahead.duration() < STALE_EMPTY_MARKER,
+        }
+    });
     Ok(Marker::Empty { stale: !fresh })
 }
 
@@ -911,8 +923,18 @@ mod tests {
             let opens: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
-                        let cache = CacheDir::open_in(&folder, project.path(), &token('a'));
-                        cache.unwrap().instance().to_owned()
+                        // A winner paused between creating and writing the marker makes the others report
+                        // another bisect starting: they try again, as a user would.
+                        for _ in 0..50 {
+                            match CacheDir::open_in(&folder, project.path(), &token('a')) {
+                                Ok(cache) => return cache.instance().to_owned(),
+                                Err(error) if error.to_string().contains("another bisect") => {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                Err(error) => panic!("{error}"),
+                            }
+                        }
+                        panic!("the marker was never written");
                     })
                 })
                 .collect();
@@ -952,16 +974,13 @@ mod tests {
         let own_group =
             fs::metadata(base.path()).unwrap().gid() == rustix::process::getegid().as_raw();
         let opened = CacheDir::open_in(&folder, project.path(), &token('a'));
-        if own_group {
+        if own_group && !cfg!(target_os = "macos") {
             opened.unwrap();
         } else {
-            // The folder took the group of the folder above it (BSD rule, macOS): another group.
-            assert!(
-                opened
-                    .unwrap_err()
-                    .to_string()
-                    .contains("group other than your own")
-            );
+            // On macOS every user's primary group is `staff`, and a folder may also take the group of the
+            // folder above it (BSD rule).
+            let error = opened.unwrap_err().to_string();
+            assert!(error.contains("writable by its group"), "{error}");
         }
     }
 
@@ -969,36 +988,21 @@ mod tests {
     #[test]
     fn folders_that_let_another_user_replace_what_they_hold_are_unsafe() {
         let (me, group, other) = (1000, 1000, 1001);
-        assert_eq!(unsafe_folder(0o40700, me, group, me, group), None);
-        assert_eq!(unsafe_folder(0o40755, 0, 0, me, group), None);
-        assert_eq!(unsafe_folder(0o41777, 0, 0, me, group), None);
-        assert_eq!(unsafe_folder(0o40775, me, group, me, group), None);
-        assert_eq!(unsafe_folder(0o41775, me, other, me, group), None);
-        assert!(
-            unsafe_folder(0o40700, other, group, me, group)
-                .unwrap()
-                .contains("another user")
-        );
-        assert!(
-            unsafe_folder(0o41777, other, other, me, group)
-                .unwrap()
-                .contains("another user")
-        );
-        assert!(
-            unsafe_folder(0o40777, me, group, me, group)
-                .unwrap()
-                .contains("every user")
-        );
-        assert!(
-            unsafe_folder(0o40775, me, other, me, group)
-                .unwrap()
-                .contains("group")
-        );
-        assert!(
-            unsafe_folder(0o40775, 0, other, me, group)
-                .unwrap()
-                .contains("group")
-        );
+        let why = |mode, uid, gid| unsafe_folder(mode, uid, gid, me, group);
+        assert_eq!(why(0o40700, me, group), None);
+        assert_eq!(why(0o40755, 0, 0), None);
+        assert_eq!(why(0o41777, 0, 0), None);
+        assert_eq!(why(0o41775, me, other), None);
+        // The user's own folder writable by the user's own group: Linux user-private groups, not macOS.
+        let own = why(0o40775, me, group);
+        assert_eq!(own.is_none(), !cfg!(target_os = "macos"), "{own:?}");
+        assert!(why(0o40700, other, group).unwrap().contains("another user"));
+        assert!(why(0o41777, other, other).unwrap().contains("another user"));
+        assert!(why(0o40777, me, group).unwrap().contains("every user"));
+        assert!(why(0o40775, me, other).unwrap().contains("group"));
+        // `root:users 2775`: owned by root, writable by a group that holds other users.
+        assert!(why(0o42775, 0, group).unwrap().contains("group"));
+        assert!(why(0o40775, 0, other).unwrap().contains("group"));
     }
 
     #[test]
