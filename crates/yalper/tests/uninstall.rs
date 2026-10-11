@@ -649,6 +649,55 @@ fn purge_deletes_the_recorded_folder_after_the_cache_variable_changed() {
     }
 }
 
+/// Copies the folder `from` to `to` (which must not exist), with everything in it. No links are expected.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_dir(&path, &target);
+        } else {
+            fs::copy(&path, &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn purging_a_copy_of_a_project_keeps_the_originals_bisect_data() {
+    let (repo, canary) = project_with_packages();
+    let original = repo.path();
+    let cache_base = tempfile::tempdir().unwrap();
+    let cache = cache_base.path().join("yalper");
+    let (folder, meta) = bisect_data(original, &cache, canary.path());
+    record_cache_dir(original, &meta);
+
+    // A copy with the same init token and the same recordings, `meta` included.
+    let copy = repository();
+    fs::copy(
+        original.join(".git").join(GIT_ID_FILE),
+        copy.path().join(".git").join(GIT_ID_FILE),
+    )
+    .unwrap();
+    copy_dir(&original.join(YALPER_DIR), &copy.path().join(YALPER_DIR));
+
+    let text = run_with_cache(copy.path(), &["uninstall", "--purge"], Some(&cache));
+    assert!(
+        text.contains(&format!(
+            "  Bisect data: kept {} (it belongs to the project at ",
+            folder.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("  .yalper/: deleted\n"), "{text}");
+    assert!(folder.join("copy-0").join("package.json").is_file());
+
+    // The original's own purge still deletes it.
+    let text = run_with_cache(original, &["uninstall", "--purge"], Some(&cache));
+    assert!(text.contains(&deleted(&folder)), "{text}");
+    assert!(!folder.exists());
+}
+
 #[test]
 fn a_purge_stopped_halfway_is_finished_by_running_it_again() {
     let (repo, canary) = project_with_packages();
