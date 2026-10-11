@@ -10,6 +10,10 @@
 //! included, must be the same after each bisect, and `yalper uninstall --purge` must remove the project's cache
 //! folder.
 //!
+//! A fourth test checks a cold copy in the middle of a bisect: the Node sample's dependencies change and change
+//! back, so a copy is installed for a step between the ends, and its first run, slower than the time limit taken
+//! from the end runs, still passes with the raised limit of a cold run.
+//!
 //! They download packages from the npm registry and PyPI and build Rust code, so a plain `cargo test` skips
 //! them. CI runs them in the "Bisect end-to-end" job:
 //!
@@ -243,9 +247,10 @@ impl Sample {
         Bisected { out, elapsed }
     }
 
-    /// Bisects the recorded session twice with `test`, checks both results and what each installed, then purges
-    /// Yalper from the project. `broken` is the step that plants the break.
-    fn check(&self, test: &str, broken: usize) {
+    /// Bisects the recorded session twice with `test` and checks what both bisects must show: `broken`, the step
+    /// that plants the break, is named, no run reached the time limit, and the runs stay within
+    /// `ceil(log2 N) + 2`. The second bisect installs nothing.
+    fn bisect_twice(&self, test: &str, broken: usize) -> (Bisected, Bisected) {
         let first = self.bisect(test);
         let second = self.bisect(test);
         for bisect in [&first, &second] {
@@ -260,24 +265,59 @@ impl Sample {
             let most = ceil_log2(bisect.entries()) + 2;
             assert!(bisect.runs().len() <= most, "{out}");
         }
-        // The steps from before the lockfile changed need their own install, once; the others reuse the project's
-        // installed dependencies.
-        assert_eq!(first.installs().len(), 1, "{}", first.out);
         assert!(second.installs().is_empty(), "{}", second.out);
-        // The bad end is the first run in the copy that reuses the project's dependencies, made by this bisect.
-        let bad_end = first.runs()[1];
-        assert!(bad_end.contains(", the bad end "), "{bad_end}");
-        assert!(
-            bad_end.contains("(first run in a new test copy: time limit raised to "),
-            "{bad_end}"
-        );
         assert!(!second.out.contains("first run in a new test copy"));
+        (first, second)
+    }
+
+    /// [`Sample::bisect_twice`] for a session that changes the lockfile once, then [`Sample::purge`]: the steps
+    /// from before the change get their own install, once, at the good end; the bad end is the first run in the
+    /// copy that reuses the project's dependencies, made by this bisect, so its time limit is raised.
+    fn check(&self, test: &str, broken: usize) {
+        let (first, second) = self.bisect_twice(test, broken);
+        assert_eq!(first.installs().len(), 1, "{}", first.out);
+        let runs = first.runs();
+        assert!(
+            runs[0].contains(", the good end ") && runs[0].contains("installed its dependencies"),
+            "{}",
+            first.out
+        );
+        assert!(runs[1].contains(", the bad end "), "{}", first.out);
+        assert!(
+            runs[1].contains("(first run in a new test copy: time limit raised to "),
+            "{}",
+            first.out
+        );
+        self.purge();
+        self.report(broken, &first, &second);
+    }
+
+    /// Removes Yalper from the project with `yalper uninstall --purge`, which must delete the project's cache
+    /// folder, the one folder `<name>-<12 hex digits>` in `YALPER_CACHE_DIR`.
+    fn purge(&self) {
+        let entries: Vec<PathBuf> = fs::read_dir(self.cache.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let folder = &entries[0];
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        let id = name.strip_prefix(&format!("{}-", self.name)).expect(&name);
+        assert!(
+            id.len() == 12 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{name}"
+        );
+        assert!(folder.join("copy-0").is_dir(), "{name}");
 
         let purge = self.yalper(&["uninstall", "--purge"]);
         assert!(purge.status.success(), "{purge:?}");
+        assert!(!folder.exists());
         assert!(fs::read_dir(self.cache.path()).unwrap().next().is_none());
         assert!(!self.root.join(".yalper").exists());
+    }
 
+    /// Prints the `bisect_end_to_end` line of the sample.
+    fn report(&self, broken: usize, first: &Bisected, second: &Bisected) {
         println!(
             "bisect_end_to_end {name} ({os}): step {broken} named among {entries} entries. First bisect: {first}. \
              Second bisect: {second}.",
@@ -452,66 +492,199 @@ const DURATION_JS: &str = "const ms = require('ms');\n\n\
     /** The number of seconds in a duration such as \"2m\". */\n\
     function seconds(text) {\n  return ms(text) / 1000;\n}\n\nmodule.exports = { seconds };\n";
 
-#[test]
-#[ignore = "installs a package from the npm registry; run by the Bisect end-to-end CI job"]
-fn bisects_a_node_project() {
-    let (Some(npm), Some(_)) = (tool(&["npm.cmd", "npm"]), tool(&["node"])) else {
-        return;
-    };
-    let sample = Sample::new(
-        "durations",
-        &[
-            (".gitignore", "node_modules/\n"),
-            (
-                "package.json",
-                "{\n  \"name\": \"durations\",\n  \"version\": \"1.0.0\",\n  \"private\": true\n}\n",
-            ),
-            ("src/duration.js", DURATION_JS),
-            ("src/notes.js", "module.exports = [];\n"),
-            (
-                "test/duration.test.js",
-                "const test = require('node:test');\nconst assert = require('node:assert');\n\
-                 const { seconds } = require('../src/duration');\n\n\
-                 test('two minutes are 120 seconds', () => {\n  assert.strictEqual(seconds('2m'), 120);\n});\n",
-            ),
-        ],
-    );
-    let quiet = ["--no-audit", "--no-fund", "--loglevel=error"];
-    let mut install = vec!["install", "--save-exact", "--package-lock-only"];
-    install.extend(quiet);
-    install.push("ms@2.1.2");
-    sample.run(npm, &strings(&install));
-    let mut ci = vec!["ci"];
-    ci.extend(quiet);
-    sample.run(npm, &strings(&ci));
-    sample.commit_and_init();
+/// The flags of every npm command of the samples: no package scripts, no audit or funding requests.
+const NPM_FLAGS: [&str; 4] = [
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--loglevel=error",
+];
 
-    // Step 8 breaks the conversion; step 14 updates the package (package.json and package-lock.json). Steps 3 to
-    // 13 then need their own install, which the search reuses for the steps it tests there.
-    let mut upgrade = vec!["install", "--save-exact"];
-    upgrade.extend(quiet);
-    upgrade.push("ms@2.1.3");
-    let special = BTreeMap::from([
-        (14, Action::bash(npm, &upgrade)),
+/// The `integrity` of the versions of `ms` the samples install, as the npm registry publishes them.
+const MS_INTEGRITY: [(&str, &str); 2] = [
+    (
+        "2.1.2",
+        "sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==",
+    ),
+    (
+        "2.1.3",
+        "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
+    ),
+];
+
+/// A Node project named `name` with its files and `extra`, whose `package-lock.json` holds `ms` 2.1.2, installed
+/// with `npm ci`, committed and set up with `yalper init`. Returns the sample and the npm command.
+fn node_sample(name: &'static str, extra: &[(&str, &str)]) -> Option<(Sample, &'static str)> {
+    let (Some(npm), Some(_)) = (tool(&["npm.cmd", "npm"]), tool(&["node"])) else {
+        return None;
+    };
+    let mut files = vec![
+        (".gitignore", "node_modules/\n"),
         (
-            8,
-            Action::Write(
-                "src/duration.js",
-                DURATION_JS.replace("ms(text) / 1000", "ms(text) / 100"),
-            ),
+            "package.json",
+            "{\n  \"name\": \"durations\",\n  \"version\": \"1.0.0\",\n  \"private\": true\n}\n",
         ),
-    ]);
-    let actions = session(
+        ("src/duration.js", DURATION_JS),
+        ("src/notes.js", "module.exports = [];\n"),
+        (
+            "test/duration.test.js",
+            "const test = require('node:test');\nconst assert = require('node:assert');\n\
+             const { seconds } = require('../src/duration');\n\n\
+             test('two minutes are 120 seconds', () => {\n  assert.strictEqual(seconds('2m'), 120);\n});\n",
+        ),
+    ];
+    files.extend_from_slice(extra);
+    let sample = Sample::new(name, &files);
+    sample.run(
+        npm,
+        &npm_args(&["install", "--save-exact", "--package-lock-only", "ms@2.1.2"]),
+    );
+    sample.assert_locked_ms("2.1.2");
+    sample.run(npm, &npm_args(&["ci"]));
+    sample.commit_and_init();
+    Some((sample, npm))
+}
+
+/// `args` followed by [`NPM_FLAGS`].
+fn npm_args(args: &[&str]) -> Vec<String> {
+    let mut all = strings(args);
+    all.extend(strings(&NPM_FLAGS));
+    all
+}
+
+impl Sample {
+    /// Checks that the project's `package-lock.json` holds `ms` at `version` with its published integrity.
+    fn assert_locked_ms(&self, version: &str) {
+        let lock = fs::read(self.root.join("package-lock.json")).unwrap();
+        let lock: Value = serde_json::from_slice(&lock).unwrap();
+        let ms = &lock["packages"]["node_modules/ms"];
+        let (_, integrity) = MS_INTEGRITY
+            .iter()
+            .find(|(known, _)| *known == version)
+            .unwrap();
+        assert_eq!(ms["version"], version, "{lock}");
+        assert_eq!(ms["integrity"], *integrity, "{lock}");
+    }
+}
+
+/// The agent's Bash step that installs `ms` at `version` in the project.
+fn install_ms(npm: &str, version: &str) -> Action {
+    let package = format!("ms@{version}");
+    Action::Bash(
+        npm.to_owned(),
+        npm_args(&["install", "--save-exact", &package]),
+    )
+}
+
+/// The agent's Write step that breaks the conversion.
+fn break_duration() -> Action {
+    Action::Write(
+        "src/duration.js",
+        DURATION_JS.replace("ms(text) / 1000", "ms(text) / 100"),
+    )
+}
+
+/// The session of a Node sample: steps 3 to 22 write `src/notes.js`, except those of `special`.
+fn node_session(special: BTreeMap<usize, Action>) -> Vec<Action> {
+    session(
         22,
         "src/notes.js",
         |step| format!("module.exports = ['note {step}'];\n"),
         special,
-    );
+    )
+}
+
+#[test]
+#[ignore = "installs a package from the npm registry; run by the Bisect end-to-end CI job"]
+fn bisects_a_node_project() {
+    let Some((sample, npm)) = node_sample("durations", &[]) else {
+        return;
+    };
+    // Step 8 breaks the conversion; step 14 updates the package (package.json and package-lock.json). Steps 3 to
+    // 13 then need their own install, which the search reuses for the steps it tests there.
+    let special = BTreeMap::from([(8, break_duration()), (14, install_ms(npm, "2.1.3"))]);
     sample.record(
         "Add notes and keep the duration helper up to date.",
-        &actions,
+        &node_session(special),
     );
+    sample.assert_locked_ms("2.1.3");
     sample.check("node --test", 8);
+}
+
+/// How long the first test run after an install of `ms` 2.1.3 takes, like a first build: longer than the time
+/// limit of a run that is not cold.
+const FIRST_RUN_SECONDS: u64 = 45;
+
+#[test]
+#[ignore = "installs a package from the npm registry and waits 45 s; run by the Bisect end-to-end CI job"]
+fn a_copy_installed_in_the_middle_of_a_bisect_gets_time_for_its_first_run() {
+    // A test that waits on the first run in a copy whose `node_modules` holds `ms` 2.1.3: only a copy with its
+    // own install (`npm ci` recreates the folder, removing the marker), never the copy that links to the
+    // project's packages (2.1.2).
+    let first_run = format!(
+        "const fs = require('node:fs');\nconst path = require('node:path');\nconst test = require('node:test');\n\n\
+         const marker = path.join(__dirname, '..', 'node_modules', '.first-run-done');\n\n\
+         test('the first run after an install takes long', async () => {{\n  \
+         if (require('ms/package.json').version !== '2.1.3' || fs.existsSync(marker)) return;\n  \
+         fs.writeFileSync(marker, '');\n  \
+         await new Promise((resolve) => setTimeout(resolve, {FIRST_RUN_SECONDS} * 1000));\n}});\n"
+    );
+    let Some((sample, npm)) = node_sample("durations", &[("test/first-run.test.js", &first_run)])
+    else {
+        return;
+    };
+    let lockfile = fs::read(sample.root.join("package-lock.json")).unwrap();
+    // Step 9 updates the package and step 15 goes back to the version of the project, so only the steps in
+    // between need their own install: both ends run in the copy that links to the project's packages, and the
+    // first step tested between them, step 12, gets the install and the long first run, with a time limit
+    // picked from the quick end runs. Step 18 breaks the conversion.
+    let special = BTreeMap::from([
+        (9, install_ms(npm, "2.1.3")),
+        (15, install_ms(npm, "2.1.2")),
+        (18, break_duration()),
+    ]);
+    sample.record(
+        "Try the newer ms, then keep the duration helper up to date.",
+        &node_session(special),
+    );
+    assert_eq!(
+        fs::read(sample.root.join("package-lock.json")).unwrap(),
+        lockfile
+    );
+
+    let (first, second) = sample.bisect_twice("node --test", 18);
+    let runs = first.runs();
+    assert!(runs[0].contains(", the good end "), "{}", first.out);
+    assert!(runs[1].contains(", the bad end "), "{}", first.out);
+    let installed: Vec<&str> = runs
+        .iter()
+        .copied()
+        .filter(|line| line.contains("installed its dependencies"))
+        .collect();
+    assert_eq!(installed.len(), 1, "{}", first.out);
+    let cold = installed[0];
+    assert!(cold.starts_with("Testing step 12 "), "{}", first.out);
+    assert!(
+        cold.contains("(first run in a new test copy: time limit raised to "),
+        "{}",
+        first.out
+    );
+    // Without the raised limit this run would have timed out: the limit of a run that is not cold is the longer
+    // of three times the longest end run and that run plus 30 s.
+    let longest_end = run_time(runs[0]).unwrap().max(run_time(runs[1]).unwrap());
+    let limit = (longest_end * 3.0).max(longest_end + 30.0);
+    assert!(run_time(cold).unwrap() > limit, "{}", first.out);
+    // The marker stays in the copy: no run of the second bisect waits.
+    assert!(
+        second
+            .runs()
+            .iter()
+            .all(|line| run_time(line).unwrap() < 30.0),
+        "{}",
+        second.out
+    );
+    sample.purge();
+    sample.report(18, &first, &second);
 }
 
 const TALLY_INIT: &str =
@@ -528,13 +701,15 @@ fn bisects_a_python_project() {
     }) else {
         return;
     };
+    // Packages from PyPI are pinned exactly (the build backend here, `six` below), so the sample installs known
+    // releases.
     let sample = Sample::new(
         "tally",
         &[
             (".gitignore", ".venv/\n__pycache__/\n*.egg-info/\nbuild/\n"),
             (
                 "pyproject.toml",
-                "[build-system]\nrequires = [\"setuptools>=64\"]\nbuild-backend = \"setuptools.build_meta\"\n\n\
+                "[build-system]\nrequires = [\"setuptools==84.0.0\"]\nbuild-backend = \"setuptools.build_meta\"\n\n\
                  [project]\nname = \"tally\"\nversion = \"0.1.0\"\n",
             ),
             ("requirements.txt", "-e .\n"),
