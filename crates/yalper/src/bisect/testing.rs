@@ -156,6 +156,24 @@ pub fn state(dir: &Path) -> BTreeMap<PathBuf, String> {
     out
 }
 
+/// Every link (symlink or junction) under `dir`, found without following any.
+pub fn links_under(dir: &Path) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    let mut todo = vec![dir.to_owned()];
+    while let Some(dir) = todo.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_symlink() {
+                links.push(path);
+            } else if metadata.is_dir() {
+                todo.push(path);
+            }
+        }
+    }
+    links
+}
+
 /// The first of `names` that runs with `--version`. Without one the test is skipped, unless
 /// `YALPER_REQUIRE_TOOLS=1`, which CI sets.
 pub fn tool(names: &[&'static str]) -> Option<&'static str> {

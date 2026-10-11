@@ -25,7 +25,9 @@
 //!   uv write), and the step's tree has nothing at its path (compared without regard to case);
 //! - every link is an extra path of the copy (see [`TestCopy::set_extra_paths`]), checked before every run:
 //!   anything else at its path (a link a test changed, a file, a folder) is removed, never followed, and the
-//!   link made anew. A link no longer wanted is removed;
+//!   link made anew. A link no longer wanted is removed, and every link when the bisect ends
+//!   ([`PythonEnvs::unlink`]); links a bisect that ended abnormally left are removed by the first switch of
+//!   the next bisect that uses the copy;
 //! - files of the environment are read only through real folders, never through a link, and up to
 //!   [`MAX_READ_BYTES`]; the paths they hold are mapped into the copy from their text only, never followed.
 
@@ -195,6 +197,34 @@ impl PythonEnvs {
         }
         linked.envs = self.links.len();
         Ok(linked)
+    }
+
+    /// Removes every link of the copy to an environment (or whatever a test put in its place), never following
+    /// it, and takes them out of the copy's extra paths: called when the bisect ends, so that no link into the
+    /// project stays in the cache folder between bisects. The next [`link`](Self::link) makes them again. A link
+    /// that cannot be removed stays registered, and the first error is returned.
+    pub fn unlink(&mut self, copy: &mut TestCopy) -> io::Result<()> {
+        let root = plain(&std::path::absolute(copy.path())?);
+        let links = std::mem::take(&mut self.links);
+        let mut failed = None;
+        for path in &links {
+            if let Err(error) = remove_link(&root, path) {
+                failed.get_or_insert(io::Error::new(
+                    error.kind(),
+                    format!("cannot remove {path}: {error}"),
+                ));
+                self.links.insert(path.clone());
+            }
+        }
+        let mut extra = copy.extra_paths().clone();
+        extra.retain(|path| !links.contains(path) || self.links.contains(path));
+        copy.set_extra_paths(extra);
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// The links in the copy, relative and `/`-separated.
+    pub(super) fn links(&self) -> impl Iterator<Item = &str> {
+        self.links.iter().map(String::as_str)
     }
 
     /// The folders of the editable installs of the environments linked in `copy`, inside the copy: to put
@@ -556,7 +586,7 @@ mod tests {
 
     use crate::bisect::env_additions;
     use crate::bisect::link::make_link;
-    use crate::bisect::testing::{Project, state, tool, venv_python, write};
+    use crate::bisect::testing::{Project, links_under, state, tool, venv_python, write};
 
     /// The site-packages folder of an environment at `env`, as `python -m venv` lays it out on this system.
     fn site(env: &str) -> String {
@@ -816,6 +846,48 @@ mod tests {
         assert!(fs::symlink_metadata(&link).unwrap().is_dir());
         assert_eq!(fs::read(link.join("local.py")).unwrap(), b"local");
         assert_eq!(extra(&copy), [".env"]);
+        assert_eq!(state(project.path()), before);
+    }
+
+    #[test]
+    fn unlink_removes_every_link_never_following_it_and_link_makes_them_again() {
+        let project = with_env();
+        fake_env(&project, "api/venv");
+        let before = state(project.path());
+        let mut step = STEP.to_vec();
+        step.push(("api/requirements.txt", ""));
+        let tree = project.tree(&step);
+        let mut copy = project.copy();
+        copy.set_extra_paths([".env".to_owned()]);
+        let mut envs = envs(&project);
+        copy.switch(&project.store, tree).unwrap();
+        assert_eq!(envs.link(&mut copy).unwrap().envs, 2);
+        // A test replaced one link with a folder of its own: removed too.
+        let api_link = copy.path().join("api/venv");
+        remove_entry(&api_link, &fs::symlink_metadata(&api_link).unwrap()).unwrap();
+        write(copy.path(), "api/venv/made-by-the-test.txt", "");
+
+        envs.unlink(&mut copy).unwrap();
+        assert_eq!(links_under(copy.path()), Vec::<PathBuf>::new());
+        assert!(fs::symlink_metadata(copy.path().join(".venv")).is_err());
+        assert!(fs::symlink_metadata(&api_link).is_err());
+        assert!(copy.path().join("api/requirements.txt").is_file());
+        assert_eq!(extra(&copy), [".env"]);
+        assert_eq!(envs.links().count(), 0);
+        assert_eq!(state(project.path()), before);
+        envs.unlink(&mut copy).unwrap();
+
+        copy.switch(&project.store, tree).unwrap();
+        assert_eq!(
+            envs.link(&mut copy).unwrap(),
+            LinkedEnvs {
+                envs: 2,
+                links: 2,
+                removed: 0,
+            }
+        );
+        assert_links_to(&copy.path().join(".venv"), &project.path().join(".venv"));
+        assert_eq!(extra(&copy), [".env", ".venv", "api/venv"]);
         assert_eq!(state(project.path()), before);
     }
 

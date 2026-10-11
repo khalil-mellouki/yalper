@@ -410,6 +410,60 @@ fn names_the_step_that_broke_the_tests_with_its_prompt_and_diff() {
     assert!(cache.join("logs").join("run-1.log").is_file());
 }
 
+/// Every link (symlink or junction) under `dir`, found without following any.
+fn links_under(dir: &Path) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    let mut todo = vec![dir.to_owned()];
+    while let Some(dir) = todo.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_symlink() {
+                links.push(path);
+            } else if metadata.is_dir() {
+                todo.push(path);
+            }
+        }
+    }
+    links
+}
+
+#[test]
+fn the_test_copy_keeps_no_link_into_the_project_after_a_bisect() {
+    let project = Project::new("good");
+    // Installed dependencies the runs use through links of `copy-0`.
+    fs::write(project.root.join(".gitignore"), "node_modules/\n.venv/\n").unwrap();
+    fs::write(
+        project.root.join("pyproject.toml"),
+        "[project]\nname = \"demo\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(project.root.join("node_modules").join("dep")).unwrap();
+    fs::write(project.root.join("node_modules/dep/index.js"), "").unwrap();
+    fs::create_dir(project.root.join(".venv")).unwrap();
+    fs::write(project.root.join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    record(&project, SESSION, &notes_steps(8));
+    // Fails unless the copy has the project's package and environment.
+    let test = if cfg!(windows) {
+        "(if not exist node_modules\\dep\\index.js exit /b 1) & (if not exist .venv\\pyvenv.cfg exit /b 1) & \
+         findstr /c:good status.txt"
+    } else {
+        "test -f node_modules/dep/index.js && test -f .venv/pyvenv.cfg && grep good status.txt"
+    };
+
+    // Twice: the second bisect makes the links again.
+    for _ in 0..2 {
+        let (code, out, err) = project.bisect(&["--test", test], &[]);
+        assert_eq!(code, Some(0), "{out}{err}");
+        assert!(out.contains("Step 8 broke the tests"), "{out}");
+        let cache = project.cache_folder();
+        assert!(cache.join("copy-0").join("pyproject.toml").is_file());
+        assert_eq!(links_under(project.cache.path()), Vec::<PathBuf>::new());
+        assert!(project.root.join("node_modules/dep/index.js").is_file());
+        assert!(project.root.join(".venv/pyvenv.cfg").is_file());
+    }
+}
+
 #[test]
 fn a_good_end_that_fails_shows_the_end_of_its_output_masked_and_prefixed() {
     let project = Project::new("bad");
