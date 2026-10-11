@@ -105,7 +105,7 @@ impl fmt::Display for Failure {
 pub enum Skip {
     /// The test command exited with 125.
     ExitCode,
-    /// The test command printed more than [`MAX_LOG_BYTES`].
+    /// The test command printed more than `MAX_LOG_BYTES`.
     OutputTooLarge,
     /// The `test` callback returned [`Tested::CannotTest`] with this reason.
     CannotTest(String),

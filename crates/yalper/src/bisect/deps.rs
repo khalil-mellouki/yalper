@@ -84,7 +84,7 @@ use crate::redact::redact_str;
 use crate::snapshot::{Error, FileKind, MAX_FILE_BYTES, Result, ShadowStore, validate_path};
 use crate::store::Store;
 
-/// The `meta` key of the event log that records the copies with their own install: see [`Book`].
+/// The `meta` key of the event log that records the copies with their own install: see `Book`.
 pub const COPIES_KEY: &str = "bisect.copies";
 
 /// The most copies with their own install, `copy-1` to `copy-3`, kept in the project's cache folder.
@@ -757,7 +757,7 @@ impl SetCopy {
 
     /// The complete environment of a run in this copy, for [`run`]: [`run_env`] of the user's environment `user`
     /// with the additions of [`env_additions`]. In a copy with its own install, the variables of
-    /// [`OWN_INSTALL_REMOVED`] are removed and those of [`OWN_INSTALL_SET`] set, so that tools use the copy's
+    /// `OWN_INSTALL_REMOVED` are removed and those of `OWN_INSTALL_SET` set, so that tools use the copy's
     /// own environments. Call it before every run, after [`clean_root`] and [`write_boundaries`].
     pub fn run_env(
         &self,

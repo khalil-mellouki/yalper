@@ -208,7 +208,7 @@ impl TestCopy {
     /// copy or differ from it; afterwards, the files that differ between the tree the copy holds and `to`,
     /// and the files of the tree the copy holds that a test run changed or deleted. Then every file and
     /// folder that is neither part of `to`, ignored by its rules, nor an extra path is removed (see
-    /// [`sweep`]).
+    /// `sweep`).
     ///
     /// Known limit of a first switch on a case-insensitive file system (Windows, macOS): a file or folder
     /// whose name differs from the tree's only in case is taken as the tree's and keeps its old spelling.
