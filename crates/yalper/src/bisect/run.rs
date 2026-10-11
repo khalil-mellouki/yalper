@@ -319,7 +319,8 @@ impl Logs {
     }
 
     /// Creates the empty log `name`, a plain file name, opened for reading and writing (0600 on Unix). A link
-    /// or anything but a regular file at that name is refused, never followed; a file is emptied.
+    /// or anything but a regular file at that name is refused, never followed; a file is emptied and made
+    /// private.
     pub fn create(&self, name: &str) -> io::Result<File> {
         let mut components = Path::new(name).components();
         let plain = matches!(
@@ -336,6 +337,12 @@ impl Logs {
         self.dir.check_still_at_path()?;
         let log = self.dir.open_file(name, Access::ReadWrite)?;
         log.set_len(0)?;
+        // A file that was already there would keep its mode otherwise.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            log.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         Ok(log)
     }
 }
