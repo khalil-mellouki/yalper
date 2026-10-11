@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
 
+use super::deps::remove_left_links;
 use super::entries::{
     Entries, Entry, Kind, Scope, another_session_running, entries, others_between, step_name,
 };
@@ -339,6 +340,9 @@ fn command_in(
     // After `clean_root`, which removes a link left in place of a copy, and before any copy is used: files an
     // earlier bisect could not delete would apply to this one.
     for warning in remove_left_over(&cache, &store) {
+        say(out, &printable(&format!("warning: {warning}")));
+    }
+    if let Some(warning) = remove_left_links(&cache) {
         say(out, &printable(&format!("warning: {warning}")));
     }
     let logs = Logs::open(&cache).map_err(io_failed)?;
@@ -1675,5 +1679,94 @@ mod tests {
         let yalper = OwnedDir::open(&project.path().join(".yalper")).unwrap();
         let events = Store::open(&yalper, &token()).unwrap();
         assert_eq!(events.meta(COPIED_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn links_left_in_copy_0_are_removed_at_the_start_of_a_bisect_that_never_uses_it() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let package = r#"{"dependencies": {"dep": "1"}}"#;
+        let pyproject = "[project]\nname = \"demo\"\n";
+        // Every step has another lockfile than the project: none runs in `copy-0`.
+        recorded(
+            project.path(),
+            &[
+                &[("package.json", package), ("package-lock.json", "2")],
+                &[("b.txt", "b")],
+                &[("c.txt", "c")],
+            ],
+        );
+        write(project.path(), ".gitignore", "node_modules/\n.venv/\n");
+        write(project.path(), "package.json", package);
+        write(project.path(), "package-lock.json", "1");
+        write(project.path(), "pyproject.toml", pyproject);
+        write(project.path(), "node_modules/dep/index.js", "");
+        write(project.path(), ".venv/pyvenv.cfg", "home = /usr/bin\n");
+        let before = state(project.path());
+        let folder = cache_base.path().join("yalper");
+        let copy_0 = {
+            let cache = CacheDir::open_in(&folder, project.path(), &token()).unwrap();
+            let yalper = OwnedDir::open(&project.path().join(".yalper")).unwrap();
+            let shadow = ShadowStore::open(&yalper, &token()).unwrap();
+            let events = Store::open(&yalper, &token()).unwrap();
+            let files = [
+                ("package.json", package),
+                ("package-lock.json", "1"),
+                ("pyproject.toml", pyproject),
+            ];
+            let changes: Vec<Change> = files
+                .iter()
+                .map(|&(path, content)| Change::Upsert {
+                    path: path.to_owned(),
+                    kind: FileKind::Regular,
+                    blob: shadow.write_blob(content.as_bytes()).unwrap(),
+                })
+                .collect();
+            let tree = shadow.edit_tree(shadow.empty_tree(), &changes).unwrap();
+            let mut sets = DependencySets::new(&cache, &events, None, Vec::new()).unwrap();
+            let logs = Logs::open(&cache).unwrap();
+            let prepared = sets
+                .prepare(&events, &shadow, tree, &logs, &AtomicBool::new(false))
+                .unwrap();
+            let Prepared::Ready(set_copy) = prepared else {
+                panic!("not ready");
+            };
+            let copy_0 = set_copy.copy().path().to_owned();
+            // Yalper ends without removing them: killed, or crashed.
+            sets.leak_project_links();
+            copy_0
+        };
+        assert_eq!(links_under(&copy_0).len(), 2);
+
+        let options = Options {
+            test: "exit 0".to_owned(),
+            good: Some(StepRef {
+                session: None,
+                step: 2,
+            }),
+            setup: Some("exit 0".to_owned()),
+            ..Options::default()
+        };
+        let screen = Screen {
+            live: false,
+            time_zone: TimeZone::UTC,
+        };
+        let open_cache = |project: &Path, token: &Token| CacheDir::open_in(&folder, project, token);
+        let mut out = Vec::new();
+        let ended = command_in(
+            project.path(),
+            &options,
+            &screen,
+            &mut out,
+            &AtomicBool::new(false),
+            &open_cache,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(ended, Ok(Ended::NotNamed), "{out}");
+        assert!(out.contains("The bad end, step 4, passes"), "{out}");
+        assert!(!out.contains("warning"), "{out}");
+        assert!(copy_0.with_file_name("copy-1").is_dir());
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert_eq!(state(project.path()), before);
     }
 }

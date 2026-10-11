@@ -816,6 +816,29 @@ pub(super) fn remove_all_project_links() -> MutexGuard<'static, BTreeSet<(PathBu
     listed
 }
 
+/// Removes the links into the project that a bisect which did not end left in `copy-0` of the project's cache
+/// folder `cache` (see [`NodeModules::remove_left_links`]), whether or not this bisect uses `copy-0`. Call it at
+/// the start of a bisect, after [`clean_root`], which removes a link in place of a copy, and before any copy is
+/// used. Nothing is removed unless `copy-0` and the cache folder are the real folders Yalper opened. Returns a
+/// message if the links could not be looked for or removed.
+pub(super) fn remove_left_links(cache: &CacheDir) -> Option<String> {
+    let path = cache.path().join("copy-0");
+    if !is_real_dir_no_follow(&path) {
+        return None;
+    }
+    let removed = TestCopy::open(cache, 0).and_then(|copy| {
+        copy.check_still_at_path()?;
+        NodeModules::new(cache.project())?.remove_left_links(&copy)
+    });
+    removed.err().map(|error| {
+        format!(
+            "cannot remove the links to your project's installed dependencies that an earlier bisect left in the \
+             test copy {}: {error}. If you delete it by hand, use a tool that does not follow links.",
+            path.display()
+        )
+    })
+}
+
 /// Removes every link of `listed` (see [`PROJECT_LINKS`]) and empties it. A link is removed only through a copy
 /// still at its canonical path and real folders, never followed (see [`remove_copied`]).
 fn remove_listed(listed: &mut BTreeSet<(PathBuf, String)>) {
@@ -1058,6 +1081,14 @@ impl DependencySets {
                 set_copy.copy.path().display()
             )
         })
+    }
+
+    /// Forgets the links of `copy-0` without removing them, as when Yalper is killed or crashes.
+    #[cfg(test)]
+    pub(super) fn leak_project_links(&mut self) {
+        if let Some(set_copy) = self.copies.get_mut(&0) {
+            std::mem::forget(set_copy.links.take());
+        }
     }
 
     /// Puts the env files and `--with` files into copy `number`, which holds a step.
@@ -2155,23 +2186,47 @@ mod tests {
         let (project, step) = with_installed();
         let before = state(project.path());
         let copy_0 = project.cache.path().join("copy-0");
-        let mut bisect = Bisect::new(&project, None);
-        assert_eq!(bisect.ready(&project, step), "copy-0");
-        // Yalper ends without removing them: killed, or crashed.
-        let mut set_copy = bisect.sets.copies.remove(&0).unwrap();
-        std::mem::forget(set_copy.links.take());
-        drop(set_copy);
-        drop(bisect);
-        assert_eq!(links_under(&copy_0).len(), 2);
+        let leave_links = || {
+            let mut bisect = Bisect::new(&project, None);
+            assert_eq!(bisect.ready(&project, step), "copy-0");
+            // Yalper ends without removing them: killed, or crashed.
+            bisect.sets.leak_project_links();
+            drop(bisect);
+            assert_eq!(links_under(&copy_0).len(), 2);
+        };
 
         // The next bisect's first step in `copy-0` has neither `web/` nor `api/`: its switch removes the link to
         // the environment, and its first link removes the farm, which the switch keeps as ignored.
+        leave_links();
         let mut bisect = Bisect::new(&project, None);
         let other = project.tree(&[(".gitignore", "node_modules/\n.venv/\n"), ("index.js", "")]);
         assert_eq!(bisect.ready(&project, other), "copy-0");
         assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
         assert!(!copy_0.join("web").exists());
         assert!(listed_for(&copy_0).is_empty());
+        drop(bisect);
+        assert_eq!(state(project.path()), before);
+
+        // A bisect that never uses `copy-0` removes them at its start. A link out of the project is not looked
+        // at.
+        leave_links();
+        let outside = tempfile::tempdir().unwrap();
+        let out_link = copy_0.join("tools").join("node_modules").join("out");
+        fs::create_dir_all(out_link.parent().unwrap()).unwrap();
+        make_link(outside.path(), &out_link).unwrap();
+        assert_eq!(remove_left_links(&project.cache), None);
+        assert_eq!(links_under(&copy_0), std::slice::from_ref(&out_link));
+        assert!(copy_0.join("web/package.json").is_file());
+        let mut bisect = Bisect::new(&project, Some("exit 0".to_owned()));
+        let other_lockfile = project.tree(&[
+            (".gitignore", "node_modules/\n.venv/\n"),
+            ("web/package.json", r#"{"dependencies": {"dep": "1"}}"#),
+            ("web/package-lock.json", "2"),
+            ("index.js", ""),
+        ]);
+        assert_eq!(bisect.ready(&project, other_lockfile), "copy-1");
+        drop(bisect);
+        assert_eq!(links_under(&copy_0), [out_link]);
         assert_eq!(state(project.path()), before);
     }
 

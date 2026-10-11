@@ -73,7 +73,7 @@ const LOG_TAIL_BYTES: u64 = 1 << 20;
 /// for a file being copied into a test copy and deleting every env file and `--with` file copied, and removing
 /// the links of `copy-0` into the project. Closing the console on Windows is not handled: Windows ends Yalper
 /// right away, and the job object kills the run's processes; the next bisect deletes the copied files (see
-/// [`remove_left_over`](super::remove_left_over)) and the links once `copy-0` is used again.
+/// [`remove_left_over`](super::remove_left_over)) and the links of `copy-0` at its start.
 /// Install it once per process.
 pub fn handle_ctrl_c() -> io::Result<()> {
     ctrlc::set_handler(|| {

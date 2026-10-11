@@ -26,8 +26,8 @@
 //! - every link is an extra path of the copy (see [`TestCopy::set_extra_paths`]), checked before every run:
 //!   anything else at its path (a link a test changed, a file, a folder) is removed, never followed, and the
 //!   link made anew. A link no longer wanted is removed, and every link when the bisect ends
-//!   ([`PythonEnvs::unlink`]); links a bisect that ended abnormally left are removed by the first switch of
-//!   the next bisect that uses the copy;
+//!   ([`PythonEnvs::unlink`]); links a bisect that did not end left are removed at the start of the next
+//!   bisect (see [`NodeModules::remove_left_links`](super::NodeModules::remove_left_links));
 //! - files of the environment are read only through real folders, never through a link, and up to
 //!   [`MAX_READ_BYTES`]; the paths they hold are mapped into the copy from their text only, never followed.
 
@@ -48,7 +48,7 @@ use crate::safe_fs;
 use crate::snapshot::{CASE_INSENSITIVE, Excludes};
 
 /// The names of the virtual environment folders that are reused.
-const ENV_NAMES: [&str; 2] = [".venv", "venv"];
+pub(super) const ENV_NAMES: [&str; 2] = [".venv", "venv"];
 
 /// The most bytes read of one `.pth` or finder file. Real ones hold a few lines.
 const MAX_READ_BYTES: u64 = 1024 * 1024;
