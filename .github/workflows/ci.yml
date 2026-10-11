@@ -39,7 +39,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Tests that need Python, Node or cargo skip when the tool is missing on a developer's machine, and fail
+      # here instead: the runners have all of them.
       - run: cargo test --workspace --all-features --locked
+        env:
+          YALPER_REQUIRE_TOOLS: "1"
 
   bench:
     name: Hook latency (${{ matrix.os }})

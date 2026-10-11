@@ -657,6 +657,16 @@ impl ShadowStore {
     fn verified(&self) -> Verified<'_> {
         Verified(&self.repo.objects)
     }
+
+    /// Writes `tree` as it is, without the path checks of [`edit_tree`](Self::edit_tree), for tests that need
+    /// a tree Yalper would refuse to build.
+    #[cfg(test)]
+    pub(crate) fn write_unchecked_tree(&self, tree: &gix::objs::Tree) -> Result<ObjectId> {
+        use gix::objs::WriteTo;
+        let mut bytes = Vec::new();
+        tree.write_to(&mut bytes)?;
+        self.write_object(gix::objs::Kind::Tree, &bytes)
+    }
 }
 
 /// One file of a tree: how it is stored and its blob.
