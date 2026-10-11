@@ -151,6 +151,9 @@ fn command_in(
         .parent()
         .ok_or("cannot find the project folder above .yalper")?;
     let chosen = choose(&store, project, start, &options.files)?;
+    for warning in &chosen.warnings {
+        say(out, &printable(&format!("warning: {warning}")));
+    }
     let events = store.events_without_output(&session.id).map_err(failed)?;
     let shadow = ShadowStore::open(&yalper.dir, &yalper.token)
         .map_err(|error| format!("cannot read the snapshots: {error}"))?;
@@ -192,10 +195,6 @@ fn command_in(
     if let Some(warning) = cache.warning() {
         say(out, &printable(&format!("warning: {warning}")));
     }
-    // Before any copy is used: files an earlier bisect could not delete would apply to this one.
-    for warning in remove_left_over(&cache, &store) {
-        say(out, &printable(&format!("warning: {warning}")));
-    }
     write_missing(out, &missing);
     store
         .set_meta(CACHE_DIR_KEY, Some(&cache.meta_value()))
@@ -204,6 +203,11 @@ fn command_in(
     let io_failed = |error: io::Error| error.to_string();
     clean_root(&cache).map_err(io_failed)?;
     write_boundaries(&cache).map_err(io_failed)?;
+    // After `clean_root`, which removes a link left in place of a copy, and before any copy is used: files an
+    // earlier bisect could not delete would apply to this one.
+    for warning in remove_left_over(&cache, &store) {
+        say(out, &printable(&format!("warning: {warning}")));
+    }
     let logs = Logs::open(&cache).map_err(io_failed)?;
     let existed = copies_in(&cache).map_err(io_failed)?;
     // Its own connection, so it can update the list of copied files until it is dropped.

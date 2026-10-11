@@ -115,7 +115,7 @@ pub struct Chosen {
     pub with: Vec<String>,
     /// The files of the `--with` paths (the files inside a folder), sorted.
     pub with_files: Vec<String>,
-    /// Warnings to show: remembered `--with` paths that no longer exist.
+    /// Warnings to show right away: remembered `--with` paths that no longer exist.
     pub warnings: Vec<String>,
 }
 
@@ -586,18 +586,19 @@ pub struct LocalFiles {
     /// The files listed in the event log: copy name and path.
     listed: BTreeSet<(String, String)>,
     used: Used,
+    /// How many times the list was written to the event log.
+    saves: usize,
 }
 
 impl LocalFiles {
     /// The files `chosen` for the project whose cache folder is `cache`, found by one walk of the project, with
-    /// warnings to show: those of `chosen`, env files that are links or too large, and files the snapshots skip
-    /// because they are too large (and that no `--with` path brings in). `events` is the project's event log,
+    /// warnings to show: env files that are links or too large, and files the snapshots skip because they are
+    /// too large (and that no `--with` path brings in). `events` is the project's event log,
     /// where the copied files are listed; files already listed there stay listed.
     pub fn new(cache: &CacheDir, chosen: &Chosen, events: Store) -> (Self, Vec<String>) {
         let project = cache.project().to_owned();
         let found = walk_project(&project, chosen.env);
-        let mut warnings = chosen.warnings.clone();
-        warnings.extend(found.notes);
+        let mut warnings = found.notes;
         let covered = |path: &str| {
             chosen.with.iter().any(|with| {
                 path == with
@@ -641,6 +642,7 @@ impl LocalFiles {
             copies: HashMap::new(),
             listed,
             used: Used::default(),
+            saves: 0,
         };
         (files, warnings)
     }
@@ -697,6 +699,7 @@ impl LocalFiles {
             copies,
             listed,
             used,
+            saves,
         } = self;
         let held = match copies.entry(root.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -746,6 +749,7 @@ impl LocalFiles {
             .collect();
 
         let before: Vec<String> = held.files.keys().cloned().collect();
+        let mut unlisted = false;
         for path in &before {
             if wanted.contains(path) {
                 continue;
@@ -755,12 +759,20 @@ impl LocalFiles {
                 || remove_copied(&held.canonical, path)
                     .map_err(|error| in_copy(error, "delete", path))?;
             if gone {
-                listed.remove(&(held.name.clone(), path.clone()));
+                unlisted |= listed.remove(&(held.name.clone(), path.clone()));
             }
             unregister(&held.canonical, path);
             held.files.remove(path);
         }
-        save_listed(events, instance, listed)?;
+        // Every file is listed before it is first written, with one write of the list for all of them.
+        let mut added = false;
+        for &path in &wanted {
+            added |= listed.insert((held.name.clone(), path.clone()));
+        }
+        if unlisted || added {
+            save_listed(events, instance, listed)?;
+            *saves += 1;
+        }
         // Registered before anything is written, so a switch keeps a file left half made by an error.
         let mut extra = copy.extra_paths().clone();
         extra.retain(|path| !before.contains(path));
@@ -772,9 +784,6 @@ impl LocalFiles {
             // Held until the file is written: a second Ctrl-C waits for it, then deletes it.
             let mut copied = copied();
             copied.insert((held.canonical.clone(), path.clone()));
-            if listed.insert((held.name.clone(), path.clone())) {
-                save_listed(events, instance, listed)?;
-            }
             let same = held.files.entry(path.clone()).or_default();
             if refresh(project, &root, path, same, &mut held.dirs, &tree)
                 .map_err(|error| in_copy(error, "copy", path))?
@@ -799,11 +808,12 @@ impl LocalFiles {
     /// without the messages.
     pub fn remove(&mut self) -> Vec<String> {
         let mut failed = Vec::new();
+        let mut unlisted = false;
         for (root, held) in &mut self.copies {
             for path in std::mem::take(&mut held.files).into_keys() {
                 match remove_copied(&held.canonical, &path) {
                     Ok(true) => {
-                        self.listed.remove(&(held.name.clone(), path.clone()));
+                        unlisted |= self.listed.remove(&(held.name.clone(), path.clone()));
                     }
                     Ok(false) => failed.push(not_looked_for(&path, root)),
                     Err(error) => failed.push(format!(
@@ -818,8 +828,11 @@ impl LocalFiles {
                 remove_empty_dir(&held.canonical, dir);
             }
         }
-        if let Err(error) = save_listed(&self.events, &self.instance, &self.listed) {
-            failed.push(error.to_string());
+        if unlisted {
+            self.saves += 1;
+            if let Err(error) = save_listed(&self.events, &self.instance, &self.listed) {
+                failed.push(error.to_string());
+            }
         }
         failed
     }
@@ -896,36 +909,72 @@ fn is_copy_name(name: &str) -> bool {
 
 /// Deletes the files that `events` lists as copied into the test copies of the project's cache folder `cache`
 /// (see [`COPIED_KEY`]): an earlier bisect ended without deleting them (Yalper was killed, crashed, or its
-/// console was closed). Call it at the start of a bisect, under the bisect lock, before any copy is used.
-/// Files that could not be deleted stay listed. Returns a warning for each of them.
+/// console was closed). Call it at the start of a bisect, under the bisect lock, after [`clean_root`] (which
+/// removes a link left in place of a copy) and before any copy is used. Only a copy that is a real folder of
+/// the cache folder, reached without any link, is looked into: a link in place of a copy is never followed.
+/// Files that could not be deleted, or were not looked for, stay listed. Returns a warning for each of them.
+///
+/// [`clean_root`]: super::clean_root
 pub fn remove_left_over(cache: &CacheDir, events: &Store) -> Vec<String> {
     let listed = match read_listed(events, cache.instance()) {
         Ok(listed) => listed,
         Err(error) => return vec![error.to_string()],
     };
+    if listed.is_empty() {
+        return Vec::new();
+    }
+    // The cache folder is the one Yalper opened and checked, and its canonical path holds no link.
+    let cache_root = cache
+        .dir()
+        .check_still_at_path()
+        .and_then(|()| fs::canonicalize(cache.path()));
+    let cache_root = match cache_root {
+        Ok(cache_root) => plain(&cache_root),
+        Err(error) => {
+            return vec![format!(
+                "cannot look for the files an earlier bisect left in the test copies of {}: {error}",
+                cache.path().display()
+            )];
+        }
+    };
     let mut kept = BTreeSet::new();
     let mut warnings = Vec::new();
-    for (copy, path) in listed {
-        if !is_copy_name(&copy) || validate_path(&path, FileKind::Regular).is_err() {
+    for (copy, path) in &listed {
+        if !is_copy_name(copy) || validate_path(path, FileKind::Regular).is_err() {
             continue;
         }
-        let root = cache.path().join(&copy);
-        // A copy that is gone was deleted with its files.
-        let Ok(canonical) = fs::canonicalize(&root) else {
+        let root = cache.path().join(copy);
+        match fs::symlink_metadata(&root) {
+            // A copy that is gone was deleted with its files.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Ok(metadata) if metadata.is_dir() => {}
+            // A link, a junction or a file in place of the copy: never followed.
+            _ => {
+                warnings.push(not_looked_for(path, &root));
+                kept.insert((copy.clone(), path.clone()));
+                continue;
+            }
+        }
+        let canonical = cache_root.join(copy);
+        if fs::canonicalize(&root).map(|now| plain(&now)).ok() != Some(canonical.clone()) {
+            warnings.push(not_looked_for(path, &root));
+            kept.insert((copy.clone(), path.clone()));
             continue;
-        };
-        match remove_copied(&plain(&canonical), &path) {
+        }
+        match remove_copied(&canonical, path) {
             Ok(true) => continue,
-            Ok(false) => warnings.push(not_looked_for(&path, &root)),
+            Ok(false) => warnings.push(not_looked_for(path, &root)),
             Err(error) => warnings.push(format!(
                 "cannot delete {path}, left by an earlier bisect, from the test copy {}: {error}. Delete it \
                  by hand.",
                 root.display()
             )),
         }
-        kept.insert((copy, path));
+        kept.insert((copy.clone(), path.clone()));
     }
-    if let Err(error) = save_listed(events, cache.instance(), &kept) {
+    if kept != listed
+        && let Err(error) = save_listed(events, cache.instance(), &kept)
+    {
         warnings.push(error.to_string());
     }
     warnings
@@ -1570,6 +1619,76 @@ mod tests {
     }
 
     #[test]
+    fn a_link_in_place_of_a_copy_is_never_followed_by_the_next_bisect() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join(".env"), "CANARY=1\n").unwrap();
+        fs::create_dir(canary.path().join("venv")).unwrap();
+        fs::write(canary.path().join("venv").join("x"), "x").unwrap();
+        let events = project.events();
+        let listed: BTreeSet<(String, String)> =
+            [("copy-0", ".env"), ("copy-1", ".env"), ("copy-1", "venv")]
+                .into_iter()
+                .map(|(copy, path)| (copy.to_owned(), path.to_owned()))
+                .collect();
+        save_listed(&events, project.cache.instance(), &listed).unwrap();
+        // A test replaced copy-0 itself with a link to the canary folder, and copy-1 is one too.
+        let copy = project.copy();
+        let copy_0 = copy.path().to_owned();
+        drop(copy);
+        fs::remove_dir(&copy_0).unwrap();
+        make_link(canary.path(), &copy_0).unwrap();
+        make_link(canary.path(), &project.cache.path().join("copy-1")).unwrap();
+
+        let warnings = remove_left_over(&project.cache, &events);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(".env was not deleted from the test copy "),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(canary.path().join(".env")).unwrap(),
+            "CANARY=1\n"
+        );
+        assert!(canary.path().join("venv").join("x").is_file());
+        // Still listed, for a later bisect once the links are gone.
+        assert_eq!(
+            read_listed(&events, project.cache.instance()).unwrap(),
+            listed
+        );
+    }
+
+    #[test]
+    fn the_list_of_copied_files_is_written_only_when_it_changes() {
+        let project = Project::new();
+        project.write(".gitignore", ".env\n.env.*\n");
+        project.write(".env", "A=1\n");
+        project.write(".env.local", "B=1\n");
+        project.write(".env.test", "C=1\n");
+        let (mut files, _) = LocalFiles::new(&project.cache, &env_only(), project.events());
+        let mut copy = project.copy();
+        let tree = project.tree(&[("a.txt", "a")]);
+        copy.switch(&project.store, tree).unwrap();
+        // Three files listed with one write, before any of them is written.
+        assert_eq!(files.sync(&mut copy).unwrap(), 3);
+        assert_eq!(files.saves, 1);
+        assert_eq!(files.listed.len(), 3);
+        fs::write(native(copy.path(), ".env"), "changed by a test").unwrap();
+        assert_eq!(files.sync(&mut copy).unwrap(), 1);
+        assert_eq!(files.saves, 1);
+        // A step whose tree has `.env`: one write to unlist it.
+        copy.switch(&project.store, project.tree(&[(".env", "TRACKED=1\n")]))
+            .unwrap();
+        assert_eq!(files.sync(&mut copy).unwrap(), 0);
+        assert_eq!(files.saves, 2);
+        assert!(files.remove().is_empty());
+        assert_eq!(files.saves, 3);
+        assert!(files.remove().is_empty());
+        assert_eq!(files.saves, 3);
+        assert_eq!(project.events().meta(COPIED_KEY).unwrap(), None);
+    }
+
+    #[test]
     fn a_remembered_with_path_that_is_gone_is_skipped_with_a_warning() {
         let project = Project::new();
         project.write(".gitignore", "*.key\n");
@@ -1590,7 +1709,8 @@ mod tests {
             ]
         );
         let (_, warnings) = LocalFiles::new(&project.cache, &chosen, project.events());
-        assert_eq!(warnings, chosen.warnings);
+        // Shown by the command right after `choose`, not again here.
+        assert!(warnings.is_empty(), "{warnings:?}");
         // Still remembered: it is copied again once it is back.
         project.write("a.key", "a");
         let chosen = choose(&events, root, root, &Choice::default()).unwrap();
