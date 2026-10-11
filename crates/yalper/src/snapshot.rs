@@ -29,9 +29,11 @@ use gix::{ObjectId, oid};
 use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 
+pub(crate) use excludes::{Excludes, over_budget_reason};
 pub use scan::{
     Base, MAX_FILE_BYTES, Pending, SkipReason, Skipped, Snapshot, remember_failure, snapshot, take,
 };
+pub(crate) use scan::{file_system_clock, is_racy, nanos_since_epoch};
 
 /// The shadow repository inside `.yalper/`.
 pub const SNAPSHOTS_DIR: &str = "snapshots.git";

@@ -48,7 +48,7 @@ const COARSE_RACY_WINDOW: Duration = Duration::from_secs(2);
 
 /// Whether a file with mtime `mtime_ns`, seen by a scan that started at `started_ns`, must be read again by the
 /// next scan (see [`RACY_WINDOW`]).
-fn is_racy(mtime_ns: i64, started_ns: i64) -> bool {
+pub(crate) fn is_racy(mtime_ns: i64, started_ns: i64) -> bool {
     let window = if mtime_ns % 1_000_000_000 == 0 {
         COARSE_RACY_WINDOW
     } else {
@@ -63,8 +63,14 @@ const SCAN_CLOCK_FILE: &str = "scan-clock";
 /// The time on the file system's clock, in nanoseconds since the Unix epoch: the mtime of [`SCAN_CLOCK_FILE`]
 /// right after writing to it.
 fn scan_clock(yalper_dir: &OwnedDir) -> io::Result<i64> {
+    file_system_clock(yalper_dir, SCAN_CLOCK_FILE)
+}
+
+/// The time on the clock of the file system that holds `dir`, in nanoseconds since the Unix epoch: the mtime
+/// of the file `name` in `dir` right after writing to it.
+pub(crate) fn file_system_clock(dir: &OwnedDir, name: &str) -> io::Result<i64> {
     use std::io::Write as _;
-    let mut file = yalper_dir.open_file(SCAN_CLOCK_FILE, Access::ReadWrite)?;
+    let mut file = dir.open_file(name, Access::ReadWrite)?;
     file.write_all(b"x")?;
     Ok(nanos_since_epoch(file.metadata()?.modified()?))
 }
@@ -649,7 +655,7 @@ fn visit(
         return (None, WalkState::Continue);
     };
     if entry.depth() == 0 {
-        excludes.add_dir(entry.path());
+        excludes.add_dir(entry.path(), true);
         return (None, WalkState::Continue);
     }
     let skip = |path: String, reason| {
@@ -695,7 +701,7 @@ fn visit(
         return skip(path, SkipReason::InvalidPath(reason));
     }
     let Some(metadata) = metadata else {
-        excludes.add_dir(entry.path());
+        excludes.add_dir(entry.path(), true);
         return (None, WalkState::Continue);
     };
     let mtime_ns = match metadata.modified() {
@@ -810,7 +816,7 @@ fn is_executable(_metadata: &Metadata) -> bool {
     false
 }
 
-pub(super) fn nanos_since_epoch(time: SystemTime) -> i64 {
+pub(crate) fn nanos_since_epoch(time: SystemTime) -> i64 {
     let nanos = |duration: Duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX);
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => nanos(after),

@@ -6,6 +6,18 @@
 //! hashes every file of the target tree found in the copy and writes only those that are missing or differ.
 //! Later switches apply the tree diff between the step the copy holds and the next one.
 //!
+//! Every switch also undoes what the test run before it did, so each run starts from the exact files of its
+//! step:
+//!
+//! - files of the tree the run changed or deleted are written again. The copy keeps the size and mtime of
+//!   each file it wrote (a stat manifest, in memory only): a file whose size, mtime or kind changed, or whose
+//!   mtime is so close to the end of the previous switch that the run could have changed it within the same
+//!   timestamp tick, is hashed, and written again if its content differs (the same rule as recording's stat
+//!   cache);
+//! - every other file or folder is removed unless the step's ignore rules ignore it (see [`sweep`]), so
+//!   build caches such as `target/` or `__pycache__/` are kept for speed. The first switch does the same
+//!   cleanup, since the copy may still hold files of another tree.
+//!
 //! The copy is written with its own small writer, not a git checkout: snapshots hold raw bytes, and a
 //! checkout would apply `.gitattributes` filters such as line-ending conversion. Its rules:
 //!
@@ -23,19 +35,27 @@
 //! - the cached bytecode of every Python file written or removed is deleted (see [`remove_bytecode`]).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
+use std::time::SystemTime;
 
 use gix::ObjectId;
 
 use super::BISECT_DIR;
+use crate::repo;
 use crate::safe_fs::{self, OwnedDir};
 use crate::snapshot::{
-    Error, FileChange, FileKind, MAX_FILE_BYTES, Result, ShadowStore, TreeFile, validate_path,
+    Error, Excludes, FileChange, FileKind, MAX_FILE_BYTES, Result, ShadowStore, TreeFile,
+    file_system_clock, is_racy, nanos_since_epoch, over_budget_reason, validate_path,
 };
+
+/// The file in `.yalper/bisect/` whose mtime gives the time a switch ended, on the file system's clock (see
+/// [`is_racy`]).
+const CLOCK_FILE: &str = "clock";
 
 /// The most entries (files and folders) of a tree diff one switch takes. Over it the switch is refused: no
 /// project has that many files, but a crafted store could repeat a large subtree many times.
@@ -56,18 +76,42 @@ const QUEUED_WRITES: usize = 16;
 /// a snapshot step.
 #[derive(Debug)]
 pub struct TestCopy {
+    /// `.yalper/bisect/`, which holds [`CLOCK_FILE`].
+    bisect: OwnedDir,
     dir: OwnedDir,
+    /// The `info/exclude` file of the project's repository: its rules apply in the copy as in the project.
+    info_exclude: Option<PathBuf>,
     /// The tree the copy holds, `None` until a switch succeeded: the first switch then checks every file.
     tree: Option<ObjectId>,
+    /// Every file of `tree`, by path, as the last switch left it on disk.
+    placed: HashMap<String, Placed>,
+    /// When the last switch ended, in nanoseconds since the Unix epoch on the file system's clock.
+    clean_at: i64,
+    /// See [`set_extra_paths`](Self::set_extra_paths).
+    extra: HashSet<String>,
+}
+
+/// A file of the tree a copy holds, with the size and mtime the copy gave it.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    file: TreeFile,
+    size: u64,
+    /// `None` if the file system gives no mtime: the file is then hashed by every check.
+    mtime_ns: Option<i64>,
 }
 
 /// What a [`TestCopy::switch`] did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Switched {
-    /// Files and links written.
+    /// Files and links written, `restored` included.
     pub written: usize,
-    /// Files and links removed.
+    /// Files and links of the previous tree removed because the new tree does not have them.
     pub removed: usize,
+    /// Files and links of the previous tree written again because the test run changed or deleted them.
+    pub restored: usize,
+    /// Files, links and folders that were neither part of the tree nor ignored (created by the test run, or
+    /// left by another tree before a first switch), removed.
+    pub deleted: usize,
 }
 
 impl TestCopy {
@@ -77,17 +121,39 @@ impl TestCopy {
     pub fn open(yalper_dir: &OwnedDir, number: usize) -> io::Result<Self> {
         let bisect = open_private_dir(&yalper_dir.path().join(BISECT_DIR))?;
         let dir = open_private_dir(&bisect.path().join(format!("copy-{number}")))?;
-        Ok(Self { dir, tree: None })
+        let info_exclude = yalper_dir
+            .path()
+            .parent()
+            .and_then(repo::git_common_dir)
+            .map(|git_dir| git_dir.join("info").join("exclude"));
+        Ok(Self {
+            bisect,
+            dir,
+            info_exclude,
+            tree: None,
+            placed: HashMap::new(),
+            clean_at: 0,
+            extra: HashSet::new(),
+        })
     }
 
     pub fn path(&self) -> &Path {
         self.dir.path()
     }
 
-    /// Makes the copy hold the tree `to` of `store`, writing only what differs: on the first switch of this
-    /// `TestCopy`, the files of `to` that are missing in the copy or differ from it; afterwards, the files
-    /// that differ between the tree the copy holds and `to`. Files the tree does not have are not touched
-    /// by a first switch.
+    /// Sets the paths of the copy, relative and `/`-separated, that Yalper puts there besides the files of
+    /// the tree (a folder of links to the project's dependencies, env files): switches keep them as they
+    /// are, a folder with everything inside it.
+    pub fn set_extra_paths(&mut self, paths: impl IntoIterator<Item = String>) {
+        self.extra = paths.into_iter().collect();
+    }
+
+    /// Makes the copy hold exactly the tree `to` of `store`, plus the files its ignore rules ignore, writing
+    /// only what differs: on the first switch of this `TestCopy`, the files of `to` that are missing in the
+    /// copy or differ from it; afterwards, the files that differ between the tree the copy holds and `to`,
+    /// and the files of the tree the copy holds that a test run changed or deleted. Then every file and
+    /// folder that is neither part of `to`, ignored by its rules, nor an extra path is removed (see
+    /// [`sweep`]).
     ///
     /// Known limit of a first switch on a case-insensitive file system (Windows, macOS): a file or folder
     /// whose name differs from the tree's only in case is taken as the tree's and keeps its old spelling.
@@ -106,6 +172,7 @@ impl TestCopy {
         max_changes: usize,
     ) -> Result<Switched> {
         let from = self.tree.take();
+        let mut placed = std::mem::take(&mut self.placed);
         let first = from.is_none();
         let changes =
             store.file_changes(from.unwrap_or_else(|| store.empty_tree()), to, max_changes)?;
@@ -115,14 +182,33 @@ impl TestCopy {
             ))
             .into());
         }
-        let changes = checked(&changes.files)?;
+        let mut changes = checked(&changes.files)?;
 
         // Checked right before writing: a test run could have replaced the copy's folder.
         self.dir.check_still_at_path()?;
         let root = self.dir.path();
         make_owner_writable(root, &fs::symlink_metadata(root)?)?;
 
-        let mut switched = Switched::default();
+        // Files the diff rewrites or removes anyway are not checked.
+        let restores = if first {
+            Vec::new()
+        } else {
+            let in_diff = changes.iter().map(|&(path, _)| path).collect();
+            changed_by_run(root, &mut placed, &in_diff, self.clean_at)?
+        };
+        let mut switched = Switched {
+            restored: restores.len(),
+            ..Switched::default()
+        };
+        if !restores.is_empty() {
+            changes.extend(
+                restores
+                    .iter()
+                    .map(|(path, file)| (path.as_str(), Some(*file))),
+            );
+            changes.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        }
+
         let mut kept = HashMap::new();
         for &(path, new) in &changes {
             if new.is_none()
@@ -163,8 +249,241 @@ impl TestCopy {
             }
         }
 
+        // On a first switch every file of `to` is listed, written or found as it should be; on a later one,
+        // every listed file was written.
+        for &(path, new) in &changes {
+            match new {
+                Some(file) => {
+                    let metadata = fs::symlink_metadata(native(root, path))
+                        .map_err(|error| in_copy(error, path))?;
+                    placed.insert(path.to_owned(), Placed::new(file, &metadata));
+                }
+                None => {
+                    placed.remove(path);
+                }
+            }
+        }
+        switched.deleted = sweep(root, &placed, &self.extra, self.info_exclude.as_deref())?;
+
+        // The local clock if the file system's cannot be read.
+        self.clean_at = file_system_clock(&self.bisect, CLOCK_FILE)
+            .unwrap_or_else(|_| nanos_since_epoch(SystemTime::now()));
+        self.placed = placed;
         self.tree = Some(to);
         Ok(switched)
+    }
+}
+
+impl Placed {
+    fn new(file: TreeFile, metadata: &fs::Metadata) -> Self {
+        Self {
+            file,
+            size: metadata.len(),
+            mtime_ns: metadata.modified().ok().map(nanos_since_epoch),
+        }
+    }
+}
+
+/// The files of `placed` (the tree the copy at `root` holds) that a test run changed or deleted, except those
+/// in `skip`, with what they should hold. A file counts as changed when it is missing, when a
+/// folder above it is not a real folder, or when it is not the kind of entry the copy writes for it.
+///
+/// A file whose size or mtime differs from `placed`, or whose mtime is so close to `clean_at` (the end of
+/// the previous switch) that a change within the same timestamp tick would have kept it, is hashed: if its
+/// content is still the tree's, its new size and mtime are kept in `placed` and it is not written again.
+fn changed_by_run(
+    root: &Path,
+    placed: &mut HashMap<String, Placed>,
+    skip: &HashSet<&str>,
+    clean_at: i64,
+) -> io::Result<Vec<(String, TreeFile)>> {
+    let mut real_dirs: HashMap<String, bool> = HashMap::new();
+    let mut changed = Vec::new();
+    for (path, entry) in placed.iter_mut() {
+        if skip.contains(path.as_str()) {
+            continue;
+        }
+        let mut in_real_dirs = true;
+        for parent in parents(path) {
+            let real = match real_dirs.get(parent) {
+                Some(&real) => real,
+                None => {
+                    let real = is_real_dir(&native(root, parent))?;
+                    real_dirs.insert(parent.to_owned(), real);
+                    real
+                }
+            };
+            if !real {
+                in_real_dirs = false;
+                break;
+            }
+        }
+        if !in_real_dirs || !still_placed(&native(root, path), entry, clean_at)? {
+            changed.push((path.clone(), entry.file));
+        }
+    }
+    Ok(changed)
+}
+
+/// Whether the entry at `path` still holds the file of `placed` (see [`changed_by_run`]), updating the size
+/// and mtime of `placed` when the file had to be hashed.
+fn still_placed(path: &Path, placed: &mut Placed, clean_at: i64) -> io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let now = Placed::new(placed.file, &metadata);
+    if !is_written_as(&metadata, placed.file.kind) {
+        return Ok(false);
+    }
+    if let Some(mtime_ns) = now.mtime_ns
+        && now.size == placed.size
+        && placed.mtime_ns == Some(mtime_ns)
+        && !is_racy(mtime_ns, clean_at)
+    {
+        return Ok(true);
+    }
+    if !holds(path, placed.file)? {
+        return Ok(false);
+    }
+    *placed = now;
+    Ok(true)
+}
+
+/// Removes from the copy at `root` every file and folder that is neither a file of the tree (`placed`), a
+/// folder holding one, one of the `extra` paths, nor ignored: what a test run created, or what another tree
+/// left before a first switch. Returns how many entries were removed.
+///
+/// "Ignored" means what recording means, so exactly the files that are never in snapshots: the rules of the
+/// tree's `.gitignore` files (read from the copy, which the switch just made hold them), the project's
+/// `info/exclude` (`info_exclude`) and the user's global excludes file. A `.gitignore` that is not a file of
+/// the tree, such as one a test created, has no effect. Ignored folders are not entered; a folder that is
+/// neither part of the tree nor ignored is entered, and removed once empty, so ignored files inside it stay
+/// as a checkout would leave them. Links are never followed: a link is removed itself, never what it points
+/// to.
+fn sweep(
+    root: &Path,
+    placed: &HashMap<String, Placed>,
+    extra: &HashSet<String>,
+    info_exclude: Option<&Path>,
+) -> Result<usize> {
+    let dirs: HashSet<&str> = placed.keys().flat_map(|path| parents(path)).collect();
+    // On a case-insensitive file system, a first switch keeps a name whose case differs from the tree's
+    // (see `TestCopy::switch`): it is found through its lowercase spelling.
+    let lowercase: HashMap<String, &str> = placed
+        .keys()
+        .map(String::as_str)
+        .chain(dirs.iter().copied())
+        .map(|path| (path.to_lowercase(), path))
+        .collect();
+    let has_rules = |dir: &str| {
+        let file = join(dir, ".gitignore");
+        // On Windows a link of the tree is a plain file holding its target, not rules.
+        placed
+            .get(&file)
+            .is_some_and(|placed| placed.file.kind != FileKind::Symlink)
+    };
+    let excludes = Excludes::with_info_exclude(root, info_exclude);
+    let over_budget = || {
+        io::Error::other(format!(
+            "cannot clean the test copy: {}",
+            over_budget_reason()
+        ))
+    };
+
+    let mut deleted = 0;
+    // Folders still to list: path on disk, and path in the tree for a folder of the tree, `None` for a folder
+    // that is not part of it and not ignored.
+    let mut todo = vec![(root.to_path_buf(), Some(String::new()))];
+    let mut created = Vec::new();
+    excludes.add_dir(root, has_rules(""));
+    while let Some((dir, tree_dir)) = todo.pop() {
+        if excludes.exceeded() {
+            return Err(over_budget().into());
+        }
+        // A test can take the write permission away from a folder.
+        make_owner_writable(&dir, &fs::symlink_metadata(&dir)?)?;
+        let entries = fs::read_dir(&dir)?
+            .map(|entry| {
+                let entry = entry?;
+                // The type of the entry itself: a link is not followed.
+                Ok((entry.file_name(), entry.file_type()?))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let names: HashSet<&OsStr> = entries.iter().map(|(name, _)| name.as_os_str()).collect();
+        for (name, file_type) in &entries {
+            let full = dir.join(name);
+            let is_dir = file_type.is_dir();
+            if let Some(tree_dir) = &tree_dir {
+                let path = name.to_str().map(|name| join(tree_dir, name));
+                if path.as_ref().is_some_and(|path| extra.contains(path)) {
+                    continue;
+                }
+                let tree_path = path.and_then(|path| {
+                    if placed.contains_key(&path) || dirs.contains(path.as_str()) {
+                        return Some(path);
+                    }
+                    let &spelled = lowercase.get(&path.to_lowercase())?;
+                    // Both spellings in one folder: a case-sensitive file system, where this is another
+                    // entry.
+                    let tree_name = spelled.rsplit('/').next().unwrap_or(spelled);
+                    (!names.contains(OsStr::new(tree_name))).then(|| spelled.to_owned())
+                });
+                match tree_path {
+                    Some(path) if is_dir && dirs.contains(path.as_str()) => {
+                        excludes.add_dir(&full, has_rules(&path));
+                        todo.push((full, Some(path)));
+                        continue;
+                    }
+                    Some(path) if !is_dir && placed.contains_key(&path) => continue,
+                    _ => {}
+                }
+            }
+            if excludes.is_ignored(&full, is_dir) {
+                continue;
+            }
+            if is_dir {
+                // Entered, so the ignored files inside it are kept, as a checkout keeps them; removed at the
+                // end if nothing is left in it.
+                excludes.add_dir(&full, false);
+                created.push(full.clone());
+                todo.push((full, None));
+                continue;
+            }
+            match fs::symlink_metadata(&full) {
+                Ok(metadata) => {
+                    remove_entry(&full, &metadata)
+                        .map_err(|error| in_copy_at(error, root, &full))?;
+                    deleted += 1;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    // Inner folders first.
+    created.sort_unstable();
+    for dir in created.iter().rev() {
+        if fs::remove_dir(dir).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Adds the path of `full`, an entry of the copy at `root`, to an error.
+fn in_copy_at(error: io::Error, root: &Path, full: &Path) -> io::Error {
+    let path = full.strip_prefix(root).unwrap_or(full);
+    in_copy(error, &path.to_string_lossy().replace('\\', "/"))
+}
+
+/// The path `name` inside the folder `dir` of the tree (`""` for the root).
+fn join(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
     }
 }
 
@@ -381,12 +700,14 @@ fn holds(path: &Path, file: TreeFile) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
+    if !is_written_as(&metadata, file.kind) {
+        return Ok(false);
+    }
     #[cfg(unix)]
     if file.kind == FileKind::Symlink {
-        return Ok(metadata.is_symlink() && is_blob(&link_target(path)?, file.blob)?);
+        return is_blob(&link_target(path)?, file.blob);
     }
-    // On Windows, a link of the tree is a plain file holding its target.
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES || !plain_as(&metadata, file.kind) {
+    if metadata.len() > MAX_FILE_BYTES {
         return Ok(false);
     }
     let opened = match safe_fs::open_regular_file(path) {
@@ -405,6 +726,16 @@ fn is_blob(bytes: &[u8], id: ObjectId) -> io::Result<bool> {
     let actual = gix::objs::compute_hash(id.kind(), gix::objs::Kind::Blob, bytes)
         .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(actual == id)
+}
+
+/// Whether the entry with `metadata` (not followed) is the kind of entry the copy writes for a file of kind
+/// `kind`: a link for a link of the tree on Unix, otherwise a regular file (see [`plain_as`]). On Windows, a
+/// link of the tree is a plain file holding its target.
+fn is_written_as(metadata: &fs::Metadata, kind: FileKind) -> bool {
+    if cfg!(unix) && kind == FileKind::Symlink {
+        return metadata.is_symlink();
+    }
+    metadata.is_file() && plain_as(metadata, kind)
 }
 
 /// Whether the regular file with `metadata` is stored as `kind` would write it: on Unix, the same executable
@@ -561,7 +892,7 @@ fn clear(path: &Path) -> io::Result<()> {
 /// removed itself, never what it points to, and so are the links inside a removed folder.
 fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.is_dir() {
-        return fs::remove_dir_all(path);
+        return fs::remove_dir_all(path).or_else(|_| remove_dir_forcing(path));
     }
     if metadata.is_symlink() {
         // On Windows, a link to a folder and a junction are removed as folders.
@@ -582,6 +913,23 @@ fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
         fs::set_permissions(path, permissions)?;
     }
     fs::remove_file(path)
+}
+
+/// Removes the folder `dir` and everything in it one entry at a time, making each folder writable by its
+/// owner first and clearing read-only attributes: for a folder `remove_dir_all` could not remove, such as one
+/// a test left without write permission. Links are removed, never followed.
+fn remove_dir_forcing(dir: &Path) -> io::Result<()> {
+    make_owner_writable(dir, &fs::symlink_metadata(dir)?)?;
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            remove_dir_forcing(&path)?;
+        } else {
+            remove_entry(&path, &metadata)?;
+        }
+    }
+    fs::remove_dir(dir)
 }
 
 /// Removes the cached bytecode of the Python file at `path`: the `__pycache__/<name>.*.pyc` files next to it,
@@ -881,7 +1229,8 @@ mod tests {
             switched,
             Switched {
                 written: 1,
-                removed: 0
+                removed: 0,
+                ..Switched::default()
             }
         );
         assert_holds(&copy, &nested);
@@ -890,7 +1239,8 @@ mod tests {
             switched,
             Switched {
                 written: 0,
-                removed: 1
+                removed: 1,
+                ..Switched::default()
             }
         );
         assert_holds(&copy, &flat);
@@ -943,12 +1293,18 @@ mod tests {
     #[test]
     fn a_case_only_folder_rename_keeps_files_the_tree_does_not_have() {
         let project = Project::new();
-        let old = [("Src/Lib/a.txt", Regular, "a")];
-        let new = [("src/lib/a.txt", Regular, "a")];
+        let old = [
+            (".gitignore", Regular, "*.o\n"),
+            ("Src/Lib/a.txt", Regular, "a"),
+        ];
+        let new = [
+            (".gitignore", Regular, "*.o\n"),
+            ("src/lib/a.txt", Regular, "a"),
+        ];
         let (tree_old, tree_new) = (project.tree(&old), project.tree(&new));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_old).unwrap();
-        // A build output the tree does not have keeps both folders from being removed.
+        // An ignored build output keeps both folders from being removed.
         fs::write(copy.path().join("Src").join("Lib").join("out.o"), "o").unwrap();
         copy.switch(&project.store, tree_new).unwrap();
         let names = |dir: &Path| -> Vec<String> {
@@ -962,12 +1318,12 @@ mod tests {
         let src = copy.path().join("src");
         if cfg!(any(windows, target_os = "macos")) {
             // One folder, renamed to the tree's spelling, with both files.
-            assert_eq!(names(copy.path()), ["src"]);
+            assert_eq!(names(copy.path()), [".gitignore", "src"]);
             assert_eq!(names(&src), ["lib"]);
             assert_eq!(names(&src.join("lib")), ["a.txt", "out.o"]);
         } else {
             // Two folders on a case-sensitive file system: the old one keeps only the build output.
-            assert_eq!(names(copy.path()), ["Src", "src"]);
+            assert_eq!(names(copy.path()), [".gitignore", "Src", "src"]);
             assert_eq!(names(&copy.path().join("Src").join("Lib")), ["out.o"]);
             assert_eq!(names(&src.join("lib")), ["a.txt"]);
         }
@@ -1110,7 +1466,8 @@ mod tests {
             switched,
             Switched {
                 written: 100,
-                removed: 0
+                removed: 0,
+                ..Switched::default()
             }
         );
         let switched = copy.switch(&project.store, tree_step).unwrap();
@@ -1118,7 +1475,8 @@ mod tests {
             switched,
             Switched {
                 written: 5,
-                removed: 0
+                removed: 0,
+                ..Switched::default()
             }
         );
         assert_holds(&copy, &view(&step));
@@ -1135,7 +1493,8 @@ mod tests {
             switched,
             Switched {
                 written: 1,
-                removed: 0
+                removed: 0,
+                ..Switched::default()
             }
         );
         assert_holds(&reused, &view(&step));
@@ -1262,7 +1621,8 @@ mod tests {
             switched,
             Switched {
                 written: 1,
-                removed: 0
+                removed: 0,
+                ..Switched::default()
             }
         );
         assert_holds(&copy, &a);
@@ -1300,10 +1660,12 @@ mod tests {
     fn bytecode_of_a_written_or_removed_python_file_is_removed() {
         let project = Project::new();
         let a = [
+            (".gitignore", Regular, "__pycache__/\n"),
             ("pkg/mod.py", Regular, "VALUE = 1\n"),
             ("pkg/other.py", Regular, ""),
         ];
         let b = [
+            (".gitignore", Regular, "__pycache__/\n"),
             ("pkg/mod.py", Regular, "VALUE = 2\n"),
             ("pkg/other.py", Regular, ""),
         ];
@@ -1329,6 +1691,335 @@ mod tests {
         // Removing the files removes the rest, and the folders left empty.
         copy.switch(&project.store, project.tree(&[])).unwrap();
         assert!(!copy.path().join("pkg").exists());
+    }
+
+    /// Writes `content` at `path` inside `root`, creating the folders above it.
+    fn create(root: &Path, path: &str, content: &str) {
+        let full = root.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, content).unwrap();
+    }
+
+    #[test]
+    fn what_a_test_run_changed_is_undone_and_ignored_build_folders_are_kept() {
+        let project = Project::new();
+        let files = [
+            (".gitignore", Regular, "target/\n__pycache__/\n/dist/\n"),
+            ("README.md", Regular, "readme\n"),
+            ("pkg/mod.py", Regular, "VALUE = 1\n"),
+            ("src/lib.rs", Regular, "pub fn f() {}\n"),
+            ("src/main.rs", Regular, "fn main() {}\n"),
+        ];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+
+        // The test run changes a file, deletes one, creates a file and a folder, and leaves build outputs.
+        let root = copy.path().to_path_buf();
+        fs::write(root.join("src").join("lib.rs"), "broken").unwrap();
+        fs::remove_file(root.join("README.md")).unwrap();
+        create(&root, "src/created.txt", "new");
+        create(&root, "tmp/deeper/out.txt", "out");
+        let ignored = [
+            "target/debug/app",
+            "pkg/__pycache__/mod.cpython-312.pyc",
+            "dist/bundle.js",
+        ];
+        for path in ignored {
+            create(&root, path, "build output");
+        }
+
+        let switched = copy.switch(&project.store, tree).unwrap();
+        assert_eq!(
+            switched,
+            Switched {
+                written: 2,
+                removed: 0,
+                restored: 2,
+                // `src/created.txt`, `tmp/deeper/out.txt`, `tmp/deeper` and `tmp`.
+                deleted: 4,
+            }
+        );
+        let mut expected = expected(&files);
+        for path in ignored {
+            expected.insert(path.to_owned(), (Regular, b"build output".to_vec()));
+        }
+        assert_eq!(contents(&root), expected);
+    }
+
+    #[test]
+    fn a_test_run_is_undone_on_a_switch_to_another_tree() {
+        let project = Project::new();
+        let a = [
+            ("changed_by_run.txt", Regular, "a"),
+            ("changed_by_both.txt", Regular, "a"),
+            ("removed_in_b.txt", Regular, "a"),
+        ];
+        let b = [
+            ("changed_by_run.txt", Regular, "a"),
+            ("changed_by_both.txt", Regular, "b"),
+        ];
+        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree_a).unwrap();
+        let root = copy.path().to_path_buf();
+        for name in ["changed_by_run.txt", "changed_by_both.txt"] {
+            fs::write(root.join(name), "run").unwrap();
+        }
+        fs::remove_file(root.join("removed_in_b.txt")).unwrap();
+        create(&root, "created.txt", "run");
+
+        let switched = copy.switch(&project.store, tree_b).unwrap();
+        // The file the diff rewrites anyway is not counted as restored.
+        assert_eq!(
+            switched,
+            Switched {
+                written: 2,
+                removed: 0,
+                restored: 1,
+                deleted: 1,
+            }
+        );
+        assert_holds(&copy, &b);
+    }
+
+    #[test]
+    fn a_same_size_change_that_keeps_the_mtime_is_undone() {
+        let project = Project::new();
+        let files = [("a.txt", Regular, "one")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        let path = copy.path().join("a.txt");
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "two").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        // Same size and mtime as the copy wrote, but the mtime is too recent to vouch for the content.
+        assert_eq!(copy.switch(&project.store, tree).unwrap().restored, 1);
+        assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn a_file_touched_by_a_test_is_hashed_not_rewritten() {
+        let project = Project::new();
+        let files = [("a.txt", Regular, "same")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(copy.path().join("a.txt"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            copy.switch(&project.store, tree).unwrap(),
+            Switched::default()
+        );
+        assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn a_file_created_through_a_link_is_not_followed() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join("a.txt"), "keep me").unwrap();
+        let files = [("src/a.txt", Regular, "a"), ("top.txt", Regular, "top")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+
+        // The test run links a new folder and a folder of the tree to a folder outside, and creates a file
+        // through the first link.
+        let root = copy.path().to_path_buf();
+        link_dir(canary.path(), &root.join("out"));
+        fs::write(root.join("out").join("created.txt"), "through the link").unwrap();
+        fs::remove_dir_all(root.join("src")).unwrap();
+        link_dir(canary.path(), &root.join("src"));
+        let before = contents(canary.path());
+        assert_eq!(before.len(), 2);
+
+        let switched = copy.switch(&project.store, tree).unwrap();
+        assert_eq!((switched.restored, switched.deleted), (1, 1));
+        assert_holds(&copy, &files);
+        assert_eq!(contents(canary.path()), before);
+    }
+
+    #[test]
+    fn ignore_rules_changed_or_added_by_a_test_have_no_effect() {
+        let project = Project::new();
+        let files = [
+            (".gitignore", Regular, "build/\n"),
+            ("sub/a.txt", Regular, "a"),
+        ];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        let root = copy.path().to_path_buf();
+        fs::write(root.join(".gitignore"), "*\n").unwrap();
+        create(&root, "sub/.gitignore", "*\n");
+        create(&root, "created.txt", "x");
+        create(&root, "sub/created.txt", "x");
+        create(&root, "build/out.o", "o");
+
+        copy.switch(&project.store, tree).unwrap();
+        let mut expected = expected(&files);
+        expected.insert("build/out.o".to_owned(), (Regular, b"o".to_vec()));
+        assert_eq!(contents(&root), expected);
+    }
+
+    #[test]
+    fn a_first_switch_removes_files_of_another_tree_and_keeps_ignored_ones() {
+        let project = Project::new();
+        let a = [
+            (".gitignore", Regular, "target/\n"),
+            ("a.txt", Regular, "a"),
+            ("old/only_in_a.txt", Regular, "a"),
+        ];
+        let b = [
+            (".gitignore", Regular, "target/\n"),
+            ("a.txt", Regular, "a"),
+        ];
+        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        project.copy().switch(&project.store, tree_a).unwrap();
+        let mut copy = project.copy();
+        create(copy.path(), "target/debug/app", "app");
+
+        // A new bisect reusing the copy: nothing tells it that the copy holds another tree.
+        let switched = copy.switch(&project.store, tree_b).unwrap();
+        assert_eq!(
+            switched,
+            Switched {
+                written: 0,
+                removed: 0,
+                restored: 0,
+                deleted: 2,
+            }
+        );
+        let mut expected = expected(&b);
+        expected.insert("target/debug/app".to_owned(), (Regular, b"app".to_vec()));
+        assert_eq!(contents(copy.path()), expected);
+    }
+
+    #[test]
+    fn the_switch_after_a_failed_one_removes_stale_files() {
+        let project = Project::new();
+        let files = [("a.txt", Regular, "a")];
+        let tree = project.tree(&files);
+        let missing = ObjectId::from_hex(b"0123456789012345678901234567890123456789").unwrap();
+        let broken = project.crafted_tree(&[
+            (
+                "a.txt",
+                EntryKind::Blob,
+                project.store.write_blob(b"a").unwrap(),
+            ),
+            (
+                "b.txt",
+                EntryKind::Blob,
+                project.store.write_blob(b"b").unwrap(),
+            ),
+            ("z.txt", EntryKind::Blob, missing),
+        ]);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        assert!(copy.switch(&project.store, broken).is_err());
+        // Written before the switch failed.
+        assert!(copy.path().join("b.txt").exists());
+        create(copy.path(), "stray.txt", "x");
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 2);
+        assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn extra_paths_are_kept_as_they_are() {
+        let project = Project::new();
+        let files = [("a.txt", Regular, "a")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.set_extra_paths(["node_modules".to_owned(), ".env".to_owned()]);
+        create(copy.path(), "node_modules/dep/index.js", "dep");
+        create(copy.path(), ".env", "KEY=value");
+        copy.switch(&project.store, tree).unwrap();
+        let mut expected = expected(&files);
+        expected.insert(
+            "node_modules/dep/index.js".to_owned(),
+            (Regular, b"dep".to_vec()),
+        );
+        expected.insert(".env".to_owned(), (Regular, b"KEY=value".to_vec()));
+        assert_eq!(contents(copy.path()), expected);
+
+        copy.set_extra_paths([]);
+        copy.switch(&project.store, tree).unwrap();
+        assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn the_projects_info_exclude_applies_in_the_copy() {
+        let project = Project::new();
+        create(
+            project.root.path(),
+            ".git/info/exclude",
+            "*.yalper-test-log\n",
+        );
+        let files = [("a.txt", Regular, "a")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        create(copy.path(), "run.yalper-test-log", "log");
+        create(copy.path(), "created.txt", "x");
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 1);
+        let mut expected = expected(&files);
+        expected.insert("run.yalper-test-log".to_owned(), (Regular, b"log".to_vec()));
+        assert_eq!(contents(copy.path()), expected);
+    }
+
+    #[test]
+    fn read_only_files_and_folders_a_test_created_are_removed() {
+        let project = Project::new();
+        let files = [("a.txt", Regular, "a")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        let locked = copy.path().join("tmp").join("locked");
+        create(copy.path(), "tmp/locked/f.txt", "x");
+        let file = locked.join("f.txt");
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 3);
+        assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn a_name_differing_only_in_case_is_kept_only_on_a_case_insensitive_file_system() {
+        let project = Project::new();
+        let files = [("README.md", Regular, "same")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        create(copy.path(), "readme.md", "same");
+        copy.switch(&project.store, tree).unwrap();
+        let names: Vec<String> = fs::read_dir(copy.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        if cfg!(any(windows, target_os = "macos")) {
+            // The known limit of a first switch: the tree's file, with its old spelling.
+            assert_eq!(names, ["readme.md"]);
+        } else {
+            assert_eq!(names, ["README.md"]);
+        }
+        assert_eq!(fs::read(copy.path().join("README.md")).unwrap(), b"same");
     }
 
     /// A Python 3 interpreter on `PATH`. Without one the test is skipped, unless `YALPER_REQUIRE_TOOLS=1`.
