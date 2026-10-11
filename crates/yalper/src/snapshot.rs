@@ -33,7 +33,7 @@ pub(crate) use excludes::{CASE_INSENSITIVE, Excludes, over_budget_reason};
 pub use scan::{
     Base, MAX_FILE_BYTES, Pending, SkipReason, Skipped, Snapshot, remember_failure, snapshot, take,
 };
-pub(crate) use scan::{is_racy, nanos_since_epoch};
+pub(crate) use scan::{MAX_DEPTH, is_racy, nanos_since_epoch};
 
 /// The shadow repository inside `.yalper/`.
 pub const SNAPSHOTS_DIR: &str = "snapshots.git";

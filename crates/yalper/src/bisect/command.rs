@@ -2,10 +2,11 @@
 //!
 //! It reads the session's snapshots ([`session_entries`]), opens the project's cache folder and takes its
 //! [`BisectLock`], and lets the engine ([`bisect`]) pick the entries to test. Each run goes through the same
-//! protections: the step's copy and dependencies from [`DependencySets::prepare`], the cache folder's root cleaned
-//! and its boundary files written, the environment of [`SetCopy::run_env`](super::SetCopy::run_env), and [`run`]
-//! with the stop flag of Ctrl-C. Nothing is written into the project: only the `meta` table of its event log
-//! records where the bisect data is.
+//! protections: the step's copy and dependencies from [`DependencySets::prepare`] (with the env files and
+//! `--with` files of [`LocalFiles`], deleted when the bisect ends), the cache folder's root cleaned and its
+//! boundary files written, the environment of [`SetCopy::run_env`](super::SetCopy::run_env), and [`run`] with the
+//! stop flag of Ctrl-C. Nothing is written into the project: only the `meta` table of its event log records
+//! where the bisect data is and which files to copy (see [`choose`]).
 //!
 //! What a test prints is never shown as is: the end of a log is shown through [`log_tail`] (secrets masked,
 //! escape sequences removed), each line prefixed, and every verdict comes from how the run ended, never from
@@ -25,9 +26,10 @@ use jiff::tz::TimeZone;
 
 use super::entries::{Entries, Entry, session_entries};
 use super::{
-    Answer, BisectLock, CACHE_DIR_KEY, CacheDir, DependencySets, End, Exit, Failure,
-    InstallFailure, Logs, Outcome, Prepared, Reason, Report, Run, SKIP_EXIT_CODE, Settings, Skip,
-    Tested, Trial, bisect, clean_root, log_tail, remove_stale, run, write_boundaries,
+    Answer, BisectLock, CACHE_DIR_KEY, CacheDir, Choice, DependencySets, End, Exit, Failure,
+    InstallFailure, LocalFiles, Logs, Outcome, Prepared, Reason, Report, Run, SKIP_EXIT_CODE,
+    Settings, Skip, Tested, Trial, Used, bisect, choose, clean_root, log_tail, remove_stale, run,
+    write_boundaries,
 };
 use crate::init::{printable, say};
 use crate::log::{NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars};
@@ -60,6 +62,9 @@ pub struct Options {
     /// `--setup`: the command that installs the dependencies of a copy.
     pub setup: Option<String>,
     pub settings: Settings,
+    /// `--with-env`, `--no-env`, `--with`, `--no-with`: the ignored files of the project to copy into the test
+    /// copies.
+    pub files: Choice,
 }
 
 /// Where the output goes.
@@ -140,6 +145,12 @@ fn command_in(
         None => &sessions[0],
     };
     let short = short_id(&session.id, id_chars);
+    let project = yalper
+        .dir
+        .path()
+        .parent()
+        .ok_or("cannot find the project folder above .yalper")?;
+    let chosen = choose(&store, project, start, &options.files)?;
     let events = store.events_without_output(&session.id).map_err(failed)?;
     let shadow = ShadowStore::open(&yalper.dir, &yalper.token)
         .map_err(|error| format!("cannot read the snapshots: {error}"))?;
@@ -163,11 +174,6 @@ fn command_in(
         return Ok(Ended::NotNamed);
     }
 
-    let project = yalper
-        .dir
-        .path()
-        .parent()
-        .ok_or("cannot find the project folder above .yalper")?;
     let cache = open_cache(project, &yalper.token).map_err(|error| error.to_string())?;
     let _lock = BisectLock::acquire(&cache).map_err(|error| {
         if error.kind() == io::ErrorKind::ResourceBusy {
@@ -196,13 +202,21 @@ fn command_in(
     write_boundaries(&cache).map_err(io_failed)?;
     let logs = Logs::open(&cache).map_err(io_failed)?;
     let existed = copies_in(&cache).map_err(io_failed)?;
+    let (local_files, warnings) = LocalFiles::new(&cache, &chosen);
+    for warning in warnings {
+        say(out, &printable(&format!("warning: {warning}")));
+    }
+    if let Some(summary) = local_files.summary() {
+        say(out, &printable(&summary));
+    }
     let sets = DependencySets::new(
         &cache,
         &store,
         options.setup.clone(),
         std::env::vars_os().collect(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_local_files(local_files);
     let candidates = entries.len() - 1;
     say(
         out,
@@ -234,12 +248,19 @@ fn command_in(
     let trees: Vec<_> = entries.iter().map(|entry| entry.tree).collect();
     let report = bisect(&trees, options.settings, |trial| tester.test(trial))
         .map_err(|error| error.to_string())?;
+    // Deleted before the result is shown, so they stay no longer than the runs need them.
+    let used = tester.sets.local_files().map(LocalFiles::used);
+    let not_deleted = tester.sets.remove_local_files();
     let history = tester.history;
     say(out, "");
     let ended = write_answer(out, &report, &entries, &history, &short);
+    for message in not_deleted {
+        say(out, &printable(&format!("warning: {message}")));
+    }
     if ended == Ended::Stopped {
         return Ok(ended);
     }
+    write_used(out, used.unwrap_or_default());
 
     if let Answer::Found { entry, .. } = report.answer {
         let (good, breaking) = (entries[entry - 1], entries[entry]);
@@ -504,6 +525,21 @@ fn write_missing(out: &mut dyn Write, missing: &[u32]) {
                 "they are"
             }
         ),
+    );
+}
+
+/// Writes a note saying that the tests used the current env files or `--with` files, if they used any: Yalper
+/// never keeps their content, so those from the time of each step are not known.
+fn write_used(out: &mut dyn Write, used: Used) {
+    let what = match (used.env, used.with) {
+        (true, true) => "your current env files and the current files given with --with",
+        (true, false) => "your current env files",
+        (false, true) => "the current files given with --with",
+        (false, false) => return,
+    };
+    say(
+        out,
+        &format!("Note: the tests used {what}, not the ones from the time of each step."),
     );
 }
 
@@ -952,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_flag_kills_the_run_and_leaves_the_project_unchanged() {
+    fn the_stop_flag_kills_the_run_deletes_the_copied_env_files_and_leaves_the_project_unchanged() {
         let project = tempfile::tempdir().unwrap();
         let markers = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -961,24 +997,30 @@ mod tests {
             &[&[("a.txt", "a")], &[("b.txt", "b")], &[("c.txt", "c")]],
         );
         write(project.path(), "src/main.rs", "fn main() {}\n");
+        write(project.path(), ".gitignore", ".env\n");
+        write(project.path(), ".env", "SECRET=stop-test-secret\n");
         let before = state(project.path());
 
         let (started, late) = (markers.path().join("started"), markers.path().join("late"));
         let test = if cfg!(windows) {
             format!(
-                "echo.>\"{}\"& ping -n 6 127.0.0.1 >nul& echo.>\"{}\"",
+                "if exist .env (echo.>\"{}\")& ping -n 6 127.0.0.1 >nul& echo.>\"{}\"",
                 started.display(),
                 late.display()
             )
         } else {
             format!(
-                "echo > '{}'; sleep 5; echo > '{}'",
+                "test -f .env && echo > '{}'; sleep 5; echo > '{}'",
                 started.display(),
                 late.display()
             )
         };
         let options = Options {
             test,
+            files: Choice {
+                env: Some(true),
+                ..Choice::default()
+            },
             ..Options::default()
         };
         let screen = Screen {
@@ -1025,7 +1067,16 @@ mod tests {
         thread::sleep(
             (started_at + Duration::from_secs(6)).saturating_duration_since(Instant::now()),
         );
+        // The run started with the env file in its copy (it writes `started` only then), which is gone.
         assert!(started.exists() && !late.exists(), "{out}");
         assert_eq!(state(project.path()), before);
+        let cached = state(cache_base.path());
+        assert!(cached.keys().any(|path| path.ends_with("copy-0/README.md")));
+        assert!(
+            !cached.keys().any(|path| path.ends_with(".env")
+                || fs::read(path)
+                    .is_ok_and(|bytes| bytes.windows(16).any(|w| w == b"stop-test-secret"))),
+            "{cached:#?}"
+        );
     }
 }

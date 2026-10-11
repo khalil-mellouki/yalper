@@ -70,11 +70,14 @@ const LOG_TAIL_BYTES: u64 = 1 << 20;
 /// Installs the handler of Ctrl-C, and also of SIGTERM and SIGHUP on Unix and of closing the console on
 /// Windows. The first one sets [`STOP`]: the run going on is stopped and its processes killed, and the bisect
 /// ends. A second one makes Yalper exit at once with [`STOPPED_EXIT_CODE`], after giving a run going on up to
-/// 1 s to kill its processes. Install it once per process.
+/// 1 s to kill its processes and deleting the env files and `--with` files copied into the test copies.
+/// Install it once per process.
 pub fn handle_ctrl_c() -> io::Result<()> {
     ctrlc::set_handler(|| {
         if pressed_before(&STOP) {
             wait_for_runs(&RUNNING, SECOND_PRESS_WAIT);
+            // Held until the exit, so nothing more is copied meanwhile.
+            let _copied = super::local_files::remove_all_copied();
             std::process::exit(STOPPED_EXIT_CODE);
         }
     })

@@ -11,6 +11,9 @@
 //! [`DependencySets`] picks the copy of each step: the one linked to the project's installed dependencies
 //! when the step's dependency files are the project's, otherwise one per dependency set, installed once.
 //!
+//! [`LocalFiles`] puts the project's env files and the other ignored files the user asked for (`--with-env`,
+//! `--with`) into the copies, and deletes them when the bisect ends.
+//!
 //! [`bisect`] is the search itself: it picks the entry to test next and its time limit, and reads what the
 //! runs say, without touching files or processes.
 
@@ -23,6 +26,7 @@ mod engine;
 mod entries;
 mod env;
 mod link;
+mod local_files;
 mod node_modules;
 mod python;
 mod run;
@@ -44,6 +48,7 @@ pub use engine::{
 pub use entries::{Entries, Entry, session_entries};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
+pub use local_files::{Choice, Chosen, LocalFiles, Used, WITH_ENV_KEY, WITH_KEY, choose};
 pub use node_modules::{Linked, NodeModules};
 pub use python::{LinkedEnvs, PythonEnvs};
 pub use run::{
