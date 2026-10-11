@@ -76,15 +76,23 @@ pub fn repository() -> tempfile::TempDir {
 }
 
 /// Runs the real `yalper` binary in `dir` with a temporary folder of its own, so the warning about a binary
-/// inside the temporary folder never shows up because of where the test build lives.
+/// inside the temporary folder never shows up because of where the test build lives, and with Yalper's cache
+/// folder in it, so the user's own is never looked at.
 pub fn yalper(dir: &Path, args: &[&str]) -> Output {
+    yalper_with_cache(dir, args, None)
+}
+
+/// [`yalper`] with `YALPER_CACHE_DIR` set to `cache` when given.
+pub fn yalper_with_cache(dir: &Path, args: &[&str], cache: Option<&Path>) -> Output {
     let temp = tempfile::tempdir().unwrap();
+    let default_cache = temp.path().join("cache");
     Command::new(EXE)
         .args(args)
         .current_dir(dir)
         .env("TMPDIR", temp.path())
         .env("TMP", temp.path())
         .env("TEMP", temp.path())
+        .env("YALPER_CACHE_DIR", cache.unwrap_or(&default_cache))
         .output()
         .unwrap()
 }

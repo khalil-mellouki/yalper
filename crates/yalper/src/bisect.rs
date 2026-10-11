@@ -20,7 +20,10 @@ mod run;
 mod testing;
 
 pub use boundary::write_boundaries;
-pub use cache::{CACHE_DIR_VAR, CacheDir, clean_root};
+pub use cache::{
+    CACHE_DIR_KEY, CACHE_DIR_VAR, CacheDir, ProjectFolder, ProjectFolders, clean_root,
+    find_project_folders, remove_stale,
+};
 pub use copy::{Switched, TestCopy};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;

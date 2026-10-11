@@ -6,10 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use common::{files, git, repository, yalper};
+use common::{files, git, repository, yalper, yalper_with_cache};
 use serde_json::{Value, json};
+use yalper::bisect::{CACHE_DIR_KEY, CacheDir};
 use yalper::hook::{YALPER_DIR, find_yalper_dir};
-use yalper::repo::{GIT_ID_FILE, ID_FILE};
+use yalper::repo::{GIT_ID_FILE, ID_FILE, read_token};
+use yalper::safe_fs::OwnedDir;
+use yalper::store::Store;
 
 fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
@@ -21,7 +24,12 @@ fn stderr(output: &Output) -> String {
 
 /// Runs `yalper` with `args`, checks that it succeeds without errors or warnings, and returns its output.
 fn run(dir: &Path, args: &[&str]) -> String {
-    let output = yalper(dir, args);
+    run_with_cache(dir, args, None)
+}
+
+/// [`run`] with Yalper's cache folder at `cache` when given (see [`yalper_with_cache`]).
+fn run_with_cache(dir: &Path, args: &[&str], cache: Option<&Path>) -> String {
+    let output = yalper_with_cache(dir, args, cache);
     assert!(output.status.success(), "{args:?}: {output:?}");
     assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
     let text = stdout(&output);
@@ -522,4 +530,210 @@ fn a_submodule_is_set_up_and_removed_in_its_own_git_dir() {
     assert!(!git_dir.join(GIT_ID_FILE).exists());
     assert!(!exclude(&git_dir).contains(".yalper/"));
     assert!(!app.path().join(YALPER_DIR).exists());
+}
+
+/// Makes the bisect data of the project at `root` (set up with `yalper init`) in Yalper's cache folder `cache`,
+/// as a bisect leaves it: a test copy whose `node_modules` links to the project's package `left-pad`, links to
+/// the folder `canary` outside, a run log and the clock. Returns the folder's path and the `meta` value a
+/// bisect records for it.
+fn bisect_data(root: &Path, cache: &Path, canary: &Path) -> (PathBuf, String) {
+    let token = read_token(&root.join(".git").join(GIT_ID_FILE)).unwrap();
+    let cache_dir = CacheDir::open_in(cache, root, &token).unwrap();
+    let path = cache_dir.path().to_owned();
+    let meta = cache_dir.meta_value();
+    // On Windows a folder held open cannot be deleted.
+    drop(cache_dir);
+
+    let copy = path.join("copy-0");
+    fs::create_dir_all(copy.join("node_modules")).unwrap();
+    fs::write(copy.join("package.json"), "{}").unwrap();
+    link_dir(
+        &root.join("node_modules").join("left-pad"),
+        &copy.join("node_modules").join("left-pad"),
+    );
+    link_dir(canary, &copy.join("outside"));
+    link_dir(canary, &path.join("outside"));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(canary.join("keep.txt"), copy.join("keep.txt")).unwrap();
+    fs::create_dir(path.join("logs")).unwrap();
+    fs::write(path.join("logs").join("run-1.log"), "passed").unwrap();
+    fs::write(path.join("clock"), "x").unwrap();
+    (path, meta)
+}
+
+/// A project set up with `yalper init` that has an installed package, and a canary folder outside it.
+fn project_with_packages() -> (tempfile::TempDir, tempfile::TempDir) {
+    let repo = repository();
+    let package = repo.path().join("node_modules").join("left-pad");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.js"), "module.exports = 1;\n").unwrap();
+    run(repo.path(), &["init"]);
+    let canary = tempfile::tempdir().unwrap();
+    fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
+    (repo, canary)
+}
+
+/// Records `meta` as the project's cache folder in the event log of the project at `root`, as a bisect does.
+fn record_cache_dir(root: &Path, meta: &str) {
+    let token = read_token(&root.join(".git").join(GIT_ID_FILE)).unwrap();
+    let dir = OwnedDir::open(&root.join(YALPER_DIR)).unwrap();
+    let store = Store::open(&dir, &token).unwrap();
+    store.set_meta(CACHE_DIR_KEY, Some(meta)).unwrap();
+}
+
+fn deleted(folder: &Path) -> String {
+    format!("  Bisect data: deleted {}\n", folder.display())
+}
+
+#[test]
+fn purge_deletes_the_bisect_data_without_following_its_links() {
+    let (repo, canary) = project_with_packages();
+    let root = repo.path();
+    let cache_base = tempfile::tempdir().unwrap();
+    let cache = cache_base.path().join("yalper");
+    let (folder, _) = bisect_data(root, &cache, canary.path());
+    let packages = files(&root.join("node_modules"));
+    let canary_files = files(canary.path());
+
+    // Plain uninstall says where the bisect data is, whether or not it changes anything.
+    let kept = format!(
+        "  Bisect data: kept in {} (`yalper uninstall --purge` deletes it)\n",
+        folder.display()
+    );
+    for _ in 0..2 {
+        let text = run_with_cache(root, &["uninstall"], Some(&cache));
+        assert!(text.contains(&kept), "{text}");
+        assert!(folder.join("copy-0").join("package.json").is_file());
+    }
+
+    let text = run_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    assert!(text.contains(&deleted(&folder)), "{text}");
+    assert!(text.contains("  .yalper/: deleted\n"), "{text}");
+    assert!(!folder.exists());
+    assert!(cache.is_dir());
+    assert_eq!(files(&root.join("node_modules")), packages);
+    assert_eq!(files(canary.path()), canary_files);
+}
+
+#[test]
+fn purge_deletes_the_recorded_folder_after_the_cache_variable_changed() {
+    let (repo, canary) = project_with_packages();
+    let root = repo.path();
+    let first = tempfile::tempdir().unwrap();
+    let (recorded, meta) = bisect_data(root, &first.path().join("yalper"), canary.path());
+    record_cache_dir(root, &meta);
+    let second = tempfile::tempdir().unwrap();
+    let cache = second.path().join("yalper");
+
+    // Only the recorded folder exists.
+    let text = run_with_cache(root, &["uninstall"], Some(&cache));
+    assert!(text.contains(&recorded.display().to_string()), "{text}");
+    let text = run_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    assert!(text.contains(&deleted(&recorded)), "{text}");
+    assert!(!recorded.exists());
+    assert_eq!(
+        fs::read_to_string(canary.path().join("keep.txt")).unwrap(),
+        "keep me"
+    );
+
+    // Both the recorded folder and the one the variable gives now.
+    let (repo, canary) = project_with_packages();
+    let root = repo.path();
+    let (recorded, meta) = bisect_data(root, &first.path().join("yalper"), canary.path());
+    record_cache_dir(root, &meta);
+    let (current, _) = bisect_data(root, &cache, canary.path());
+    let text = run_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    for folder in [&recorded, &current] {
+        assert!(text.contains(&deleted(folder)), "{text}");
+        assert!(!folder.exists());
+    }
+}
+
+#[test]
+fn a_purge_stopped_halfway_is_finished_by_running_it_again() {
+    let (repo, canary) = project_with_packages();
+    let root = repo.path();
+    let cache_base = tempfile::tempdir().unwrap();
+    let cache = cache_base.path().join("yalper");
+    let (folder, _) = bisect_data(root, &cache, canary.path());
+    // What a purge stopped by a file in use leaves: the marker (deleted last) and some entries.
+    fs::remove_dir_all(folder.join("logs")).unwrap();
+    fs::remove_file(folder.join("clock")).unwrap();
+
+    let text = run_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    assert!(text.contains(&deleted(&folder)), "{text}");
+    assert!(!folder.exists());
+    assert!(!root.join(YALPER_DIR).exists());
+    assert_eq!(
+        fs::read_to_string(canary.path().join("keep.txt")).unwrap(),
+        "keep me"
+    );
+}
+
+/// A file held open without delete sharing stops the purge before `.yalper/` is deleted; once it is closed,
+/// running the purge again finishes it.
+#[cfg(windows)]
+#[test]
+fn a_file_in_use_stops_the_purge_until_it_is_closed() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    let (repo, canary) = project_with_packages();
+    let root = repo.path();
+    let cache_base = tempfile::tempdir().unwrap();
+    let cache = cache_base.path().join("yalper");
+    let (folder, _) = bisect_data(root, &cache, canary.path());
+    let held = fs::File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(folder.join("logs").join("run-1.log"))
+        .unwrap();
+
+    let output = yalper_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let message = stderr(&output);
+    assert!(
+        message.contains("cannot delete the bisect data"),
+        "{message}"
+    );
+    assert!(message.contains("--purge` again"), "{message}");
+    assert!(folder.join("project").is_file());
+    assert!(root.join(YALPER_DIR).join(ID_FILE).is_file());
+
+    drop(held);
+    let text = run_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    assert!(text.contains(&deleted(&folder)), "{text}");
+    assert!(text.contains("  .yalper/: deleted"), "{text}");
+    assert!(!folder.exists());
+    assert_eq!(
+        fs::read_to_string(canary.path().join("keep.txt")).unwrap(),
+        "keep me"
+    );
+}
+
+#[test]
+fn a_cache_folder_with_a_wrong_marker_is_kept_and_the_rest_is_purged() {
+    let (repo, canary) = project_with_packages();
+    let root = repo.path();
+    let cache_base = tempfile::tempdir().unwrap();
+    let cache = cache_base.path().join("yalper");
+    let (folder, _) = bisect_data(root, &cache, canary.path());
+    let marker = folder.join("project");
+    let text = fs::read_to_string(&marker).unwrap();
+    fs::write(&marker, text.replace("digest ", "digest 0")).unwrap();
+
+    // Not the project's: plain uninstall does not name it.
+    let text = run_with_cache(root, &["uninstall"], Some(&cache));
+    assert!(!text.contains("Bisect data"), "{text}");
+    let text = run_with_cache(root, &["uninstall", "--purge"], Some(&cache));
+    assert!(
+        text.contains(&format!(
+            "  Bisect data: kept {} (it was not created by Yalper for this project;",
+            folder.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("  .yalper/: deleted\n"), "{text}");
+    assert!(!root.join(YALPER_DIR).exists());
+    assert!(folder.join("copy-0").join("package.json").is_file());
+    assert!(folder.join("logs").join("run-1.log").is_file());
 }

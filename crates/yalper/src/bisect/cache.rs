@@ -19,25 +19,37 @@
 //! when the project's folder would be the project, inside it, or hold it (a project that is the home folder),
 //! and on Windows when it would be on a network share or a mapped network drive (junctions to the project cannot
 //! be made there, and copies and builds would be slow).
+//!
+//! The folder is deleted by `yalper uninstall --purge` (see [`find_project_folders`]) and, once its project is
+//! gone, by the next bisect of any project (see [`remove_stale`]).
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use super::boundary;
 use super::copy::{CARGO_TARGET_DIR, CLOCK_FILE, PYCACHE_DIR, open_private_dir, remove_entry};
 use super::link::{has_special_prefix, is_under, normalize, plain};
 use super::run::LOGS_DIR;
-use crate::repo::Token;
+use crate::hook::YALPER_DIR;
+use crate::repo::{self, Token};
 use crate::safe_fs::{self, OwnedDir};
 use crate::snapshot::CASE_INSENSITIVE;
 
 /// The variable that names Yalper's cache folder, in place of `<cache>/yalper/`.
 pub const CACHE_DIR_VAR: &str = "YALPER_CACHE_DIR";
 
+/// The `meta` key of the event log that records the project's cache folder: see [`CacheDir::meta_value`].
+pub const CACHE_DIR_KEY: &str = "bisect.cache_dir";
+
 /// The marker at the top of a project's folder: see [`CacheDir`].
 const MARKER_FILE: &str = "project";
+
+/// How long the folder of a project that is gone stays after its last use: the folder of a project on a drive
+/// that is not plugged in is kept that long.
+const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The lock that lets one bisect of a project run at a time. Like `clock`, it must never be written through an
 /// existing file at its name (remove it and create it with `create_new` instead): on Windows a hard link a test
@@ -243,6 +255,16 @@ impl CacheDir {
         &self.instance
     }
 
+    /// The value of [`CACHE_DIR_KEY`] for this folder, a JSON object with its `path` and `instance` id: with
+    /// it, `yalper uninstall --purge` finds the folder after the variables that place it changed.
+    pub fn meta_value(&self) -> String {
+        serde_json::json!({
+            "path": self.path().to_string_lossy(),
+            "instance": self.instance,
+        })
+        .to_string()
+    }
+
     /// The project folder, as given to [`open`](Self::open).
     pub fn project(&self) -> &Path {
         &self.project
@@ -308,6 +330,273 @@ pub fn clean_root(cache: &CacheDir) -> io::Result<usize> {
         }
     }
     Ok(removed)
+}
+
+/// A cache folder of a project, held open, found by [`find_project_folders`].
+#[derive(Debug)]
+pub struct ProjectFolder(OwnedDir);
+
+impl ProjectFolder {
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    /// Deletes the folder and everything in it, never following a link (see [`delete_folder`]).
+    pub fn delete(self) -> io::Result<()> {
+        delete_folder(self.0)
+    }
+}
+
+/// What [`find_project_folders`] found.
+#[derive(Debug, Default)]
+pub struct ProjectFolders {
+    /// The project's folders.
+    pub ours: Vec<ProjectFolder>,
+    /// Folders where the project's would be that are not the project's (they are never deleted), with the
+    /// reason.
+    pub others: Vec<(PathBuf, String)>,
+    /// Why the place of the project's folder could not be computed from the variables, when no folder was
+    /// recorded either.
+    pub unknown: Option<String>,
+}
+
+/// Looks for the cache folders of the project at `project`, whose init token is `token`: the one recorded in
+/// `recorded` (the [`CACHE_DIR_KEY`] value of its event log, if any) and the one the variables give now (see
+/// the module documentation), when they differ. A folder is the project's when its marker has the project's
+/// digest, or the recorded instance id for the recorded folder (a project moved since), or when it is empty (a
+/// creation or deletion was interrupted). Nothing is changed, no link is followed, and a network path is never
+/// looked up.
+pub fn find_project_folders(
+    project: &Path,
+    token: &Token,
+    recorded: Option<&str>,
+) -> ProjectFolders {
+    let folder = yalper_folder(System::current(), &Vars::current());
+    find_in(folder, project, token, recorded)
+}
+
+/// [`find_project_folders`] with `folder` as Yalper's cache folder.
+fn find_in(
+    folder: io::Result<PathBuf>,
+    project: &Path,
+    token: &Token,
+    recorded: Option<&str>,
+) -> ProjectFolders {
+    let mut found = ProjectFolders::default();
+    let named = fs::canonicalize(project).and_then(|real| folder_name(&plain(&real), token));
+    let digest = named.as_ref().ok().map(|(_, digest)| digest.as_str());
+
+    // Each place, with the instance id its marker may hold instead of the project's digest.
+    let mut places = Vec::new();
+    if let Some((path, instance)) = recorded.and_then(parse_meta_value) {
+        places.push((path, Some(instance)));
+    }
+    match (folder, &named) {
+        (Ok(folder), Ok((name, _))) => places.push((folder.join(name), None)),
+        (Err(error), _) if places.is_empty() => found.unknown = Some(error.to_string()),
+        (_, Err(error)) if places.is_empty() => found.unknown = Some(error.to_string()),
+        _ => {}
+    }
+
+    let mut seen = Vec::new();
+    for (path, instance) in places {
+        // The same folder spelled twice (through a link above it, or in another case) is looked at once.
+        let key = resolve(&path).ok().map(|resolved| {
+            let text = resolved.to_string_lossy().into_owned();
+            if CASE_INSENSITIVE {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        });
+        if key.is_some() && seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let accept = |found: &str, found_instance: &str| {
+            Some(found) == digest || instance.as_deref() == Some(found_instance)
+        };
+        match look(&path, accept) {
+            Look::Missing => {}
+            Look::Ours(dir) => found.ours.push(ProjectFolder(dir)),
+            Look::Other(why) => found.others.push((path, why)),
+        }
+    }
+    found
+}
+
+/// The path and instance id recorded in a [`CACHE_DIR_KEY`] value (see [`CacheDir::meta_value`]).
+fn parse_meta_value(value: &str) -> Option<(PathBuf, String)> {
+    let value: serde_json::Value = serde_json::from_str(value).ok()?;
+    let path = PathBuf::from(value.get("path")?.as_str()?);
+    let instance = Token::parse(value.get("instance")?.as_str()?)?;
+    path.is_absolute()
+        .then(|| (path, instance.as_str().to_owned()))
+}
+
+/// What is at the place of a project's cache folder.
+enum Look {
+    Missing,
+    Ours(OwnedDir),
+    Other(String),
+}
+
+/// Looks at `path`, the place of a project's cache folder, without following a link: it is the project's when
+/// it is a real folder in a real folder and is empty, or its marker's digest and instance id pass `accept`.
+fn look(path: &Path, accept: impl Fn(&str, &str) -> bool) -> Look {
+    // Checked before any lookup, so that a network path is never reached.
+    if has_special_prefix(&plain(path)) {
+        return Look::Other("it is on a network share, which Yalper does not look at".to_owned());
+    }
+    for dir in [path.parent().unwrap_or(path), path] {
+        match fs::symlink_metadata(dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Look::Missing,
+            Err(error) => return Look::Other(format!("cannot read {}: {error}", dir.display())),
+            Ok(metadata) if !metadata.is_dir() => {
+                return Look::Other(format!(
+                    "{} is a link or a file, not a folder",
+                    dir.display()
+                ));
+            }
+            Ok(_) => {}
+        }
+    }
+    let dir = match OwnedDir::open(path) {
+        Ok(dir) => dir,
+        Err(error) => return Look::Other(error.to_string()),
+    };
+    match fs::read_dir(path).map(|mut entries| entries.next().is_none()) {
+        Ok(true) => return Look::Ours(dir),
+        Ok(false) => {}
+        Err(error) => return Look::Other(format!("cannot read it: {error}")),
+    }
+    let marker = safe_fs::read_small_regular_file(&path.join(MARKER_FILE), MAX_MARKER_BYTES)
+        .and_then(|bytes| parse_marker(&bytes));
+    match marker {
+        Some((digest, instance)) if accept(&digest, &instance) => Look::Ours(dir),
+        _ => Look::Other("it was not created by Yalper for this project".to_owned()),
+    }
+}
+
+/// Deletes the project's cache folder `dir` without following any link inside it (a link is removed, never
+/// what it points to: the test copies link to the project's dependencies). The folder is checked to still be
+/// at its path first (see [`OwnedDir::check_still_at_path`]). Its marker goes last: if a file in use stops the
+/// deletion halfway (Windows), the folder still says whose it is, so running the deletion again finishes it.
+fn delete_folder(dir: OwnedDir) -> io::Result<()> {
+    dir.check_still_at_path()?;
+    let path = dir.path().to_owned();
+    for entry in fs::read_dir(&path)? {
+        let entry = entry?;
+        if entry.file_name() != MARKER_FILE {
+            let entry = entry.path();
+            remove_entry(&entry, &fs::symlink_metadata(&entry)?)?;
+        }
+    }
+    let marker = path.join(MARKER_FILE);
+    match fs::symlink_metadata(&marker).and_then(|metadata| remove_entry(&marker, &metadata)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    // On Windows the held handle stops the folder itself from being deleted.
+    drop(dir);
+    fs::remove_dir(&path)
+}
+
+/// Deletes the folders next to `current` in Yalper's cache folder that projects no longer use: the marker
+/// names a project that is gone, or that no longer gives the folder its name (moved, purged, set up again with
+/// `yalper init`), and the folder was last used (its `clock`, else its marker, last changed) more than 7 days
+/// ago. Folders without a valid marker, links, and `current` are never touched; nothing is ever followed out of
+/// Yalper's cache folder, and a project on a network share is never looked up. Returns the deleted folders.
+///
+/// Call it when a bisect starts: it lists one folder and reads a small marker in each entry, and looks at a
+/// project only for a folder unused for 7 days. A folder that cannot be checked or deleted is kept.
+pub fn remove_stale(current: &CacheDir) -> Vec<PathBuf> {
+    let (Some(folder), Some(own)) = (current.path().parent(), current.path().file_name()) else {
+        return Vec::new();
+    };
+    if !fs::symlink_metadata(folder).is_ok_and(|metadata| metadata.is_dir()) {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let now = SystemTime::now();
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == own || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if name.to_str().is_some_and(|name| is_stale(&path, name, now))
+            && let Ok(dir) = OwnedDir::open(&path)
+            && delete_folder(dir).is_ok()
+        {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
+/// Whether the folder `name` at `path` in Yalper's cache folder is stale at `now` (see [`remove_stale`]).
+fn is_stale(path: &Path, name: &str, now: SystemTime) -> bool {
+    let Some(text) = safe_fs::read_small_regular_file(&path.join(MARKER_FILE), MAX_MARKER_BYTES)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return false;
+    };
+    let Some((digest, _)) = parse_marker(text.as_bytes()) else {
+        return false;
+    };
+    // A marker copied from another folder does not make this one Yalper's.
+    if !digest
+        .get(..ID_HEX_DIGITS)
+        .is_some_and(|id| name.ends_with(&format!("-{id}")))
+    {
+        return false;
+    }
+    // A path that was not valid Unicode was written with replacement characters: it cannot be looked up.
+    let Some(project) = marker_value(&text, "project ").filter(|path| !path.contains('\u{FFFD}'))
+    else {
+        return false;
+    };
+    let last_use = [CLOCK_FILE, MARKER_FILE].into_iter().find_map(|file| {
+        fs::symlink_metadata(path.join(file))
+            .ok()
+            .filter(fs::Metadata::is_file)
+            .and_then(|metadata| metadata.modified().ok())
+    });
+    let unused = last_use.is_some_and(|last_use| {
+        now.duration_since(last_use)
+            .is_ok_and(|age| age > STALE_AFTER)
+    });
+    unused && gives_name(Path::new(&project), name) == Some(false)
+}
+
+/// Whether the project at `project` (canonical, as a marker holds it) gives its cache folder the name `name`
+/// now. `Some(false)` when it is gone, has no `.yalper/` or no init token, or its token or path give another
+/// name; `None` when that cannot be told (a network path, which is never looked up, or an error reading it).
+fn gives_name(project: &Path, name: &str) -> Option<bool> {
+    if !project.is_absolute() || has_special_prefix(project) {
+        return None;
+    }
+    let real = match fs::canonicalize(project) {
+        Ok(real) => plain(&real),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    let yalper = real.join(YALPER_DIR);
+    match fs::symlink_metadata(&yalper) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+        Ok(_) => {}
+    }
+    let dir = OwnedDir::open(&yalper).ok()?;
+    let Some(token) = repo::init_token(&real, &dir) else {
+        return Some(false);
+    };
+    let (now, _) = folder_name(&real, &token).ok()?;
+    Some(now == name)
 }
 
 fn refusal(message: String) -> io::Error {
@@ -626,14 +915,14 @@ fn read_marker(path: &Path) -> io::Result<Marker> {
 /// The digest and the instance id of a marker: the first lines starting with `digest ` and `instance `.
 fn parse_marker(bytes: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(bytes).ok()?;
-    let value = |key: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(key))
-            .map(str::to_owned)
-    };
-    let digest = value("digest ")?;
-    let instance = Token::parse(&value("instance ")?)?;
-    Some((digest, instance.as_str().to_owned()))
+    let digest = marker_value(text, "digest ")?;
+    let instance = Token::parse(marker_value(text, "instance ")?)?;
+    Some((digest.to_owned(), instance.as_str().to_owned()))
+}
+
+/// The rest of the first line of the marker `text` that starts with `key`.
+fn marker_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| line.strip_prefix(key))
 }
 
 #[cfg(test)]
@@ -1176,5 +1465,236 @@ mod tests {
         assert!(root.join("copy-0").join("a.txt").is_file());
         assert_eq!(state(canary.path()), before);
         assert_eq!(clean_root(&project.cache).unwrap(), 0);
+    }
+
+    /// A project set up as `yalper init` leaves it (only its init token files matter here) with `token`.
+    fn set_up(token: &Token) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir(root.path().join(YALPER_DIR)).unwrap();
+        set_token(root.path(), token);
+        root
+    }
+
+    fn set_token(root: &Path, token: &Token) {
+        fs::write(root.join(".git").join(repo::GIT_ID_FILE), token.as_str()).unwrap();
+        fs::write(root.join(YALPER_DIR).join(repo::ID_FILE), token.as_str()).unwrap();
+    }
+
+    /// The cache folder of the project at `root` in Yalper's cache folder `folder`, created and closed (on
+    /// Windows a folder held open cannot be deleted).
+    fn cache_of(folder: &Path, root: &Path, token: &Token) -> PathBuf {
+        CacheDir::open_in(folder, root, token)
+            .unwrap()
+            .path()
+            .to_owned()
+    }
+
+    /// Makes the file at `path` look last changed `days` ago.
+    fn last_changed(path: &Path, days: u64) {
+        let then = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    #[test]
+    fn folders_of_projects_that_are_gone_are_deleted_after_7_days_unused() {
+        let (_base, folder) = base();
+        let canary = tempfile::tempdir().unwrap();
+        write(canary.path(), "keep.txt", "keep me");
+        let before = state(canary.path());
+        let old = |cache: &Path| last_changed(&cache.join(MARKER_FILE), 8);
+
+        // A deleted project, last used 8 days ago, whose folder links to a canary outside.
+        let deleted = set_up(&token('b'));
+        let deleted_cache = cache_of(&folder, deleted.path(), &token('b'));
+        write(&deleted_cache, CLOCK_FILE, "x");
+        last_changed(&deleted_cache.join(CLOCK_FILE), 8);
+        old(&deleted_cache);
+        make_link(canary.path(), &deleted_cache.join("copy-0")).unwrap();
+        drop(deleted);
+
+        // A project set up again with `yalper init` (a new token): its old folder, with no clock, was created
+        // 8 days ago.
+        let again = set_up(&token('c'));
+        let again_cache = cache_of(&folder, again.path(), &token('c'));
+        old(&again_cache);
+        set_token(again.path(), &token('d'));
+
+        // A deleted project used a day ago.
+        let recent = set_up(&token('e'));
+        let recent_cache = cache_of(&folder, recent.path(), &token('e'));
+        write(&recent_cache, CLOCK_FILE, "x");
+        last_changed(&recent_cache.join(CLOCK_FILE), 1);
+        old(&recent_cache);
+        drop(recent);
+
+        // A project still there, unused for 8 days.
+        let kept = set_up(&token('f'));
+        let kept_cache = cache_of(&folder, kept.path(), &token('f'));
+        old(&kept_cache);
+
+        // A folder without a marker, and one whose marker was copied from another folder.
+        let unmarked = folder.join("unmarked-0123456789ab");
+        write(&unmarked, "copy-0/a.txt", "");
+        write(&unmarked, CLOCK_FILE, "x");
+        last_changed(&unmarked.join(CLOCK_FILE), 8);
+        let copied = folder.join("copied-0123456789ab");
+        fs::create_dir(&copied).unwrap();
+        fs::copy(again_cache.join(MARKER_FILE), copied.join(MARKER_FILE)).unwrap();
+        old(&copied);
+
+        // A link in Yalper's cache folder to the stale folder of a deleted project elsewhere.
+        let (_elsewhere, other_folder) = base();
+        let linked = set_up(&token('9'));
+        let linked_cache = cache_of(&other_folder, linked.path(), &token('9'));
+        old(&linked_cache);
+        drop(linked);
+        let link = folder.join(linked_cache.file_name().unwrap());
+        make_link(&linked_cache, &link).unwrap();
+        let linked_before = state(&linked_cache);
+
+        // The current project's folder, as old as the others, after its `.yalper/` was deleted.
+        let current_project = set_up(&token('a'));
+        let current = CacheDir::open_in(&folder, current_project.path(), &token('a')).unwrap();
+        old(current.path());
+        fs::remove_dir_all(current_project.path().join(YALPER_DIR)).unwrap();
+
+        let mut removed = remove_stale(&current);
+        removed.sort();
+        let mut expected = vec![deleted_cache, again_cache];
+        expected.sort();
+        assert_eq!(removed, expected);
+        for gone in &expected {
+            assert!(!gone.exists(), "{}", gone.display());
+        }
+        for left in [&recent_cache, &kept_cache, &unmarked, &copied] {
+            assert!(left.join(MARKER_FILE).exists() || left == &unmarked);
+            assert!(left.is_dir(), "{}", left.display());
+        }
+        assert!(current.path().join(MARKER_FILE).is_file());
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(state(&linked_cache), linked_before);
+        assert_eq!(state(canary.path()), before);
+        assert!(remove_stale(&current).is_empty());
+    }
+
+    #[test]
+    fn the_recorded_folder_and_the_computed_one_are_found_once_each() {
+        let (_base, folder) = base();
+        let project = set_up(&token('a'));
+        let found = |recorded: Option<&str>| {
+            find_in(Ok(folder.clone()), project.path(), &token('a'), recorded)
+        };
+        assert!(found(None).ours.is_empty());
+        assert!(found(None).others.is_empty());
+
+        let cache = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+        let (path, meta) = (cache.path().to_owned(), cache.meta_value());
+        drop(cache);
+        let paths = |found: ProjectFolders| -> Vec<PathBuf> {
+            found.ours.iter().map(|f| f.path().to_owned()).collect()
+        };
+        assert_eq!(paths(found(None)), [path.as_path()]);
+        // Recorded where the variables put it too: the same folder, once.
+        assert_eq!(paths(found(Some(&meta))), [path.as_path()]);
+        // Recorded in another cache folder, with the variables now giving none.
+        let other = find_in(
+            Err(io::Error::other("no home")),
+            project.path(),
+            &token('a'),
+            Some(&meta),
+        );
+        assert_eq!(paths(other), [path.as_path()]);
+        let unknown = find_in(
+            Err(io::Error::other("no home")),
+            project.path(),
+            &token('a'),
+            None,
+        );
+        assert_eq!(unknown.unknown.as_deref(), Some("no home"));
+        // Values a bisect never writes are ignored.
+        for bad in ["", "{}", r#"{"path": "relative", "instance": "x"}"#, "[1]"] {
+            assert!(parse_meta_value(bad).is_none(), "{bad}");
+        }
+        assert_eq!(parse_meta_value(&meta).unwrap().0, path);
+    }
+
+    #[test]
+    fn a_moved_project_finds_its_recorded_folder_by_its_instance_id() {
+        let (_base, folder) = base();
+        let parent = tempfile::tempdir().unwrap();
+        let project = set_up(&token('a'));
+        let first = parent.path().join("first");
+        fs::rename(project.path(), &first).unwrap();
+        let cache = CacheDir::open_in(&folder, &first, &token('a')).unwrap();
+        let (path, meta) = (cache.path().to_owned(), cache.meta_value());
+        drop(cache);
+        let moved = parent.path().join("moved");
+        fs::rename(&first, &moved).unwrap();
+
+        let found = find_in(Ok(folder.clone()), &moved, &token('a'), Some(&meta));
+        assert_eq!(found.ours.len(), 1);
+        assert_eq!(found.ours[0].path(), path);
+        // Without the record, the folder's marker names another path: it is not this project's.
+        assert!(
+            find_in(Ok(folder), &moved, &token('a'), None)
+                .ours
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_empty_folder_is_the_projects_and_a_link_or_foreign_folder_is_not() {
+        let (_base, folder) = base();
+        let project = set_up(&token('a'));
+        let path = cache_of(&folder, project.path(), &token('a'));
+        let found = || find_in(Ok(folder.clone()), project.path(), &token('a'), None);
+
+        // What an interrupted deletion leaves once the marker is gone.
+        fs::remove_file(path.join(MARKER_FILE)).unwrap();
+        let empty = found();
+        assert_eq!(empty.ours.len(), 1);
+        empty.ours.into_iter().next().unwrap().delete().unwrap();
+        assert!(!path.exists());
+
+        // A link at its place is never followed.
+        let canary = tempfile::tempdir().unwrap();
+        write(canary.path(), "project", "digest x\n");
+        make_link(canary.path(), &path).unwrap();
+        let linked = found();
+        assert!(linked.ours.is_empty());
+        assert!(linked.others[0].1.contains("link"), "{:?}", linked.others);
+        remove_entry(&path, &fs::symlink_metadata(&path).unwrap()).unwrap();
+        assert!(canary.path().join("project").is_file());
+
+        // A folder with something in it and no marker.
+        write(&path, "a.txt", "");
+        let foreign = found();
+        assert!(foreign.ours.is_empty());
+        assert!(foreign.others[0].1.contains("not created by Yalper"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_recorded_folder_on_a_network_share_is_never_looked_up() {
+        let project = set_up(&token('a'));
+        let meta = serde_json::json!({
+            "path": r"\\server\share\yalper\x-0123456789ab",
+            "instance": "a".repeat(32),
+        })
+        .to_string();
+        let found = find_in(
+            Err(io::Error::other("no home")),
+            project.path(),
+            &token('a'),
+            Some(&meta),
+        );
+        assert!(found.ours.is_empty());
+        assert!(found.others[0].1.contains("network"), "{:?}", found.others);
     }
 }
