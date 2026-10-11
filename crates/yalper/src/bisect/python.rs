@@ -51,6 +51,15 @@ const ENV_NAMES: [&str; 2] = [".venv", "venv"];
 /// The most bytes read of one `.pth` or finder file. Real ones hold a few lines.
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 
+/// The most `.pth` and finder files read in one environment. A large environment has a few dozen.
+const MAX_FILES_READ: usize = 1000;
+
+/// The most bytes read in one environment, all `.pth` and finder files together.
+const MAX_ENV_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most editable install folders kept for one environment. A large monorepo has a few dozen.
+const MAX_ROOTS: usize = 256;
+
 /// The links of one test copy to the project's Python virtual environments (the copy that reuses the
 /// project's installed dependencies).
 pub struct PythonEnvs {
@@ -193,6 +202,7 @@ impl PythonEnvs {
     pub fn python_path(&self, copy: &TestCopy) -> io::Result<Vec<PathBuf>> {
         let root = plain(&std::path::absolute(copy.path())?);
         let mut paths = Vec::new();
+        let mut seen = HashSet::new();
         for link in &self.links {
             for relative in self.found.get(link).into_iter().flatten().flatten() {
                 let path = if relative.as_os_str().is_empty() {
@@ -200,7 +210,7 @@ impl PythonEnvs {
                 } else {
                     root.join(relative)
                 };
-                if !paths.contains(&path) {
+                if seen.insert(path.clone()) {
                     paths.push(path);
                 }
             }
@@ -253,9 +263,14 @@ impl PythonEnvs {
 
     /// The folders of the editable installs of the environment `env`, relative to the project: the paths of
     /// its `*.pth` files and setuptools finders that lead into the project, outside the environment itself.
+    /// A hostile environment cannot make this slow: at most [`MAX_FILES_READ`] files and [`MAX_ENV_BYTES`]
+    /// bytes are read and [`MAX_ROOTS`] folders kept, and what is over a limit is left out.
     fn editable_roots(&self, env: &str) -> io::Result<Vec<PathBuf>> {
         let env_paths = [native(&self.project, env), native(&self.project_real, env)];
         let mut roots = Vec::new();
+        let mut seen = HashSet::new();
+        let mut files_read = 0;
+        let mut bytes_left = MAX_ENV_BYTES;
         for site in site_packages(&native(&self.project, env))? {
             let mut pth = Vec::new();
             let mut finders = Vec::new();
@@ -271,35 +286,53 @@ impl PythonEnvs {
                     finders.push((name.to_owned(), path));
                 }
             }
-            // In the order Python reads them.
+            // In the order Python reads them: `.pth` files first, by name, then the finders they install.
             pth.sort_unstable();
             finders.sort_unstable();
-            let mut found = Vec::new();
-            for (_, path) in &pth {
-                if let Some(bytes) = safe_fs::read_small_regular_file(path, MAX_READ_BYTES) {
-                    found.extend(pth_paths(&bytes).into_iter().map(|line| site.join(line)));
+            let files = pth
+                .iter()
+                .map(|(_, path)| (path, false))
+                .chain(finders.iter().map(|(_, path)| (path, true)));
+            for (path, is_finder) in files {
+                if files_read == MAX_FILES_READ || bytes_left == 0 || roots.len() == MAX_ROOTS {
+                    return Ok(roots);
                 }
-            }
-            for (_, path) in &finders {
-                if let Some(bytes) = safe_fs::read_small_regular_file(path, MAX_READ_BYTES) {
-                    let text = String::from_utf8_lossy(&bytes);
-                    for value in mapping_values(&text) {
-                        // A package folder or a module file: the folder that holds it is the root.
-                        if let Some(parent) = normalize(&site.join(value)).parent() {
-                            found.push(parent.to_owned());
+                files_read += 1;
+                let Some(bytes) =
+                    safe_fs::read_small_regular_file(path, MAX_READ_BYTES.min(bytes_left))
+                else {
+                    continue;
+                };
+                bytes_left -= bytes.len() as u64;
+                let found: Vec<PathBuf> = if is_finder {
+                    // A package folder or a module file: the folder that holds it is the root.
+                    mapping_values(&String::from_utf8_lossy(&bytes))
+                        .into_iter()
+                        .filter_map(|value| {
+                            normalize(&site.join(value)).parent().map(Path::to_owned)
+                        })
+                        .collect()
+                } else {
+                    pth_paths(&bytes)
+                        .into_iter()
+                        .map(|line| site.join(line))
+                        .collect()
+                };
+                for path in found {
+                    let path = normalize(&plain(&path));
+                    if has_special_prefix(&path) || env_paths.iter().any(|env| is_under(&path, env))
+                    {
+                        continue;
+                    }
+                    if let Some(relative) = self.relative(&path)
+                        && is_plain_entry(&relative)
+                        && seen.insert(relative.clone())
+                    {
+                        roots.push(relative);
+                        if roots.len() == MAX_ROOTS {
+                            return Ok(roots);
                         }
                     }
-                }
-            }
-            for path in found {
-                let path = normalize(&plain(&path));
-                if has_special_prefix(&path) || env_paths.iter().any(|env| is_under(&path, env)) {
-                    continue;
-                }
-                if let Some(relative) = self.relative(&path)
-                    && !roots.contains(&relative)
-                {
-                    roots.push(relative);
                 }
             }
         }
@@ -314,6 +347,18 @@ impl PythonEnvs {
             .find(|root| is_under(path, root))
             .map(|root| path.components().skip(root.components().count()).collect())
     }
+}
+
+/// Whether `relative`, an editable folder relative to the project, can be put in `PYTHONPATH` as one entry
+/// that stays inside the copy: its text has no path list separator (`;` on Windows, `:` on Unix), which
+/// would split it into entries that could lead elsewhere, no `"`, and no control character such as NUL.
+fn is_plain_entry(relative: &Path) -> bool {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    relative.to_str().is_some_and(|text| {
+        !text
+            .chars()
+            .any(|c| c == separator || c == '"' || c.is_control())
+    })
 }
 
 /// Whether `name` is the name of a Python manifest: `pyproject.toml`, `setup.py` or `requirements*.txt`,
@@ -895,6 +940,88 @@ mod tests {
             .unwrap();
         envs.link(&mut copy).unwrap();
         assert!(envs.python_path(&copy).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_huge_pth_file_is_read_up_to_the_limits() {
+        let project = with_env();
+        let site = site(".venv");
+        // A `.pth` file of 1 MiB with tens of thousands of different folders inside the project.
+        let envs_of = |project: &Project| PythonEnvs::new(project.path()).unwrap();
+        let mut huge = String::new();
+        let mut index = 0;
+        while huge.len() < MAX_READ_BYTES as usize - 100 {
+            huge.push_str(&format!(
+                "{}\n",
+                project.path().join(format!("r{index}")).display()
+            ));
+            index += 1;
+        }
+        assert!(index > 10 * MAX_ROOTS);
+        project.write(&format!("{site}/huge.pth"), &huge);
+        let started = std::time::Instant::now();
+        let mut copy = project.copy();
+        let mut envs = envs(&project);
+        copy.switch(&project.store, project.tree(&STEP)).unwrap();
+        envs.link(&mut copy).unwrap();
+        let paths = envs.python_path(&copy).unwrap();
+        assert_eq!(paths.len(), MAX_ROOTS);
+        assert_eq!(paths[0], copy.path().join("r0"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // Past the number of files or the bytes read, nothing more is read: `zz.pth` is left out.
+        let many_files = with_env();
+        for file in 0..MAX_FILES_READ {
+            many_files.write(
+                &format!("{site}/a{file:05}.pth"),
+                "# nothing
+",
+            );
+        }
+        let many_bytes = with_env();
+        let comment = format!(
+            "#{}
+",
+            "x".repeat(MAX_READ_BYTES as usize - 2)
+        );
+        for file in 0..MAX_ENV_BYTES / MAX_READ_BYTES {
+            many_bytes.write(&format!("{site}/a{file}.pth"), &comment);
+        }
+        for project in [&many_files, &many_bytes] {
+            project.write(
+                &format!("{site}/zz.pth"),
+                &format!(
+                    "{}
+",
+                    project.path().join("late").display()
+                ),
+            );
+            assert!(envs_of(project).editable_roots(".venv").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_folder_that_would_not_be_one_pythonpath_entry_is_left_out() {
+        let project = with_env();
+        let site = site(".venv");
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let p = |name: &str| project.path().join(name).display().to_string();
+        let pth = [
+            p(&format!("a{separator}b")),
+            p("quote\"d"),
+            p("tab\there"),
+            p("kept"),
+        ]
+        .join("\n");
+        project.write(&format!("{site}/a.pth"), &pth);
+        let mut copy = project.copy();
+        let mut envs = envs(&project);
+        copy.switch(&project.store, project.tree(&STEP)).unwrap();
+        envs.link(&mut copy).unwrap();
+        let root = plain(&std::path::absolute(copy.path()).unwrap());
+        assert_eq!(envs.python_path(&copy).unwrap(), [root.join("kept")]);
+        assert!(!is_plain_entry(Path::new("nul\0byte")));
+        assert!(is_plain_entry(Path::new("src")));
     }
 
     #[test]

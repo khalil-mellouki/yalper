@@ -7,9 +7,10 @@
 //!   (Python 3.8 and later), so none is written into the project's virtual environment through the copy's
 //!   link to it;
 //! - `UV_NO_SYNC=1` stops `uv run` from syncing, and so writing into, that environment;
-//! - `CARGO_TARGET_DIR` is `.yalper/bisect/cargo-target/`, one folder shared by every copy and every bisect:
-//!   the project's `target/` is never used, and cargo's own fingerprints decide what to rebuild. The first
-//!   bisect of a Rust project compiles its dependencies there once.
+//! - `CARGO_TARGET_DIR` is the copy's folder `.yalper/bisect/cargo-target/copy-<n>/`, reused by every step and
+//!   every bisect of that copy: the project's `target/` is never used, and cargo's own fingerprints decide
+//!   what to rebuild. The first bisect of a Rust project compiles its dependencies there once per copy (see
+//!   [`TestCopy::cargo_target_path`] for why copies do not share one).
 
 use std::ffi::OsString;
 use std::fs;
@@ -19,9 +20,6 @@ use std::path::{Path, PathBuf};
 use super::copy::remove_entry;
 use super::link::plain;
 use super::{PythonEnvs, TestCopy};
-
-/// The folder in `.yalper/bisect/` where cargo builds the tests of every copy.
-const CARGO_TARGET_DIR: &str = "cargo-target";
 
 /// What the environment of a test run adds to the user's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,13 +36,14 @@ pub struct EnvAdditions {
 pub fn env_additions(copy: &TestCopy, python: &PythonEnvs) -> io::Result<EnvAdditions> {
     copy.bisect_dir().check_still_at_path()?;
     let pycache = plain(&std::path::absolute(copy.pycache_path())?);
-    let bisect = plain(&std::path::absolute(copy.bisect_dir().path())?);
-    let cargo_target = bisect.join(CARGO_TARGET_DIR);
-    if let Some(parent) = pycache.parent() {
-        make_real_dir(parent)?;
+    let cargo_target = plain(&std::path::absolute(copy.cargo_target_path())?);
+    for folder in [&pycache, &cargo_target] {
+        // `.yalper/bisect/pycache/` or `.yalper/bisect/cargo-target/` first.
+        if let Some(parent) = folder.parent() {
+            make_real_dir(parent)?;
+        }
+        make_real_dir(folder)?;
     }
-    make_real_dir(&pycache)?;
-    make_real_dir(&cargo_target)?;
     Ok(EnvAdditions {
         python_path: python.python_path(copy)?,
         vars: vec![
@@ -98,7 +97,7 @@ mod tests {
         let bisect = plain(&std::path::absolute(copy.path().parent().unwrap()).unwrap());
         assert!(bisect.ends_with(".yalper/bisect"));
         let pycache = bisect.join("pycache").join("copy-0");
-        let cargo_target = bisect.join("cargo-target");
+        let cargo_target = bisect.join("cargo-target").join("copy-0");
         assert_eq!(
             additions,
             EnvAdditions {
@@ -133,8 +132,7 @@ mod tests {
         let python = PythonEnvs::new(project.path()).unwrap();
         env_additions(&copy, &python).unwrap();
 
-        // A test run replaces both folders with links to the canary, and the pycache folder of the copy with a
-        // file.
+        // A test run replaces the folders with links to the canary, then the copy's own folders with files.
         let bisect = project.path().join(".yalper/bisect");
         for folder in ["pycache", "cargo-target"] {
             let path = bisect.join(folder);
@@ -142,11 +140,18 @@ mod tests {
             make_link(canary.path(), &path).unwrap();
         }
         env_additions(&copy, &python).unwrap();
-        fs::remove_dir_all(bisect.join("pycache/copy-0")).unwrap();
-        fs::write(bisect.join("pycache/copy-0"), "a file").unwrap();
+        for folder in ["pycache/copy-0", "cargo-target/copy-0"] {
+            fs::remove_dir_all(bisect.join(folder)).unwrap();
+            fs::write(bisect.join(folder), "a file").unwrap();
+        }
         env_additions(&copy, &python).unwrap();
 
-        for folder in ["pycache", "pycache/copy-0", "cargo-target"] {
+        for folder in [
+            "pycache",
+            "pycache/copy-0",
+            "cargo-target",
+            "cargo-target/copy-0",
+        ] {
             assert!(fs::symlink_metadata(bisect.join(folder)).unwrap().is_dir());
         }
         assert_eq!(state(canary.path()), before);
@@ -250,12 +255,57 @@ mod tests {
         assert_eq!(compiled(&cargo_test(cargo, &copy, &additions)), ["b"]);
 
         assert!(!copy.path().join("target").exists());
-        assert!(
-            project
-                .path()
-                .join(".yalper/bisect/cargo-target/debug")
-                .is_dir()
-        );
+        assert!(copy.cargo_target_path().join("debug").is_dir());
         assert_eq!(state(project.path()), before);
+    }
+
+    #[test]
+    fn a_copy_never_runs_the_build_of_another_copy() {
+        let Some(cargo) = tool(&["cargo"]) else {
+            return;
+        };
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let main = |value: u32| format!("fn main() {{\n    print!(\"{value}\");\n}}\n");
+        let project = Project::new();
+        let python = PythonEnvs::new(project.path()).unwrap();
+        let tree = |value: u32| {
+            let main = main(value);
+            project.tree(&[
+                (".gitignore", "target/\n"),
+                ("Cargo.toml", manifest),
+                ("src/main.rs", &main),
+            ])
+        };
+        let cargo_run = |copy: &TestCopy| {
+            let additions = env_additions(copy, &python).unwrap();
+            let output = Command::new(cargo)
+                .args(["run", "--offline", "--quiet"])
+                .current_dir(copy.path())
+                .envs(additions.vars.iter().map(|(name, value)| (name, value)))
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        // Copy 1 gets its step first, so its sources are older than the build copy 0 makes next: with one
+        // target folder shared by both, cargo would take that build as fresh for copy 1.
+        let mut second = TestCopy::open(&project.yalper, 1).unwrap();
+        second.switch(&project.store, tree(1)).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for file in ["Cargo.toml", "src/main.rs"] {
+            fs::File::options()
+                .write(true)
+                .open(second.path().join(file))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let mut first = project.copy();
+        first.switch(&project.store, tree(2)).unwrap();
+        assert_eq!(cargo_run(&first), "2");
+        assert_eq!(cargo_run(&second), "1");
+        assert_ne!(first.cargo_target_path(), second.cargo_target_path());
     }
 }

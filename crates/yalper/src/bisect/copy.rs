@@ -64,6 +64,12 @@ const CLOCK_FILE: &str = "clock";
 /// so nothing is written into the project's virtual environment through a link of the copy.
 const PYCACHE_DIR: &str = "pycache";
 
+/// The folder in `.yalper/bisect/` that holds the `CARGO_TARGET_DIR` of each copy, `cargo-target/copy-<n>/`,
+/// reused by every step and every bisect of that copy. One per copy, not one shared by all: cargo tells a
+/// workspace crate is fresh from its source mtimes and from hashes of paths relative to the workspace, so a
+/// copy whose sources are older than another copy's build would run that build.
+const CARGO_TARGET_DIR: &str = "cargo-target";
+
 /// The most entries (files and folders) of a tree diff one switch takes. Over it the switch is refused: no
 /// project has that many files, but a crafted store could repeat a large subtree many times.
 const MAX_CHANGES: usize = 1_000_000;
@@ -98,6 +104,8 @@ pub struct TestCopy {
     extra: HashSet<String>,
     /// See [`pycache_path`](Self::pycache_path).
     pycache: PathBuf,
+    /// See [`cargo_target_path`](Self::cargo_target_path).
+    cargo_target: PathBuf,
     /// The paths of the copy's folder inside `pycache` (see [`prefix_mirrors`]).
     mirrors: Vec<PathBuf>,
 }
@@ -133,7 +141,8 @@ impl TestCopy {
         let bisect = open_private_dir(&yalper_dir.path().join(BISECT_DIR))?;
         let name = format!("copy-{number}");
         let dir = open_private_dir(&bisect.path().join(&name))?;
-        let pycache = bisect.path().join(PYCACHE_DIR).join(name);
+        let pycache = bisect.path().join(PYCACHE_DIR).join(&name);
+        let cargo_target = bisect.path().join(CARGO_TARGET_DIR).join(name);
         let info_exclude = yalper_dir
             .path()
             .parent()
@@ -149,6 +158,7 @@ impl TestCopy {
             mirrors: prefix_mirrors(dir.path()),
             dir,
             pycache,
+            cargo_target,
         })
     }
 
@@ -160,6 +170,12 @@ impl TestCopy {
     /// (see [`env_additions`](super::env_additions)).
     pub fn pycache_path(&self) -> &Path {
         &self.pycache
+    }
+
+    /// The copy's `CARGO_TARGET_DIR`, `.yalper/bisect/cargo-target/copy-<n>/`, which may not exist yet (see
+    /// [`env_additions`](super::env_additions)).
+    pub fn cargo_target_path(&self) -> &Path {
+        &self.cargo_target
     }
 
     /// `.yalper/bisect/`.
@@ -1030,12 +1046,15 @@ struct Bytecode {
 
 impl Bytecode {
     /// For a switch of the copy whose prefix folder is `pycache`, with `mirrors` (see [`prefix_mirrors`]).
+    /// The folder above `pycache` (`.yalper/bisect/pycache/`) must be a real folder too: a test run can put a
+    /// link there.
     fn new(pycache: &Path, mirrors: &[PathBuf]) -> Self {
+        let parent_is_real = pycache.parent().is_some_and(is_real_dir_no_follow);
         let roots = mirrors
             .iter()
             .filter_map(|mirror| {
                 let mut dir = pycache.to_owned();
-                if !is_real_dir_no_follow(&dir) {
+                if !parent_is_real || !is_real_dir_no_follow(&dir) {
                     return None;
                 }
                 for component in mirror.components() {
@@ -1170,69 +1189,11 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use gix::objs::tree::{Entry, EntryKind};
+    use gix::objs::tree::EntryKind;
 
-    use crate::repo::Token;
-    use crate::snapshot::Change;
+    use crate::bisect::testing::{Project, tool};
 
     use FileKind::{Executable, Regular, Symlink};
-
-    /// A project folder with a `.yalper/` holding a snapshot store.
-    struct Project {
-        root: tempfile::TempDir,
-        yalper: OwnedDir,
-        store: ShadowStore,
-    }
-
-    impl Project {
-        fn new() -> Self {
-            let root = tempfile::tempdir().unwrap();
-            fs::create_dir(root.path().join(".yalper")).unwrap();
-            let yalper = OwnedDir::open(&root.path().join(".yalper")).unwrap();
-            let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
-            let store = ShadowStore::init(&yalper, &token).unwrap();
-            Self {
-                root,
-                yalper,
-                store,
-            }
-        }
-
-        fn copy(&self) -> TestCopy {
-            TestCopy::open(&self.yalper, 0).unwrap()
-        }
-
-        /// The tree holding `files` (path, kind, content).
-        fn tree(&self, files: &[(&str, FileKind, &str)]) -> ObjectId {
-            let changes: Vec<Change> = files
-                .iter()
-                .map(|&(path, kind, content)| Change::Upsert {
-                    path: path.to_owned(),
-                    kind,
-                    blob: self.store.write_blob(content.as_bytes()).unwrap(),
-                })
-                .collect();
-            self.store
-                .edit_tree(self.store.empty_tree(), &changes)
-                .unwrap()
-        }
-
-        /// A tree with the entries `(name, kind, id)`, written without any path check.
-        fn crafted_tree(&self, entries: &[(&str, EntryKind, ObjectId)]) -> ObjectId {
-            let mut entries: Vec<Entry> = entries
-                .iter()
-                .map(|&(name, kind, oid)| Entry {
-                    mode: kind.into(),
-                    filename: name.into(),
-                    oid,
-                })
-                .collect();
-            entries.sort();
-            self.store
-                .write_unchecked_tree(&gix::objs::Tree { entries })
-                .unwrap()
-        }
-    }
 
     /// Every file and link under `dir` by `/`-separated path, with its kind and content (a link: its target).
     fn contents(dir: &Path) -> BTreeMap<String, (FileKind, Vec<u8>)> {
@@ -1281,7 +1242,7 @@ mod tests {
         assert_eq!(contents(copy.path()), expected(files));
     }
 
-    /// Borrowed form of generated files, for [`Project::tree`] and [`assert_holds`].
+    /// Borrowed form of generated files, for [`Project::typed_tree`] and [`assert_holds`].
     fn view(files: &[(String, FileKind, String)]) -> Vec<(&str, FileKind, &str)> {
         files
             .iter()
@@ -1312,7 +1273,7 @@ mod tests {
     fn copies_are_real_private_folders_in_yalper_bisect() {
         let project = Project::new();
         let copy = TestCopy::open(&project.yalper, 3).unwrap();
-        let bisect = project.root.path().join(".yalper").join(BISECT_DIR);
+        let bisect = project.path().join(".yalper").join(BISECT_DIR);
         assert!(fs::symlink_metadata(&bisect).unwrap().is_dir());
         assert_eq!(
             fs::canonicalize(copy.path()).unwrap(),
@@ -1336,7 +1297,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         link_dir(
             outside.path(),
-            &project.root.path().join(".yalper").join(BISECT_DIR),
+            &project.path().join(".yalper").join(BISECT_DIR),
         );
         assert!(TestCopy::open(&project.yalper, 0).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
@@ -1360,7 +1321,7 @@ mod tests {
             ("src/new.rs", Regular, "\0binary\u{7f}"),
             ("tool", Executable, "same content, other mode\n"),
         ];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_a).unwrap();
         assert_holds(&copy, &a);
@@ -1393,7 +1354,7 @@ mod tests {
     #[test]
     fn a_symlink_of_the_tree_is_a_link_on_unix_and_a_file_with_its_target_on_windows() {
         let project = Project::new();
-        let tree = project.tree(&[
+        let tree = project.typed_tree(&[
             ("target.txt", Regular, "x"),
             ("link", Symlink, "target.txt"),
         ]);
@@ -1421,7 +1382,7 @@ mod tests {
             ("a.txt", Regular, "a"),
             ("one/two/three/deep.txt", Regular, "deep"),
         ];
-        let (tree_flat, tree_nested) = (project.tree(&flat), project.tree(&nested));
+        let (tree_flat, tree_nested) = (project.typed_tree(&flat), project.typed_tree(&nested));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_flat).unwrap();
         let switched = copy.switch(&project.store, tree_nested).unwrap();
@@ -1455,7 +1416,7 @@ mod tests {
             ("x/inner.txt", Regular, "in a folder"),
             ("y.txt", Regular, "y"),
         ];
-        let (tree_file, tree_folder) = (project.tree(&file), project.tree(&folder));
+        let (tree_file, tree_folder) = (project.typed_tree(&file), project.typed_tree(&folder));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_file).unwrap();
         copy.switch(&project.store, tree_folder).unwrap();
@@ -1467,7 +1428,7 @@ mod tests {
     #[test]
     fn a_folder_left_where_the_tree_has_a_file_is_replaced() {
         let project = Project::new();
-        let tree = project.tree(&[("x", Regular, "a file")]);
+        let tree = project.typed_tree(&[("x", Regular, "a file")]);
         let mut copy = project.copy();
         fs::create_dir_all(copy.path().join("x").join("build")).unwrap();
         fs::write(copy.path().join("x").join("build").join("out"), "old").unwrap();
@@ -1480,7 +1441,7 @@ mod tests {
         let project = Project::new();
         let old = [("Readme.md", Regular, "same"), ("Src/a.txt", Regular, "a")];
         let new = [("README.md", Regular, "same"), ("src/a.txt", Regular, "a")];
-        let (tree_old, tree_new) = (project.tree(&old), project.tree(&new));
+        let (tree_old, tree_new) = (project.typed_tree(&old), project.typed_tree(&new));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_old).unwrap();
         copy.switch(&project.store, tree_new).unwrap();
@@ -1501,7 +1462,7 @@ mod tests {
             (".gitignore", Regular, "*.o\n"),
             ("src/lib/a.txt", Regular, "a"),
         ];
-        let (tree_old, tree_new) = (project.tree(&old), project.tree(&new));
+        let (tree_old, tree_new) = (project.typed_tree(&old), project.typed_tree(&new));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_old).unwrap();
         // An ignored build output keeps both folders from being removed.
@@ -1544,7 +1505,7 @@ mod tests {
             ("sub/deeper/f.txt", Regular, "f2"),
             ("sub/new.txt", Regular, "new"),
         ];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
 
         // On the first switch of a copy.
         let mut copy = project.copy();
@@ -1563,7 +1524,8 @@ mod tests {
         // A removal does not follow it either.
         fs::remove_dir_all(copy.path().join("sub")).unwrap();
         link_dir(canary.path(), &copy.path().join("sub"));
-        copy.switch(&project.store, project.tree(&[])).unwrap();
+        copy.switch(&project.store, project.typed_tree(&[]))
+            .unwrap();
         assert_eq!(contents(canary.path()), before);
         assert!(fs::symlink_metadata(canary.path()).unwrap().is_dir());
     }
@@ -1576,7 +1538,7 @@ mod tests {
         let target = outside.path().join("target.txt");
         fs::write(&target, "keep me").unwrap();
         let files = [("file.txt", Regular, "keep me")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         std::os::unix::fs::symlink(&target, copy.path().join("file.txt")).unwrap();
         // Same content behind the link: still replaced by a regular file.
@@ -1593,17 +1555,20 @@ mod tests {
         let other = outside.path().join("other.txt");
         fs::write(&other, "old").unwrap();
         let mut copy = project.copy();
-        copy.switch(&project.store, project.tree(&[("f.txt", Regular, "old")]))
-            .unwrap();
+        copy.switch(
+            &project.store,
+            project.typed_tree(&[("f.txt", Regular, "old")]),
+        )
+        .unwrap();
         fs::remove_file(copy.path().join("f.txt")).unwrap();
         fs::hard_link(&other, copy.path().join("f.txt")).unwrap();
         // Treated as not matching on a first switch, and replaced, not written into, on a later one.
         let mut again = project.copy();
-        let tree = project.tree(&[("f.txt", Regular, "old")]);
+        let tree = project.typed_tree(&[("f.txt", Regular, "old")]);
         assert_eq!(again.switch(&project.store, tree).unwrap().written, 1);
         fs::remove_file(copy.path().join("f.txt")).unwrap();
         fs::hard_link(&other, copy.path().join("f.txt")).unwrap();
-        let new = project.tree(&[("f.txt", Regular, "new")]);
+        let new = project.typed_tree(&[("f.txt", Regular, "new")]);
         again.switch(&project.store, new).unwrap();
         assert_eq!(fs::read_to_string(&other).unwrap(), "old");
         assert_eq!(
@@ -1658,7 +1623,10 @@ mod tests {
         for index in [3, 17, 42, 64, 99] {
             step[index].2.push_str(" changed");
         }
-        let (tree_base, tree_step) = (project.tree(&view(&base)), project.tree(&view(&step)));
+        let (tree_base, tree_step) = (
+            project.typed_tree(&view(&base)),
+            project.typed_tree(&view(&step)),
+        );
 
         let mut copy = project.copy();
         let switched = copy.switch(&project.store, tree_base).unwrap();
@@ -1708,7 +1676,7 @@ mod tests {
             ("run.sh", Executable, "#!/bin/sh\n"),
             ("plain", Regular, "x"),
         ];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1725,7 +1693,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let project = Project::new();
         let files = [("secret.txt", Regular, "x"), ("other.txt", Regular, "y")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         let path = copy.path().join("secret.txt");
@@ -1745,7 +1713,7 @@ mod tests {
         let project = Project::new();
         let a = [("dir/a.txt", Regular, "a"), ("dir/b.txt", Regular, "b")];
         let b = [("dir/a.txt", Regular, "changed")];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_a).unwrap();
         for name in ["a.txt", "b.txt"] {
@@ -1767,7 +1735,7 @@ mod tests {
     #[test]
     fn a_diff_over_the_limit_is_refused_without_writing() {
         let project = Project::new();
-        let tree = project.tree(&[
+        let tree = project.typed_tree(&[
             ("a", Regular, "a"),
             ("b", Regular, "b"),
             ("c/d", Regular, "d"),
@@ -1791,7 +1759,8 @@ mod tests {
             Err(Error::MissingObject(id)) if id == missing
         ));
         let files = [("ok.txt", Regular, "ok")];
-        copy.switch(&project.store, project.tree(&files)).unwrap();
+        copy.switch(&project.store, project.typed_tree(&files))
+            .unwrap();
         assert_holds(&copy, &files);
     }
 
@@ -1799,7 +1768,7 @@ mod tests {
     fn a_switch_that_fails_after_writing_is_undone_by_the_next_switch() {
         let project = Project::new();
         let a = [("a.txt", Regular, "a"), ("m.txt", Regular, "m")];
-        let tree_a = project.tree(&a);
+        let tree_a = project.typed_tree(&a);
         // B changes `a.txt`, written before `z.txt`, whose blob is missing.
         let missing = ObjectId::from_hex(b"0123456789012345678901234567890123456789").unwrap();
         let changed = project.store.write_blob(b"changed").unwrap();
@@ -1850,7 +1819,7 @@ mod tests {
             })
             .collect();
         let files = view(&files);
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         assert_eq!(copy.switch(&project.store, tree).unwrap().written, 300);
         assert_holds(&copy, &files);
@@ -1869,7 +1838,7 @@ mod tests {
             ("pkg/mod.py", Regular, "VALUE = 2\n"),
             ("pkg/other.py", Regular, ""),
         ];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_a).unwrap();
         let cache = copy.path().join("pkg").join("__pycache__");
@@ -1889,7 +1858,8 @@ mod tests {
         left.sort();
         assert_eq!(left, ["other.cpython-312.pyc"]);
         // Removing the files removes the rest, and the folders left empty.
-        copy.switch(&project.store, project.tree(&[])).unwrap();
+        copy.switch(&project.store, project.typed_tree(&[]))
+            .unwrap();
         assert!(!copy.path().join("pkg").exists());
     }
 
@@ -1910,7 +1880,7 @@ mod tests {
             ("src/lib.rs", Regular, "pub fn f() {}\n"),
             ("src/main.rs", Regular, "fn main() {}\n"),
         ];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
 
@@ -1959,7 +1929,7 @@ mod tests {
             ("changed_by_run.txt", Regular, "a"),
             ("changed_by_both.txt", Regular, "b"),
         ];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
         let mut copy = project.copy();
         copy.switch(&project.store, tree_a).unwrap();
         let root = copy.path().to_path_buf();
@@ -1987,7 +1957,7 @@ mod tests {
     fn a_same_size_change_that_keeps_the_mtime_is_undone() {
         let project = Project::new();
         let files = [("a.txt", Regular, "one")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         fs::write(copy.path().join("a.txt"), "two").unwrap();
@@ -2025,7 +1995,7 @@ mod tests {
             ("run.sh", Executable, "#!/bin/sh\n"),
             ("same.txt", Regular, "same"),
         ];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         // Old enough that size and mtime alone vouch for the files: only the permission tells.
@@ -2061,7 +2031,7 @@ mod tests {
         fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
         let before = contents(canary.path());
         let files = [("x", Regular, "a file")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
 
@@ -2122,7 +2092,7 @@ mod tests {
     fn an_extra_path_in_a_folder_outside_the_tree_is_kept() {
         let project = Project::new();
         let files = [("a.txt", Regular, "a")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.set_extra_paths(["config/local.json".to_owned()]);
         create(copy.path(), "config/local.json", "{}");
@@ -2143,7 +2113,7 @@ mod tests {
             (".gitignore", Regular, "coverage\n"),
             ("a.txt", Regular, "a"),
         ];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         link_dir(canary.path(), &copy.path().join("coverage"));
@@ -2159,7 +2129,7 @@ mod tests {
         fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
         let before = contents(canary.path());
         let files = [("a.txt", Regular, "a")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         create(copy.path(), "tmp/x.txt", "x");
@@ -2174,7 +2144,7 @@ mod tests {
     fn a_file_touched_by_a_test_is_hashed_not_rewritten() {
         let project = Project::new();
         let files = [("a.txt", Regular, "same")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         let later = SystemTime::now() + std::time::Duration::from_secs(60);
@@ -2197,7 +2167,7 @@ mod tests {
         let canary = tempfile::tempdir().unwrap();
         fs::write(canary.path().join("a.txt"), "keep me").unwrap();
         let files = [("src/a.txt", Regular, "a"), ("top.txt", Regular, "top")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
 
@@ -2224,7 +2194,7 @@ mod tests {
             (".gitignore", Regular, "build/\n"),
             ("sub/a.txt", Regular, "a"),
         ];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         let root = copy.path().to_path_buf();
@@ -2252,7 +2222,7 @@ mod tests {
             (".gitignore", Regular, "target/\n"),
             ("a.txt", Regular, "a"),
         ];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
         project.copy().switch(&project.store, tree_a).unwrap();
         let mut copy = project.copy();
         create(copy.path(), "target/debug/app", "app");
@@ -2277,7 +2247,7 @@ mod tests {
     fn the_switch_after_a_failed_one_removes_stale_files() {
         let project = Project::new();
         let files = [("a.txt", Regular, "a")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let missing = ObjectId::from_hex(b"0123456789012345678901234567890123456789").unwrap();
         let broken = project.crafted_tree(&[
             (
@@ -2306,7 +2276,7 @@ mod tests {
     fn extra_paths_are_kept_as_they_are() {
         let project = Project::new();
         let files = [("a.txt", Regular, "a")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.set_extra_paths(["node_modules".to_owned(), ".env".to_owned()]);
         create(copy.path(), "node_modules/dep/index.js", "dep");
@@ -2332,7 +2302,7 @@ mod tests {
         fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
         let before = contents(canary.path());
         let files = [("node_modules/local.js", Regular, "local")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.set_extra_paths(["node_modules".to_owned()]);
         create(copy.path(), "node_modules/stray.txt", "x");
@@ -2345,13 +2315,9 @@ mod tests {
     #[test]
     fn the_projects_info_exclude_applies_in_the_copy() {
         let project = Project::new();
-        create(
-            project.root.path(),
-            ".git/info/exclude",
-            "*.yalper-test-log\n",
-        );
+        create(project.path(), ".git/info/exclude", "*.yalper-test-log\n");
         let files = [("a.txt", Regular, "a")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         create(copy.path(), "run.yalper-test-log", "log");
@@ -2366,7 +2332,7 @@ mod tests {
     fn read_only_files_and_folders_a_test_created_are_removed() {
         let project = Project::new();
         let files = [("a.txt", Regular, "a")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
         let locked = copy.path().join("tmp").join("locked");
@@ -2388,7 +2354,7 @@ mod tests {
     fn a_name_differing_only_in_case_is_kept_only_on_a_case_insensitive_file_system() {
         let project = Project::new();
         let files = [("README.md", Regular, "same")];
-        let tree = project.tree(&files);
+        let tree = project.typed_tree(&files);
         let mut copy = project.copy();
         create(copy.path(), "readme.md", "same");
         copy.switch(&project.store, tree).unwrap();
@@ -2405,25 +2371,12 @@ mod tests {
         assert_eq!(fs::read(copy.path().join("README.md")).unwrap(), b"same");
     }
 
-    /// A Python 3 interpreter on `PATH`. Without one the test is skipped, unless `YALPER_REQUIRE_TOOLS=1`.
-    fn python() -> Option<&'static str> {
-        let found = ["python3", "python"].into_iter().find(|name| {
-            Command::new(name)
-                .arg("--version")
-                .output()
-                .is_ok_and(|output| output.status.success())
-        });
-        assert!(
-            found.is_some() || std::env::var("YALPER_REQUIRE_TOOLS").as_deref() != Ok("1"),
-            "Python is required (YALPER_REQUIRE_TOOLS=1) but neither python3 nor python runs"
-        );
-        found
-    }
-
     /// Python runs a same-size change of `pkg/mod.py` written in the same second as the version it compiled,
     /// with its bytecode next to the file or, if `prefix`, in the copy's `PYTHONPYCACHEPREFIX` folder.
     fn python_runs_a_same_size_change(prefix: bool) {
-        let Some(python) = python() else { return };
+        let Some(python) = tool(&["python3", "python"]) else {
+            return;
+        };
         let project = Project::new();
         let a = [
             ("pkg/__init__.py", Regular, ""),
@@ -2433,7 +2386,7 @@ mod tests {
             ("pkg/__init__.py", Regular, ""),
             ("pkg/mod.py", Regular, "VALUE = 2\n"),
         ];
-        let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
+        let (tree_a, tree_b) = (project.typed_tree(&a), project.typed_tree(&b));
         let mut copy = project.copy();
         let value = |copy: &TestCopy| {
             let mut command = Command::new(python);
@@ -2518,7 +2471,7 @@ mod tests {
             ("linked/x.py", Regular, "changed"),
         ];
         let mut copy = project.copy();
-        copy.switch(&project.store, project.tree(&a)).unwrap();
+        copy.switch(&project.store, project.typed_tree(&a)).unwrap();
 
         // Where Python puts the bytecode with `PYTHONPYCACHEPREFIX`: under the copy's absolute path without its
         // drive or root.
@@ -2543,13 +2496,45 @@ mod tests {
         create(canary.path(), "x.cpython-312.pyc", "keep me");
         link_dir(canary.path(), &mirror.join("linked"));
 
-        copy.switch(&project.store, project.tree(&b)).unwrap();
+        copy.switch(&project.store, project.typed_tree(&b)).unwrap();
         assert_eq!(
             contents(&mirror).into_keys().collect::<Vec<_>>(),
             ["linked", "pkg/other.cpython-312.pyc"]
         );
         assert_eq!(
             fs::read(canary.path().join("x.cpython-312.pyc")).unwrap(),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn a_link_at_the_prefix_folders_parent_is_not_followed() {
+        let project = Project::new();
+        let a = [("pkg/mod.py", Regular, "VALUE = 1\n")];
+        let b = [("pkg/mod.py", Regular, "VALUE = 2\n")];
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.typed_tree(&a)).unwrap();
+
+        // A test run replaces `.yalper/bisect/pycache` with a link to a canary holding bytecode at the path the
+        // copy's own prefix folder would have.
+        let canary = tempfile::tempdir().unwrap();
+        let text = copy.path().to_string_lossy().into_owned();
+        let without_root = if cfg!(windows) {
+            &text[3..]
+        } else {
+            &text[1..]
+        };
+        let planted = canary.path().join("copy-0").join(without_root);
+        create(&planted, "pkg/mod.cpython-312.pyc", "keep me");
+        let parent = copy.pycache_path().parent().unwrap().to_owned();
+        if parent.exists() {
+            fs::remove_dir_all(&parent).unwrap();
+        }
+        link_dir(canary.path(), &parent);
+
+        copy.switch(&project.store, project.typed_tree(&b)).unwrap();
+        assert_eq!(
+            fs::read(planted.join("pkg").join("mod.cpython-312.pyc")).unwrap(),
             b"keep me"
         );
     }

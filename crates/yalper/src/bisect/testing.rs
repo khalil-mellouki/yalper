@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gix::ObjectId;
+use gix::objs::tree::{Entry, EntryKind};
 
 use super::TestCopy;
 use crate::repo::Token;
@@ -45,16 +46,41 @@ impl Project {
 
     /// The tree holding `files` (path, content), all regular files.
     pub fn tree(&self, files: &[(&str, &str)]) -> ObjectId {
+        let files: Vec<(&str, FileKind, &str)> = files
+            .iter()
+            .map(|&(path, content)| (path, FileKind::Regular, content))
+            .collect();
+        self.typed_tree(&files)
+    }
+
+    /// The tree holding `files` (path, kind, content).
+    pub fn typed_tree(&self, files: &[(&str, FileKind, &str)]) -> ObjectId {
         let changes: Vec<Change> = files
             .iter()
-            .map(|&(path, content)| Change::Upsert {
+            .map(|&(path, kind, content)| Change::Upsert {
                 path: path.to_owned(),
-                kind: FileKind::Regular,
+                kind,
                 blob: self.store.write_blob(content.as_bytes()).unwrap(),
             })
             .collect();
         self.store
             .edit_tree(self.store.empty_tree(), &changes)
+            .unwrap()
+    }
+
+    /// A tree with the entries `(name, kind, id)`, written without any path check.
+    pub fn crafted_tree(&self, entries: &[(&str, EntryKind, ObjectId)]) -> ObjectId {
+        let mut entries: Vec<Entry> = entries
+            .iter()
+            .map(|&(name, kind, oid)| Entry {
+                mode: kind.into(),
+                filename: name.into(),
+                oid,
+            })
+            .collect();
+        entries.sort();
+        self.store
+            .write_unchecked_tree(&gix::objs::Tree { entries })
             .unwrap()
     }
 
