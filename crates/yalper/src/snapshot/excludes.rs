@@ -85,7 +85,7 @@ struct Chain {
     parent: Option<Arc<Chain>>,
 }
 
-pub(super) struct Excludes {
+pub(crate) struct Excludes {
     root: PathBuf,
     /// The rule chain of each directory the walk entered, by absolute path. `None`: no `.gitignore` rules
     /// apply inside it.
@@ -103,6 +103,13 @@ pub(super) struct Excludes {
 impl Excludes {
     /// The rules for the project at `root`, without any `.gitignore` yet (see [`add_dir`](Self::add_dir)).
     pub fn new(root: &Path) -> Self {
+        let info_exclude = repo::git_common_dir(root).map(|dir| dir.join("info").join("exclude"));
+        Self::with_info_exclude(root, info_exclude.as_deref())
+    }
+
+    /// The rules for the files under `root` with the `info/exclude` file `info_exclude` (that of the
+    /// project's repository, for a folder that holds a copy of the project), without any `.gitignore` yet.
+    pub fn with_info_exclude(root: &Path, info_exclude: Option<&Path>) -> Self {
         let mut builder = GitignoreBuilder::new(root);
         let _ = builder.case_insensitive(CASE_INSENSITIVE);
         let (global, _) = builder.build_global();
@@ -119,21 +126,25 @@ impl Excludes {
             seen: Mutex::new(Vec::new()),
             exceeded: AtomicBool::new(false),
         };
-        if let Some(dir) = repo::git_common_dir(root) {
-            excludes.info_exclude = excludes.rules(root, &dir.join("info").join("exclude"));
+        if let Some(file) = info_exclude {
+            excludes.info_exclude = excludes.rules(root, file);
         }
         excludes
     }
 
-    /// Reads the `.gitignore` of `dir`. Called for each directory the walk enters, after its parent and
-    /// before any entry inside it is checked.
-    pub fn add_dir(&self, dir: &Path) {
+    /// Reads the `.gitignore` of `dir`, if `read_gitignore`. Called for each directory the walk enters, after
+    /// its parent and before any entry inside it is checked.
+    pub fn add_dir(&self, dir: &Path, read_gitignore: bool) {
         let parent = if dir == self.root {
             None
         } else {
             dir.parent().and_then(|parent| self.chain(parent))
         };
-        let rules = self.rules(dir, &dir.join(".gitignore"));
+        let rules = if read_gitignore {
+            self.rules(dir, &dir.join(".gitignore"))
+        } else {
+            Gitignore::empty()
+        };
         let chain = if rules.is_empty() {
             parent
         } else {

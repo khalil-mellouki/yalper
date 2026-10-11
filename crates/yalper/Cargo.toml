@@ -46,5 +46,9 @@ harness = false
 name = "redact"
 harness = false
 
+[[bench]]
+name = "test_copy"
+harness = false
+
 [lints]
 workspace = true

@@ -68,6 +68,17 @@ jobs:
           cargo bench --locked --bench hook_latency 2>&1 | tee bench.txt || status=$?
           grep -E '^hook_latency' bench.txt >> "$GITHUB_STEP_SUMMARY" || true
           exit "$status"
+      # Done criterion 3 of M2: switching a reused bisect test copy to the next step after a test run (undo the
+      # run, diff, writes) must take under 1 s on a project of 1,000 files.
+      - name: Test copy switch gate (median under 1 s)
+        shell: bash
+        env:
+          YALPER_BENCH_MAX_MEDIAN_MS: "1000"
+        run: |
+          status=0
+          cargo bench --locked --bench test_copy 2>&1 | tee bench.txt || status=$?
+          grep -E '^test_copy' bench.txt >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
       - name: Shadow store and redaction benchmarks (report only)
         shell: bash
         run: |
