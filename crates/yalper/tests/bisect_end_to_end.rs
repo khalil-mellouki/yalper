@@ -5,9 +5,10 @@
 //! Each sample is a git project whose dependencies are installed in it, set up with `yalper init`, with a
 //! recorded session of about 20 steps (the hook payloads Claude Code sends, while the files on disk change)
 //! that changes the lockfile once and plants the break at a known step. Then `yalper bisect --test "<command>"`
-//! must name that step, twice: the first bisect installs the dependencies of the steps from before the lockfile
-//! changed once, the second installs nothing. The project, `.git` and its installed dependencies included, must
-//! be the same after each bisect, and `yalper uninstall --purge` must remove the project's cache folder.
+//! must name that step, twice: the first bisect installs, once, the dependencies of the steps from before the
+//! lockfile changed, and the second installs nothing. The project, `.git` and its installed dependencies
+//! included, must be the same after each bisect, and `yalper uninstall --purge` must remove the project's cache
+//! folder.
 //!
 //! They download packages from the npm registry and PyPI and build Rust code, so a plain `cargo test` skips
 //! them. CI runs them in the "Bisect end-to-end" job:
