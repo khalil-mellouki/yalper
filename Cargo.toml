@@ -14,6 +14,9 @@ rust-version = "1.89"
 # Finds which secret rules can match a string: one pass over it for all rule keywords.
 aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
+# Catches Ctrl-C during a bisect, so that Yalper kills the processes of the test run before it stops.
+# `termination`: SIGTERM and SIGHUP too, on Unix.
+ctrlc = { version = "3.5", features = ["termination"] }
 # The operating system's secure random number generator, for the init token. Already built for gix.
 getrandom = "0.4"
 # Only SHA-1 object hashing: Yalper writes blobs and trees and diffs trees, and needs none of the other

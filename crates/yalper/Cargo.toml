@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 aho-corasick.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 getrandom.workspace = true
 gix.workspace = true
 gix-imara-diff.workspace = true
@@ -24,6 +25,7 @@ rusqlite.workspace = true
 serde_json.workspace = true
 
 # Unix only: the current user id (to check who owns `.yalper`), O_NOFOLLOW and openat, without unsafe code.
+# Also the process group of a bisect test run: waiting with WNOWAIT and killing the group.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
@@ -31,6 +33,15 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # test copy of a bisect, which links to the project's installed `node_modules` packages.
 [target.'cfg(windows)'.dependencies]
 junction = { version = "2.1", default-features = false }
+# The type of the process creation flags given to `process-wrap`, for `CREATE_NEW_PROCESS_GROUP`. Already built,
+# with this feature, for `process-wrap`.
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Threading"] }
+# The job objects of a bisect test run, so that its whole process tree can be killed.
+# `process-wrap` starts the run suspended in a job object and resumes it; `win32job` adds a second job around
+# that one, whose kill-on-close limit kills the tree when Yalper exits in any way (a crash included). Both
+# keep the calls to the Windows API, which need `unsafe`, out of this crate.
+process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }
+win32job = "2.0.3"
 
 [build-dependencies]
 toml.workspace = true
