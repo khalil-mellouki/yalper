@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use super::CacheDir;
 use super::copy::{open_private_dir, remove_entry};
 use crate::log::cut_end;
-use crate::redact::redact_str;
+use crate::redact::{redact_str, strip_escapes};
 use crate::safe_fs::{Access, OwnedDir, open_regular_file};
 use crate::show::{MAX_LINE_CHARS, content};
 
@@ -573,10 +573,11 @@ impl Logs {
 ///
 /// Logs are written as the tests print, unredacted, while what Yalper shows may reach a model provider (an
 /// agent that runs `yalper bisect` reads its output). So: a link or anything but a regular file at `path` is
-/// refused, never followed; only the last 64 KiB are read, and a line cut by that start is left out; secrets
-/// are masked by the rules of `crate::redact` over all of those bytes (so the first line of a private key above
-/// the lines shown still counts); each line is cut to 200 characters and made printable (tabs kept). Trailing
-/// blank lines are left out.
+/// refused, never followed; only the last 64 KiB are read, and a line cut by that start is left out; terminal
+/// escape sequences are removed (colors could split a secret's key from its value), then secrets are masked by
+/// the rules of `crate::redact` over all of those bytes (so the first line of a private key above the lines
+/// shown still counts); each line is cut to 200 characters and made printable (tabs kept). Trailing blank
+/// lines are left out.
 pub fn log_tail(path: &Path, lines: usize) -> io::Result<Vec<String>> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::other(format!(
@@ -603,6 +604,7 @@ fn tail_lines(tail: &[u8], whole: bool, lines: usize) -> Vec<String> {
         }
     };
     let text = String::from_utf8_lossy(tail);
+    let text = strip_escapes(&text);
     let text = redact_str(&text).unwrap_or_else(|| text.into_owned());
     let all: Vec<&str> = text.trim_end().lines().collect();
     all[all.len().saturating_sub(lines)..]
@@ -1162,7 +1164,7 @@ mod tests {
             [
                 "line 30".to_owned(),
                 "(masked)".to_owned(),
-                " ]0;owned  [2J 31m<U+202E>X\tY".to_owned(),
+                "<U+202E>X\tY".to_owned(),
                 format!("{}...", "z".repeat(MAX_LINE_CHARS - 3)),
                 "last".to_owned(),
             ]
@@ -1187,6 +1189,18 @@ mod tests {
         let tail = log_tail(&path, 3).unwrap();
         assert!(tail.iter().all(|line| !line.contains("MIIE")), "{tail:?}");
         assert_eq!(tail.last().unwrap(), "after");
+
+        // Colors between a key and its value do not hide the value from the rules.
+        let value = format!("{}{}", "R8x2Lq9VmT4kZ7wN", "1cJ5hB3gF6dS0aP2");
+        fs::write(
+            &path,
+            format!("API_KEY=\u{1b}[1m{value}\u{1b}[0m\n\u{1b}[31mFAILED\u{1b}[0m\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            log_tail(&path, 5).unwrap(),
+            ["API_KEY=[REDACTED:generic-api-key]", "FAILED"]
+        );
 
         fs::write(&path, "").unwrap();
         assert_eq!(log_tail(&path, 5).unwrap(), Vec::<String>::new());

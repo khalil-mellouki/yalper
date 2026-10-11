@@ -963,7 +963,8 @@ fn only_tool_steps_show_a_prompt() {
 fn a_diff_between_two_trees_that_are_not_adjacent() {
     let project = recorded_project();
     // From the tree of the prompt (step 2) to the tree of the Write (step 7): the changes of steps 3, 4 and 7.
-    // The Write's own content is left out of its output: the diff shows its file.
+    // The Write's output keeps its own content: the diff starts before the Write's base, so it is not only
+    // the Write's change.
     insta::assert_snapshot!(render(project.path(), 7, Some(2)), @r#"
     Session 00893aaf, step 7 of 10, 2026-10-07 00:01:00
 
@@ -982,7 +983,10 @@ fn a_diff_between_two_trees_that_are_not_adjacent() {
     Output:
       {
         "type": "create",
-        "filePath": "/home/dev/project/src/factorial.rs"
+        "filePath": "/home/dev/project/src/factorial.rs",
+        "content": "pub fn factorial(n: u64) -> u64 {\n    (1..=n).product()\n}\n",
+        "structuredPatch": [],
+        "originalFile": null
       }
 
     4 files changed:
@@ -1042,4 +1046,53 @@ fn a_rendered_prompt_never_brings_control_characters() {
             .contains("\nPrompt (step 1):\n   ]0;owned  [2J 31m <U+202E>X\tY\n\nBash, succeeded\n"),
         "{output}"
     );
+}
+
+#[test]
+fn an_edit_keeps_its_own_patch_when_the_diff_holds_earlier_changes() {
+    let project = common::project();
+    let root = project.path();
+    fs::write(root.join("a.txt"), "one\n").unwrap();
+    let dir = find_yalper_dir([root.to_path_buf()]).unwrap();
+    baseline(&dir);
+    record_payload(
+        &dir,
+        payload("UserPromptSubmit", json!({"prompt": "Count up"})),
+    );
+    fs::write(root.join("a.txt"), "two\n").unwrap();
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "./bump.sh"}}),
+        ),
+    );
+    fs::write(root.join("a.txt"), "three\n").unwrap();
+    let path = format!("{}/a.txt", root.display());
+    record_payload(
+        &dir,
+        payload(
+            "PostToolUse",
+            json!({
+                "tool_name": "Edit",
+                "tool_input": {"file_path": path, "old_string": "two", "new_string": "three"},
+                "tool_response": {
+                    "filePath": path,
+                    "originalFile": "two\n",
+                    "structuredPatch": [{"lines": ["-two", "+three"]}]
+                }
+            }),
+        ),
+    );
+    // From the prompt's tree, the diff of a.txt holds the Bash step's change too: the Edit's own patch stays.
+    let range = render(root, 3, Some(1));
+    assert!(range.contains("\"structuredPatch\""), "{range}");
+    assert!(range.contains(r#""originalFile": "two\n""#), "{range}");
+    assert!(range.contains("\n-one\n+three\n"), "{range}");
+    // From the Edit's own base, the diff is the patch: it is left out of the output.
+    let own = render(root, 3, Some(2));
+    assert!(!own.contains("structuredPatch"), "{own}");
+    assert!(!own.contains("originalFile"), "{own}");
+    assert!(own.contains("\n-two\n+three\n"), "{own}");
+    assert_eq!(own, render(root, 3, None));
 }

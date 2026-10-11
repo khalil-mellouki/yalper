@@ -193,7 +193,9 @@ pub enum Changes<'a> {
     /// What the step changed (from its `base_tree_id` to its `tree_id`), read from the snapshot store of this
     /// `.yalper/`. Shown only for a step that takes a snapshot.
     OfStep(&'a YalperDir),
-    /// From tree `from` to tree `to` of `shadow`, whichever steps they belong to.
+    /// From tree `from` to tree `to` of `shadow`, whichever steps they belong to. Unless `from` is the step's
+    /// own base, a file tool's output keeps the file or patch it returned: the diff can hold other steps'
+    /// changes to the same file.
     Between {
         shadow: &'a ShadowStore,
         from: ObjectId,
@@ -241,7 +243,14 @@ pub fn write_step(
         )),
     );
     // The files section comes last but is built first: a file tool's output repeats the file or its patch,
-    // which is left out only when the diff of that file is shown below.
+    // which is left out only when the diff of that file is shown below and holds only this step's changes.
+    let only_this_step = match &changes {
+        Changes::OfStep(_) => true,
+        Changes::Between { from, .. } => {
+            let base = event.base_tree_id.as_deref();
+            base.and_then(|hex| ObjectId::from_hex(hex.as_bytes()).ok()) == Some(*from)
+        }
+    };
     let mut files = Vec::new();
     let diffed = match changes {
         Changes::OfStep(yalper) if takes_snapshot(&event.kind) => {
@@ -253,7 +262,9 @@ pub fn write_step(
         }
     };
     let shown_by_diff = match (&diffed, edited_file(event)) {
-        (Some(Ok(diffed)), Some(edited)) => diffed.contains(&relative_path(edited, view.roots)),
+        (Some(Ok(diffed)), Some(edited)) if only_this_step => {
+            diffed.contains(&relative_path(edited, view.roots))
+        }
         _ => false,
     };
     if let Some(prompt) = view.prompt.filter(|_| is_tool_call(event)) {
