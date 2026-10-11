@@ -22,11 +22,11 @@
 //!   an entry is replaced or deleted;
 //! - the cached bytecode of every Python file written or removed is deleted (see [`remove_bytecode`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
 
 use gix::ObjectId;
@@ -89,6 +89,11 @@ impl TestCopy {
     /// that differ between the tree the copy holds and `to`. Files the tree does not have are not touched
     /// by a first switch.
     ///
+    /// Known limit of a first switch on a case-insensitive file system (Windows, macOS): a file or folder
+    /// whose name differs from the tree's only in case is taken as the tree's and keeps its old spelling.
+    /// Later switches rename files, and folders whose old spelling still holds other files, to the tree's
+    /// spelling.
+    ///
     /// If the switch fails, the copy is in an unknown state and the next switch checks every file again.
     pub fn switch(&mut self, store: &ShadowStore, to: ObjectId) -> Result<Switched> {
         self.switch_capped(store, to, MAX_CHANGES)
@@ -118,8 +123,11 @@ impl TestCopy {
         make_owner_writable(root, &fs::symlink_metadata(root)?)?;
 
         let mut switched = Switched::default();
+        let mut kept = HashMap::new();
         for &(path, new) in &changes {
-            if new.is_none() && remove(root, path).map_err(|error| in_copy(error, path))? {
+            if new.is_none()
+                && remove(root, path, &mut kept).map_err(|error| in_copy(error, path))?
+            {
                 switched.removed += 1;
             }
         }
@@ -135,7 +143,9 @@ impl TestCopy {
                 links.push((path, new));
                 continue;
             }
-            if prepare(root, path, new, first, &mut ready).map_err(|error| in_copy(error, path))? {
+            if prepare(root, path, new, first, &kept, &mut ready)
+                .map_err(|error| in_copy(error, path))?
+            {
                 files.push((path, new));
             }
         }
@@ -144,8 +154,10 @@ impl TestCopy {
 
         ready.clear();
         for (path, new) in links {
-            if prepare(root, path, new, first, &mut ready).map_err(|error| in_copy(error, path))? {
-                let target = read(store, new)?;
+            if prepare(root, path, new, first, &kept, &mut ready)
+                .map_err(|error| in_copy(error, path))?
+            {
+                let target = read(store, path, new)?;
                 write_link(&native(root, path), &target).map_err(|error| in_copy(error, path))?;
                 switched.written += 1;
             }
@@ -225,7 +237,10 @@ fn in_copy(error: io::Error, path: &str) -> io::Error {
 /// Removes the file or link at `path`, its cached bytecode if it is a Python file, and the folders this leaves
 /// empty. Returns whether there was something to remove. If a parent is not a real folder, the file is not in
 /// the copy and nothing is removed; a folder at `path` is left (it is not a file of the tree).
-fn remove(root: &Path, path: &str) -> io::Result<bool> {
+///
+/// The folders that still hold something (files the tree does not have) are added to `kept`, keyed by their
+/// lowercase path, for [`fix_case`].
+fn remove(root: &Path, path: &str, kept: &mut HashMap<String, String>) -> io::Result<bool> {
     for parent in parents(path) {
         if !is_real_dir(&native(root, parent))? {
             return Ok(false);
@@ -244,23 +259,56 @@ fn remove(root: &Path, path: &str) -> io::Result<bool> {
     if path.ends_with(".py") {
         remove_bytecode(&full)?;
     }
-    for parent in parents(path).collect::<Vec<_>>().into_iter().rev() {
-        // Fails, and stops, at the first folder that still holds something.
+    let mut left = parents(path).collect::<Vec<_>>();
+    while let Some(parent) = left.last() {
+        // Fails at the first folder that still holds something, so it and the folders above it stay.
         if fs::remove_dir(native(root, parent)).is_err() {
             break;
         }
+        left.pop();
+    }
+    for parent in left {
+        kept.insert(parent.to_lowercase(), parent.to_owned());
     }
     Ok(removed)
 }
 
+/// Renames the folder `kept` of the copy, kept by [`remove`], to `wanted` when the two paths differ only in
+/// case and the file system takes them for the same folder (case-insensitive, as on Windows and macOS): a
+/// case-only rename of a folder that still holds files the tree does not have. The folders above `wanted`
+/// already have their new names.
+fn fix_case(root: &Path, kept: &str, wanted: &str) -> io::Result<()> {
+    let name = |path: &'_ str| -> String { path.rsplit('/').next().unwrap_or(path).to_owned() };
+    let (old, new) = (name(kept), name(wanted));
+    let parent = match wanted.rsplit_once('/') {
+        Some((parent, _)) => native(root, parent),
+        None => root.to_path_buf(),
+    };
+    let mut has_old = false;
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?.file_name();
+        if entry == new.as_str() {
+            // Both spellings exist, so they are two folders (a case-sensitive file system).
+            return Ok(());
+        }
+        has_old |= entry == old.as_str();
+    }
+    if has_old {
+        fs::rename(parent.join(old), parent.join(new))?;
+    }
+    Ok(())
+}
+
 /// Gets `path` ready to receive `file`: every parent made a real folder (`ready` holds those already checked
-/// in this switch), and, on a first switch, whether the copy already holds `file` there. Returns whether
-/// `file` must be written. Removes the cached bytecode of a Python file that will be written.
+/// in this switch) with the case of the tree (see [`fix_case`]), and, on a first switch, whether the copy
+/// already holds `file` there. Returns whether `file` must be written. Removes the cached bytecode of a
+/// Python file that will be written.
 fn prepare(
     root: &Path,
     path: &str,
     file: TreeFile,
     first: bool,
+    kept: &HashMap<String, String>,
     ready: &mut HashSet<String>,
 ) -> io::Result<bool> {
     for parent in parents(path) {
@@ -269,7 +317,14 @@ fn prepare(
         }
         let dir = native(root, parent);
         match fs::symlink_metadata(&dir) {
-            Ok(metadata) if metadata.is_dir() => make_owner_writable(&dir, &metadata)?,
+            Ok(metadata) if metadata.is_dir() => {
+                if let Some(old) = kept.get(&parent.to_lowercase())
+                    && old != parent
+                {
+                    fix_case(root, old, parent)?;
+                }
+                make_owner_writable(&dir, &metadata)?;
+            }
             Ok(metadata) => {
                 remove_entry(&dir, &metadata)?;
                 fs::create_dir(&dir)?;
@@ -334,10 +389,14 @@ fn holds(path: &Path, file: TreeFile) -> io::Result<bool> {
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES || !plain_as(&metadata, file.kind) {
         return Ok(false);
     }
+    let opened = match safe_fs::open_regular_file(path) {
+        Ok(opened) => opened,
+        // A file a test made unreadable is replaced, like any file that differs.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
+        Err(error) => return Err(error),
+    };
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    safe_fs::open_regular_file(path)?
-        .take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    opened.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
     is_blob(&bytes, file.blob)
 }
 
@@ -356,6 +415,10 @@ fn plain_as(metadata: &fs::Metadata, kind: FileKind) -> bool {
     metadata.nlink() == 1 && (metadata.mode() & 0o100 != 0) == (kind == FileKind::Executable)
 }
 
+/// Windows has no executable bit. The standard library does not expose the hard link count there (it is
+/// unstable), so a file with a second hard link whose content matches is kept by a first switch, and a test
+/// writing to it would change the other file too. Only a local process can create a hard link (a clone
+/// cannot), and later switches always replace a file instead of writing into it.
 #[cfg(windows)]
 fn plain_as(_metadata: &fs::Metadata, _kind: FileKind) -> bool {
     true
@@ -367,73 +430,75 @@ fn link_target(path: &Path) -> io::Result<Vec<u8>> {
     Ok(fs::read_link(path)?.into_os_string().into_vec())
 }
 
-/// The content of the blob of `file`.
-fn read(store: &ShadowStore, file: TreeFile) -> Result<Vec<u8>> {
-    store
+/// The content of the blob of `file`, the file at `path`. A blob over [`MAX_FILE_BYTES`] is refused:
+/// snapshots never hold one, so only a crafted store has it, and refusing it bounds the memory of the files
+/// queued for the writer threads. Reading one blob is itself bounded by the store's allocation limit.
+fn read(store: &ShadowStore, path: &str, file: TreeFile) -> Result<Vec<u8>> {
+    let bytes = store
         .read_blob(file.blob)?
-        .ok_or(Error::MissingObject(file.blob))
+        .ok_or(Error::MissingObject(file.blob))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::other(format!(
+            "cannot write {path} in the test copy: its snapshot is larger than {} MiB, which Yalper \
+             never stores",
+            MAX_FILE_BYTES / (1024 * 1024)
+        ))
+        .into());
+    }
+    Ok(bytes)
 }
 
 /// Writes `files` into the copy at `root`, whose parent folders [`prepare`] made ready.
 fn write_files(store: &ShadowStore, root: &Path, files: &[(&str, TreeFile)]) -> Result<()> {
-    let write_one = |path: &str, file: TreeFile| -> Result<()> {
-        let bytes = read(store, file)?;
-        write_file(&native(root, path), file.kind, &bytes).map_err(|error| in_copy(error, path))?;
-        Ok(())
-    };
     if files.len() < PARALLEL_WRITES_FROM {
-        return files
-            .iter()
-            .try_for_each(|&(path, file)| write_one(path, file));
+        return files.iter().try_for_each(|&(path, file)| {
+            let bytes = read(store, path, file)?;
+            write_file(&native(root, path), file.kind, &bytes)
+                .map_err(|error| in_copy(error, path))?;
+            Ok(())
+        });
     }
 
     // The store is read on this thread only (it is not shared between threads); the writers create the files.
+    // A writer that fails keeps taking files without writing them, and nothing in it panics, so this thread
+    // never waits forever on a full queue.
     type Job = (String, PathBuf, FileKind, Vec<u8>);
     let (sender, receiver) = mpsc::sync_channel::<Job>(QUEUED_WRITES);
-    let receiver = Arc::new(Mutex::new(receiver));
+    let receiver = Mutex::new(receiver);
     thread::scope(|scope| {
-        let writers: Vec<_> = (0..WRITE_THREADS)
-            .filter_map(|_| {
-                let receiver = Arc::clone(&receiver);
-                thread::Builder::new()
-                    .spawn_scoped(scope, move || -> io::Result<()> {
-                        loop {
-                            let job = receiver
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .recv();
-                            let Ok((path, full, kind, bytes)) = job else {
-                                return Ok(());
-                            };
-                            write_file(&full, kind, &bytes)
-                                .map_err(|error| in_copy(error, &path))?;
-                        }
-                    })
-                    .ok()
-            })
-            .collect();
-        // Once every writer has stopped, nothing receives any more and sending fails.
-        drop(receiver);
-        if writers.is_empty() {
-            return files
-                .iter()
-                .try_for_each(|&(path, file)| write_one(path, file));
-        }
+        let writer = || -> io::Result<()> {
+            let mut result = Ok(());
+            loop {
+                // The lock is released before the file is written.
+                let job = receiver
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .recv();
+                let Ok((path, full, kind, bytes)) = job else {
+                    return result;
+                };
+                if result.is_ok() {
+                    result = write_file(&full, kind, &bytes).map_err(|error| in_copy(error, &path));
+                }
+            }
+        };
+        let writers = (0..WRITE_THREADS)
+            .map(|_| thread::Builder::new().spawn_scoped(scope, writer))
+            .collect::<io::Result<Vec<_>>>()?;
         let mut result = Ok(());
         for &(path, file) in files {
-            let bytes = match read(store, file) {
-                Ok(bytes) => bytes,
+            match read(store, path, file) {
+                Ok(bytes) => {
+                    // Cannot fail: the receiver lives until the end of this function.
+                    let _ = sender.send((path.to_owned(), native(root, path), file.kind, bytes));
+                }
                 Err(error) => {
                     result = Err(error);
                     break;
                 }
-            };
-            let job = (path.to_owned(), native(root, path), file.kind, bytes);
-            if sender.send(job).is_err() {
-                // Every writer stopped on an error, reported below.
-                break;
             }
         }
+        // Ends the writers' loops.
         drop(sender);
         for writer in writers {
             let written = writer
@@ -453,18 +518,21 @@ fn write_file(path: &Path, kind: FileKind, bytes: &[u8]) -> io::Result<()> {
     clear(path)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
+    let mut file = options.open(path)?;
+    // Set on the open file, so the mode is exact whatever the umask.
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(
-        &mut options,
-        if kind == FileKind::Executable {
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if kind == FileKind::Executable {
             0o755
         } else {
             0o644
-        },
-    );
+        };
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
     #[cfg(windows)]
     let _ = kind;
-    options.open(path)?.write_all(bytes)
+    file.write_all(bytes)
 }
 
 /// Replaces whatever is at `path` with a link to `target` on Unix, and with a plain file holding `target` on
@@ -748,10 +816,30 @@ mod tests {
         let mut copy = project.copy();
         copy.switch(&project.store, tree_a).unwrap();
         assert_holds(&copy, &a);
+        assert_exact_modes(&copy, &a);
         copy.switch(&project.store, tree_b).unwrap();
         assert_holds(&copy, &b);
+        assert_exact_modes(&copy, &b);
         copy.switch(&project.store, tree_a).unwrap();
         assert_holds(&copy, &a);
+        assert_exact_modes(&copy, &a);
+    }
+
+    /// On Unix, the files of the copy have mode 0644 or 0755 exactly, whatever the umask.
+    fn assert_exact_modes(copy: &TestCopy, files: &[(&str, FileKind, &str)]) {
+        #[cfg(unix)]
+        for &(path, kind, _) in files {
+            use std::os::unix::fs::PermissionsExt;
+            let expected = match kind {
+                Executable => 0o755,
+                Regular => 0o644,
+                Symlink => continue,
+            };
+            let metadata = fs::symlink_metadata(copy.path().join(path)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, expected, "{path}");
+        }
+        #[cfg(windows)]
+        let _ = (copy, files);
     }
 
     #[test]
@@ -853,6 +941,39 @@ mod tests {
     }
 
     #[test]
+    fn a_case_only_folder_rename_keeps_files_the_tree_does_not_have() {
+        let project = Project::new();
+        let old = [("Src/Lib/a.txt", Regular, "a")];
+        let new = [("src/lib/a.txt", Regular, "a")];
+        let (tree_old, tree_new) = (project.tree(&old), project.tree(&new));
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree_old).unwrap();
+        // A build output the tree does not have keeps both folders from being removed.
+        fs::write(copy.path().join("Src").join("Lib").join("out.o"), "o").unwrap();
+        copy.switch(&project.store, tree_new).unwrap();
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let src = copy.path().join("src");
+        if cfg!(any(windows, target_os = "macos")) {
+            // One folder, renamed to the tree's spelling, with both files.
+            assert_eq!(names(copy.path()), ["src"]);
+            assert_eq!(names(&src), ["lib"]);
+            assert_eq!(names(&src.join("lib")), ["a.txt", "out.o"]);
+        } else {
+            // Two folders on a case-sensitive file system: the old one keeps only the build output.
+            assert_eq!(names(copy.path()), ["Src", "src"]);
+            assert_eq!(names(&copy.path().join("Src").join("Lib")), ["out.o"]);
+            assert_eq!(names(&src.join("lib")), ["a.txt"]);
+        }
+    }
+
+    #[test]
     fn a_link_planted_where_the_tree_has_a_folder_is_replaced_and_never_followed() {
         let project = Project::new();
         let canary = tempfile::tempdir().unwrap();
@@ -940,35 +1061,28 @@ mod tests {
         let project = Project::new();
         let blob = project.store.write_blob(b"x").unwrap();
         let config = project.crafted_tree(&[("config", EntryKind::Blob, blob)]);
-        let mut invalid = vec![
-            // `.git` is refused everywhere, and so is `..`.
-            project.crafted_tree(&[
-                ("a.txt", EntryKind::Blob, blob),
-                (".git", EntryKind::Tree, config),
-            ]),
-            project.crafted_tree(&[
-                ("a.txt", EntryKind::Blob, blob),
-                ("..", EntryKind::Tree, config),
-            ]),
-            // NTFS's short name for `.git`, refused on every system.
-            project.crafted_tree(&[
-                ("a.txt", EntryKind::Blob, blob),
-                ("GIT~1", EntryKind::Tree, config),
-            ]),
+        // `.git` is refused everywhere, and so are `..` and `GIT~1`, NTFS's short name for `.git`.
+        let mut bad = vec![
+            (".git", EntryKind::Tree, config),
+            ("..", EntryKind::Tree, config),
+            ("GIT~1", EntryKind::Tree, config),
         ];
         // A name only Windows refuses, as a store written on another system could hold.
         if cfg!(windows) {
-            invalid.push(project.crafted_tree(&[
-                ("a.txt", EntryKind::Blob, blob),
-                ("nul.txt", EntryKind::Blob, blob),
-            ]));
+            bad.push(("nul.txt", EntryKind::Blob, blob));
         }
-        for tree in invalid {
+        for entry in bad {
+            // The bad entry sits in a folder that sorts after a valid file, so the switch must check every
+            // path before writing the first file.
+            let later = project.crafted_tree(&[entry]);
+            let tree = project.crafted_tree(&[
+                ("a.txt", EntryKind::Blob, blob),
+                ("z", EntryKind::Tree, later),
+            ]);
             let mut copy = project.copy();
             let error = copy.switch(&project.store, tree).unwrap_err();
             assert!(matches!(error, Error::InvalidPath { .. }), "{error}");
-            assert!(contents(copy.path()).is_empty());
-            assert!(!copy.path().join("..").join("config").exists());
+            assert!(contents(copy.path()).is_empty(), "{}", entry.0);
         }
     }
 
@@ -1038,15 +1152,33 @@ mod tests {
         let tree = project.tree(&files);
         let mut copy = project.copy();
         copy.switch(&project.store, tree).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let run = copy.path().join("run.sh");
-            fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).unwrap();
-            let mut again = project.copy();
-            assert_eq!(again.switch(&project.store, tree).unwrap().written, 1);
-            assert_holds(&again, &files);
+        use std::os::unix::fs::PermissionsExt;
+        let run = copy.path().join("run.sh");
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut again = project.copy();
+        assert_eq!(again.switch(&project.store, tree).unwrap().written, 1);
+        assert_holds(&again, &files);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_replaced_on_a_first_switch() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = Project::new();
+        let files = [("secret.txt", Regular, "x"), ("other.txt", Regular, "y")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree).unwrap();
+        let path = copy.path().join("secret.txt");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_ok() {
+            // Running as root, which reads any file: nothing to test.
+            return;
         }
+        let mut again = project.copy();
+        assert_eq!(again.switch(&project.store, tree).unwrap().written, 1);
+        assert_holds(&again, &files);
+        assert_exact_modes(&again, &files);
     }
 
     #[test]
@@ -1102,6 +1234,50 @@ mod tests {
         let files = [("ok.txt", Regular, "ok")];
         copy.switch(&project.store, project.tree(&files)).unwrap();
         assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn a_switch_that_fails_after_writing_is_undone_by_the_next_switch() {
+        let project = Project::new();
+        let a = [("a.txt", Regular, "a"), ("m.txt", Regular, "m")];
+        let tree_a = project.tree(&a);
+        // B changes `a.txt`, written before `z.txt`, whose blob is missing.
+        let missing = ObjectId::from_hex(b"0123456789012345678901234567890123456789").unwrap();
+        let changed = project.store.write_blob(b"changed").unwrap();
+        let m = project.store.write_blob(b"m").unwrap();
+        let tree_b = project.crafted_tree(&[
+            ("a.txt", EntryKind::Blob, changed),
+            ("m.txt", EntryKind::Blob, m),
+            ("z.txt", EntryKind::Blob, missing),
+        ]);
+        let mut copy = project.copy();
+        copy.switch(&project.store, tree_a).unwrap();
+        assert!(matches!(
+            copy.switch(&project.store, tree_b),
+            Err(Error::MissingObject(id)) if id == missing
+        ));
+        assert_eq!(fs::read(copy.path().join("a.txt")).unwrap(), b"changed");
+        let switched = copy.switch(&project.store, tree_a).unwrap();
+        assert_eq!(
+            switched,
+            Switched {
+                written: 1,
+                removed: 0
+            }
+        );
+        assert_holds(&copy, &a);
+    }
+
+    #[test]
+    fn a_blob_larger_than_snapshots_hold_is_refused() {
+        let project = Project::new();
+        let large = vec![b'x'; MAX_FILE_BYTES as usize + 1];
+        let blob = project.store.write_blob(&large).unwrap();
+        let tree = project.crafted_tree(&[("large.bin", EntryKind::Blob, blob)]);
+        let mut copy = project.copy();
+        let error = copy.switch(&project.store, tree).unwrap_err();
+        assert!(error.to_string().contains("larger than 10 MiB"), "{error}");
+        assert!(contents(copy.path()).is_empty());
     }
 
     #[test]
