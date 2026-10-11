@@ -1,46 +1,44 @@
-//! Boundary files in `.yalper/bisect/`, the folder that holds the test copies.
+//! Boundary files at the top of the project's cache folder, the folder that holds the test copies.
 //!
-//! A test copy sits inside the project, so a tool that searches the folders above it for its project file
-//! reaches the project when the step has no such file (a step from before the agent created it): `npm test`
-//! would run the project's script in the project, `pytest` would load the project's `conftest.py` and write
-//! its cache there, `cargo test` would build the project's current code and could write its `Cargo.lock`, and
-//! `uv run` would use, or even create, the project's virtual environment. The files written here end those
-//! searches in `.yalper/bisect/`, so the tools fail there or find nothing to run:
+//! The copies live outside the project (see [`CacheDir`]), so no tool that searches the folders above a copy
+//! reaches the project. Without these files, such searches would go on to the user's home folder, which often
+//! holds a stray `package.json`, `node_modules` or `pytest.ini`. The files written here end them in the project's
+//! cache folder, so that in a step without the file a tool looks for (a step from before the agent created it),
+//! the tool fails there or finds nothing to run:
 //!
 //! - `package.json`, with no scripts: `npm test` fails with "Missing script". npm, pnpm, bun and Yarn 1 take
 //!   the nearest `package.json` as the package a command runs in, and Node takes the module type of a step's
-//!   `.js` files from it instead of from the project's;
-//! - `pytest.ini`: pytest's root folder (where it writes `.pytest_cache`) is `.yalper/bisect/`, and it loads no
-//!   `conftest.py` above it;
+//!   `.js` files from it;
+//! - `pytest.ini`: pytest's root folder (where it writes `.pytest_cache`) is the project's cache folder, and it
+//!   loads no `conftest.py` above it;
 //! - `pyproject.toml` with a `[project]` table: uv (and Poetry, Hatch, PDM) take it as the project, so `uv run`
-//!   uses its own environment in `.yalper/bisect/.venv`, never the project's. It also ends uv's search for a
-//!   workspace above a step's own project;
+//!   uses its own environment in the cache folder's `.venv`. It also ends uv's search for a workspace above a
+//!   step's own project;
 //! - `Cargo.toml`, a package whose library file does not exist: `cargo test` fails with "can't find lib
 //!   `no_cargo_toml_in_this_step`". Cargo also reads it when it searches for a workspace above a step's own
 //!   package, where a package that is not a workspace changes nothing.
 //!
-//! Not covered (searches no file here can end): pnpm finds `pnpm-workspace.yaml` in any folder above, so in a
-//! step without one, `pnpm -r` and `pnpm install` act on the project's workspace (a boundary
-//! `pnpm-workspace.yaml` would make pnpm install single-package copies into `.yalper/bisect/`); `npx`,
-//! `npm exec` and `bunx` find programs in the `node_modules/.bin` of any folder above, like Node's module
-//! resolution; Yarn 2 and later were not tested; cargo, ESLint, Prettier and TypeScript read their
-//! configuration files (`.cargo/config.toml`, `eslint.config.js`, `tsconfig.json`) from every folder above, so
-//! a step without one uses the project's current one; a step whose root package has no `[workspace]` fails to
-//! build with cargo when the project's current `Cargo.toml` is a workspace.
+//! Not ended here, as in any folder under the home folder: pnpm's search for `pnpm-workspace.yaml`, the search
+//! of `npx`, `npm exec` and `bunx` for programs in the `node_modules/.bin` of every folder above, Node's module
+//! resolution, and the configuration files that cargo, ESLint, Prettier and TypeScript read from every folder
+//! above (`~/.cargo/config.toml`, which applies anyway as the one of `CARGO_HOME`, or `~/.prettierrc`). Yarn 2
+//! and later were not tested.
 //!
-//! The files are rewritten whenever their content differs: what is on disk is never trusted, since a test run
-//! can change them (`npm pkg set`, `npm install <package>` in a step without `package.json`) and a pulled
-//! commit can put files under `.yalper/`.
+//! What tools and tests leave next to these files (a `node_modules/` from `npm install <package>`, uv's `.venv/`,
+//! a planted `conftest.py`) is removed by [`clean_root`](super::clean_root). The files are rewritten whenever
+//! they differ: what is on disk is never trusted, since a test run can change them (`npm pkg set`) or put a
+//! hard link to another file in their place. A file that differs is removed and created anew, never written in
+//! place.
 
 use std::fs;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Write};
 
-use super::BISECT_DIR;
-use super::copy::{open_private_dir, remove_entry};
-use crate::safe_fs::{Access, OwnedDir};
+use super::CacheDir;
+use super::copy::remove_entry;
+use crate::safe_fs::{self, OwnedDir};
 
-/// The boundary files: name in `.yalper/bisect/` and content.
-const FILES: [(&str, &str); 4] = [
+/// The boundary files: name in the project's cache folder and content.
+pub(super) const FILES: [(&str, &str); 4] = [
     ("package.json", "{\"private\": true}\n"),
     (
         "pytest.ini",
@@ -59,24 +57,20 @@ const FILES: [(&str, &str); 4] = [
     ),
 ];
 
-/// Writes the boundary files into `.yalper/bisect/` of the `.yalper/` folder `yalper_dir`, creating that folder
-/// if it is missing: each one whose content differs, or that is not a regular file with a single link, is
-/// replaced (a link or folder at its name is removed, never followed), on Unix with mode 0600. Returns how many
-/// were written.
+/// Writes the boundary files into the project's cache folder `cache`: each one that is not a regular file
+/// holding exactly its content, with a single link (Unix) and as Yalper made it (mode 0600 on Unix, not
+/// read-only on Windows), is removed, never followed, and created anew. Returns how many were written.
 ///
-/// Call it at the start of every bisect, and before every run, since a run can change them: checking four
-/// small files is cheap.
-pub fn write_boundaries(yalper_dir: &OwnedDir) -> io::Result<usize> {
-    let bisect = open_private_dir(&yalper_dir.path().join(BISECT_DIR))?;
+/// Call it at the start of every bisect, and before every run and every install, after
+/// [`clean_root`](super::clean_root), since a run can change them: checking four small files is cheap.
+pub fn write_boundaries(cache: &CacheDir) -> io::Result<usize> {
+    let dir = cache.dir();
     let mut written = 0;
     for (name, content) in FILES {
-        if write_if_different(&bisect, name, content.as_bytes()).map_err(|error| {
+        if write_if_different(dir, name, content.as_bytes()).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!(
-                    "cannot write {}: {error}",
-                    bisect.path().join(name).display()
-                ),
+                format!("cannot write {}: {error}", dir.path().join(name).display()),
             )
         })? {
             written += 1;
@@ -90,76 +84,86 @@ fn write_if_different(dir: &OwnedDir, name: &str, content: &[u8]) -> io::Result<
     dir.check_still_at_path()?;
     let path = dir.path().join(name);
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if !metadata.is_file() => remove_entry(&path, &metadata)?,
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-        _ => {}
-    }
-    let mut file = match dir.open_file(name, Access::ReadWrite) {
-        Ok(file) => file,
-        // A file with a second hard link (Unix), or one a test made read-only or unreadable: this name is
-        // removed and the file created anew.
-        Err(_) => {
-            remove_entry(&path, &fs::symlink_metadata(&path)?)?;
-            dir.open_file(name, Access::ReadWrite)?
+        Ok(metadata) => {
+            if is_as_written(&metadata)
+                && safe_fs::read_small_regular_file(&path, content.len() as u64).as_deref()
+                    == Some(content)
+            {
+                return Ok(false);
+            }
+            remove_entry(&path, &metadata)?;
         }
-    };
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path)?;
     #[cfg(unix)]
     {
+        // Whatever the umask.
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let mut current = Vec::new();
-    (&file)
-        .take(content.len() as u64 + 1)
-        .read_to_end(&mut current)?;
-    if current == content {
-        return Ok(false);
-    }
-    file.set_len(0)?;
-    file.rewind()?;
     file.write_all(content)?;
     Ok(true)
+}
+
+/// Whether `metadata` (not followed) is of a file as [`write_if_different`] makes it.
+fn is_as_written(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file() && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600
+    }
+    // The standard library gives no link count on Windows: a hard link holding the right content is kept, and
+    // nothing is ever written through it.
+    #[cfg(windows)]
+    {
+        metadata.is_file() && !metadata.permissions().readonly()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
 
     use crate::bisect::link::make_link;
     use crate::bisect::testing::{Project, state, tool, venv_python, write};
-    use crate::bisect::{Logs, Outcome, PythonEnvs, TestCopy, env_additions, run, run_env};
-
-    fn bisect_dir(project: &Project) -> PathBuf {
-        project.path().join(".yalper").join(BISECT_DIR)
-    }
+    use crate::bisect::{
+        Logs, NodeModules, Outcome, PythonEnvs, TestCopy, clean_root, env_additions, run, run_env,
+    };
+    use crate::repo::Token;
 
     fn read(project: &Project, name: &str) -> String {
-        fs::read_to_string(bisect_dir(project).join(name)).unwrap()
+        fs::read_to_string(project.cache.path().join(name)).unwrap()
     }
 
     #[test]
     fn boundary_files_are_written_and_then_rewritten_only_when_they_differ() {
         let project = Project::new();
-        assert_eq!(write_boundaries(&project.yalper).unwrap(), FILES.len());
+        assert_eq!(write_boundaries(&project.cache).unwrap(), FILES.len());
         for (name, content) in FILES {
             assert_eq!(read(&project, name), content);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let path = bisect_dir(&project).join(name);
+                let path = project.cache.path().join(name);
                 let mode = fs::metadata(path).unwrap().permissions().mode();
                 assert_eq!(mode & 0o777, 0o600, "{name}");
             }
         }
-        assert_eq!(write_boundaries(&project.yalper).unwrap(), 0);
+        assert_eq!(write_boundaries(&project.cache).unwrap(), 0);
 
         // A test run added a script to one, made another read-only, and emptied a third: all three are written
         // anew.
-        let dir = bisect_dir(&project);
+        let dir = project.cache.path();
         fs::write(
             dir.join("package.json"),
             r#"{"private": true, "scripts": {"test": "x"}}"#,
@@ -170,34 +174,38 @@ mod tests {
         permissions.set_readonly(true);
         fs::set_permissions(&ini, permissions).unwrap();
         fs::write(dir.join("Cargo.toml"), "").unwrap();
-        assert_eq!(write_boundaries(&project.yalper).unwrap(), 3);
+        assert_eq!(write_boundaries(&project.cache).unwrap(), 3);
         for (name, content) in FILES {
             assert_eq!(read(&project, name), content);
         }
     }
 
     #[test]
-    fn a_link_or_folder_in_place_of_a_boundary_file_is_replaced_never_followed() {
+    fn a_link_hard_link_or_folder_in_place_of_a_boundary_file_is_replaced_never_followed() {
         let project = Project::new();
         let canary = tempfile::tempdir().unwrap();
         write(canary.path(), "package.json", "keep me");
-        write_boundaries(&project.yalper).unwrap();
-        let dir = bisect_dir(&project);
+        write(canary.path(), "Cargo.toml", "keep me too");
+        write_boundaries(&project.cache).unwrap();
+        let dir = project.cache.path();
         fs::remove_file(dir.join("package.json")).unwrap();
         make_link(canary.path(), &dir.join("package.json")).unwrap();
         fs::remove_file(dir.join("pytest.ini")).unwrap();
-        write(&dir, "pytest.ini/conftest.py", "");
+        write(dir, "pytest.ini/conftest.py", "");
+        // A second hard link to a file outside: writing through it would change that file.
+        fs::remove_file(dir.join("Cargo.toml")).unwrap();
+        fs::hard_link(canary.path().join("Cargo.toml"), dir.join("Cargo.toml")).unwrap();
         #[cfg(unix)]
         {
-            // A second hard link to a file outside: writing through it would change that file.
-            let outside = canary.path().join("Cargo.toml");
-            fs::remove_file(dir.join("Cargo.toml")).unwrap();
-            fs::write(&outside, "keep me too").unwrap();
-            fs::hard_link(&outside, dir.join("Cargo.toml")).unwrap();
+            write(canary.path(), "pyproject.toml", "keep me three");
+            fs::remove_file(dir.join("pyproject.toml")).unwrap();
+            let target = canary.path().join("pyproject.toml");
+            std::os::unix::fs::symlink(target, dir.join("pyproject.toml")).unwrap();
         }
         let before = state(canary.path());
 
-        assert!(write_boundaries(&project.yalper).unwrap() >= 2);
+        let replaced = if cfg!(unix) { 4 } else { 3 };
+        assert_eq!(write_boundaries(&project.cache).unwrap(), replaced);
         for (name, content) in FILES {
             assert!(fs::symlink_metadata(dir.join(name)).unwrap().is_file());
             assert_eq!(read(&project, name), content);
@@ -206,22 +214,42 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_hard_link_in_place_of_a_boundary_file_leaves_its_file_as_it_was() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        let target = canary.path().join("keep.txt");
+        fs::write(&target, "keep me").unwrap();
+        let mut permissions = fs::metadata(&target).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&target, permissions).unwrap();
+        fs::hard_link(&target, project.cache.path().join("package.json")).unwrap();
+        let before = state(canary.path());
+
+        assert_eq!(write_boundaries(&project.cache).unwrap(), FILES.len());
+        assert_eq!(read(&project, "package.json"), FILES[0].1);
+        assert_eq!(state(canary.path()), before);
+        // The attribute belongs to the file, so clearing it through the link would have cleared it there too.
+        assert!(fs::metadata(&target).unwrap().permissions().readonly());
+    }
+
+    #[test]
     fn switches_and_logs_leave_the_boundary_files_alone() {
         let project = Project::new();
-        write_boundaries(&project.yalper).unwrap();
+        write_boundaries(&project.cache).unwrap();
         let mut copy = project.copy();
         copy.switch(&project.store, project.tree(&[("package.json", "{}")]))
             .unwrap();
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
-        let mut second = TestCopy::open(&project.yalper, 1).unwrap();
+        let mut second = TestCopy::open(&project.cache, 1).unwrap();
         second
             .switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
-        Logs::open(&project.yalper).unwrap();
+        Logs::open(&project.cache).unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
         env_additions(&copy, &python).unwrap();
-        assert_eq!(write_boundaries(&project.yalper).unwrap(), 0);
+        assert_eq!(clean_root(&project.cache).unwrap(), 0);
+        assert_eq!(write_boundaries(&project.cache).unwrap(), 0);
     }
 
     fn environment() -> Vec<(OsString, OsString)> {
@@ -256,34 +284,35 @@ mod tests {
         copy
     }
 
-    /// Runs `command` in `copy` as a bisect does: boundary files written, Python environments linked, and the
-    /// environment built by [`run_env`] from `user`. The outcome and the output.
+    /// Runs `command` in `copy` as a bisect does: the top of the cache folder cleaned, boundary files written,
+    /// Python environments linked, and the environment built by [`run_env`] from `user`. The outcome and the
+    /// output.
     fn run_as_bisect(
-        project: &Project,
         copy: &mut TestCopy,
         command: &str,
         user: Vec<(OsString, OsString)>,
     ) -> (Outcome, String) {
-        write_boundaries(&project.yalper).unwrap();
-        let mut python = PythonEnvs::new(project.path()).unwrap();
+        let project = copy.cache().project().to_owned();
+        clean_root(copy.cache()).unwrap();
+        write_boundaries(copy.cache()).unwrap();
+        let mut python = PythonEnvs::new(&project).unwrap();
         python.link(copy).unwrap();
         let additions = env_additions(copy, &python).unwrap();
-        let env = run_env(user, project.path(), copy, additions).unwrap();
+        let env = run_env(user, &project, copy, additions).unwrap();
         run_with(copy.path(), command, &env)
     }
 
-    /// Runs `command` in `copy` without what keeps it there: no boundary files, and `user` as it is. Shows that
-    /// the command does reach the project otherwise.
-    fn run_unprotected(
-        project: &Project,
-        copy: &TestCopy,
+    /// Runs `command` in the folder `sub` of the project (created if missing), where the test copies used to
+    /// be, with the environment `user` as it is: shows that the command does reach the project from there, so
+    /// that each test proves something.
+    fn run_in_project(
+        project: &Path,
         command: &str,
-        user: Vec<(OsString, OsString)>,
+        user: &[(OsString, OsString)],
     ) -> (Outcome, String) {
-        for (name, _) in FILES {
-            fs::remove_file(bisect_dir(project).join(name)).unwrap();
-        }
-        run_with(copy.path(), command, &user)
+        let sub = project.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        run_with(&sub, command, user)
     }
 
     fn run_with(dir: &Path, command: &str, env: &[(OsString, OsString)]) -> (Outcome, String) {
@@ -302,33 +331,35 @@ mod tests {
         assert!(output.contains(expected), "{expected:?} not in: {output}");
     }
 
+    /// Runs `git` with `args` in `dir`, outside any environment that names a repository, and checks it worked.
+    fn git_in(git: &str, dir: &Path, args: &[&str]) {
+        // No automatic maintenance and no file system monitor: git would run them in the background, changing
+        // `.git` while its state is read.
+        let output = Command::new(git)
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["-c", "user.name=Yalper Test"])
+            .args(["-c", "user.email=test@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
     #[test]
     fn git_in_a_copy_finds_no_repository_even_when_told_to_use_the_projects() {
         let Some(git) = tool(&["git"]) else {
             return;
         };
         let project = Project::new();
-        let git_in_project = |args: &[&str]| {
-            // No automatic maintenance and no file system monitor: git would run them in the background,
-            // changing `.git` while its state is read.
-            let output = Command::new(git)
-                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
-                .args(["-c", "core.fsmonitor=false"])
-                .args(["-c", "user.name=Yalper Test"])
-                .args(["-c", "user.email=test@example.com"])
-                .args(args)
-                .current_dir(project.path())
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-        };
         project.write("a.txt", "committed\n");
-        git_in_project(&["init", "-q"]);
-        git_in_project(&["add", "a.txt"]);
-        git_in_project(&["commit", "-q", "-m", "one"]);
+        git_in(git, project.path(), &["init", "-q"]);
+        git_in(git, project.path(), &["add", "a.txt"]);
+        git_in(git, project.path(), &["commit", "-q", "-m", "one"]);
         // An uncommitted change: `git stash` would take it away.
         project.write("a.txt", "changed\n");
         let before = state(project.path());
@@ -344,14 +375,81 @@ mod tests {
             root.join(".git").join("index").into(),
         ));
         for command in ["git status", "git stash", "cd .. && git status"] {
-            let (outcome, output) = run_as_bisect(&project, &mut copy, command, user.clone());
+            let (outcome, output) = run_as_bisect(&mut copy, command, user.clone());
             assert_failed(outcome, &output, "not a git repository");
         }
         assert_eq!(state(project.path()), before);
 
-        // Without the protections, git in the copy finds the project's repository.
+        // From inside the project, git finds the project's repository.
         let user = environment_without(&["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]);
-        let (outcome, output) = run_unprotected(&project, &copy, "git status", user);
+        let (outcome, output) = run_in_project(project.path(), "git status", &user);
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+    }
+
+    #[test]
+    fn git_entering_the_project_through_a_link_of_the_copy_finds_no_repository() {
+        let Some(git) = tool(&["git"]) else {
+            return;
+        };
+        let project = Project::new();
+        project.write(".gitignore", "node_modules/\n");
+        project.write("node_modules/pkg/index.js", "");
+        git_in(git, project.path(), &["init", "-q"]);
+        let before = state(project.path());
+        let files = [(".gitignore", "node_modules/\n"), ("package.json", "{}")];
+        let mut copy = copy_with(&project, &files);
+        let mut node_modules = NodeModules::new(project.path()).unwrap();
+        node_modules.link(&mut copy).unwrap();
+        let user = environment_without(&[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+        ]);
+        // The package's folder in the copy is a link to the project's.
+        let command = if cfg!(windows) {
+            r"cd node_modules\pkg && git stash"
+        } else {
+            "cd node_modules/pkg && git stash"
+        };
+        let (outcome, output) = run_as_bisect(&mut copy, command, user.clone());
+        assert_failed(outcome, &output, "not a git repository");
+        assert_eq!(state(project.path()), before);
+
+        // Without the environment of a run, git finds the project's repository from the package's real folder,
+        // where the shell is on Unix (on Windows it stays in the copy's path of the junction).
+        #[cfg(unix)]
+        {
+            let command = "cd node_modules/pkg && git status";
+            let (outcome, output) = run_with(copy.path(), command, &user);
+            assert_eq!(outcome, Outcome::Passed, "{output}");
+        }
+    }
+
+    #[test]
+    fn git_finds_no_repository_around_the_cache_folder() {
+        let Some(git) = tool(&["git"]) else {
+            return;
+        };
+        // A home folder kept in git (dotfiles) that holds the cache folder.
+        let home = tempfile::tempdir().unwrap();
+        git_in(git, home.path(), &["init", "-q"]);
+        let project = Project::with_cache_base(home);
+        let mut copy = copy_with(&project, &[("README.md", "")]);
+        let user = environment_without(&[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+        ]);
+        // In the copy, and at the top of the project's cache folder.
+        for command in ["git status", "cd .. && git status"] {
+            let (outcome, output) = run_as_bisect(&mut copy, command, user.clone());
+            assert_failed(outcome, &output, "not a git repository");
+        }
+
+        // Without the environment of a run, git in the copy finds the home folder's repository.
+        let (outcome, output) = run_with(copy.path(), "git status", &user);
         assert_eq!(outcome, Outcome::Passed, "{output}");
     }
 
@@ -372,12 +470,12 @@ mod tests {
         let before = state(project.path());
 
         let mut copy = copy_with(&project, &[("README.md", ""), ("index.js", "")]);
-        let (outcome, output) = run_as_bisect(&project, &mut copy, "npm test", environment());
+        let (outcome, output) = run_as_bisect(&mut copy, "npm test", environment());
         assert_failed(outcome, &output, "Missing script");
         assert_eq!(state(project.path()), before);
 
-        // Without the boundary, npm runs the project's script in the project.
-        let (outcome, output) = run_unprotected(&project, &copy, "npm test", environment());
+        // From inside the project, npm runs the project's script.
+        let (outcome, output) = run_in_project(project.path(), "npm test", &environment());
         assert_eq!(outcome, Outcome::Passed, "{output}");
         assert!(project.path().join("ran").exists());
     }
@@ -439,15 +537,14 @@ mod tests {
             }
         }
         user.push(("VIRTUAL_ENV".into(), venv.clone().into()));
-        let (outcome, output) = run_as_bisect(&project, &mut copy, "pytest", user.clone());
+        let (outcome, output) = run_as_bisect(&mut copy, "pytest", user.clone());
         assert_eq!(outcome, Outcome::Passed, "{output}");
         assert!(output.contains("1 passed"), "{output}");
         assert_eq!(state(project.path()), before);
-        assert!(bisect_dir(&project).join(".pytest_cache").is_dir());
+        assert!(project.cache.path().join(".pytest_cache").is_dir());
 
-        // Without the boundary, pytest loads the project's `conftest.py` and writes its cache there.
-        let (outcome, output) = run_unprotected(&project, &copy, "pytest", user);
-        assert_eq!(outcome, Outcome::Passed, "{output}");
+        // From inside the project, pytest loads the project's `conftest.py` and writes its cache there.
+        run_in_project(project.path(), "pytest", &user);
         assert!(project.path().join("ran").exists());
         assert!(project.path().join(".pytest_cache").is_dir());
     }
@@ -471,13 +568,13 @@ mod tests {
 
         let mut copy = copy_with(&project, &[("README.md", "")]);
         let command = "cargo test --offline";
-        let (outcome, output) = run_as_bisect(&project, &mut copy, command, cargo_environment(&[]));
+        let (outcome, output) = run_as_bisect(&mut copy, command, cargo_environment(&[]));
         assert_failed(outcome, &output, "no_cargo_toml_in_this_step");
         assert_eq!(state(project.path()), before);
 
-        // Without the boundary, cargo builds and tests the project's code, and writes its `Cargo.lock`.
+        // From inside the project, cargo builds and tests the project's code, and writes its `Cargo.lock`.
         let user = cargo_environment(&["CARGO_TARGET_DIR"]);
-        let (outcome, output) = run_unprotected(&project, &copy, command, user);
+        let (outcome, output) = run_in_project(project.path(), command, &user);
         assert_eq!(outcome, Outcome::Passed, "{output}");
         assert!(project.path().join("ran").exists());
         assert!(project.path().join("Cargo.lock").exists());
@@ -508,14 +605,14 @@ mod tests {
             for (path, content) in files {
                 project.write(path, content);
             }
-            // A relative build folder in the project's cargo settings, which cargo also reads for the copy:
-            // it would be resolved against the project.
+            // A relative build folder in the project's cargo settings, which cargo would resolve against the
+            // project if it read them for the copy.
             project.write(".cargo/config.toml", "[build]\nbuild-dir = \"build-out\"\n");
             let before = state(project.path());
             let mut copy = copy_with(&project, files);
             let user = cargo_environment(&[]);
             let command = "cargo test --offline";
-            let (outcome, output) = run_as_bisect(&project, &mut copy, command, user);
+            let (outcome, output) = run_as_bisect(&mut copy, command, user);
             assert_eq!(outcome, Outcome::Passed, "{output}");
             assert!(output.contains("1 passed"), "{output}");
             assert!(!output.contains("no-cargo-toml"), "{output}");
@@ -545,13 +642,8 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         let before = state(project.path());
 
-        let mut copy = copy_with(
-            &project,
-            &[
-                ("README.md", ""),
-                ("prefix.py", "import sys\nprint('prefix=' + sys.prefix)\n"),
-            ],
-        );
+        let prefix_py = "import sys\nprint('prefix=' + sys.prefix)\n";
+        let mut copy = copy_with(&project, &[("README.md", ""), ("prefix.py", prefix_py)]);
         // The project's environment is activated.
         let mut user =
             environment_without(&["VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "UV_NO_SYNC"]);
@@ -564,17 +656,241 @@ mod tests {
             let line = line.unwrap_or_else(|| panic!("no prefix in: {output}"));
             fs::canonicalize(line).unwrap()
         };
-        let (outcome, output) = run_as_bisect(&project, &mut copy, command, user.clone());
+        let (outcome, output) = run_as_bisect(&mut copy, command, user.clone());
         assert_eq!(outcome, Outcome::Passed, "{output}");
-        let yalper = fs::canonicalize(project.path().join(".yalper")).unwrap();
-        assert!(prefix(&output).starts_with(&yalper), "{output}");
+        let cache = fs::canonicalize(project.cache.path()).unwrap();
+        assert!(prefix(&output).starts_with(&cache), "{output}");
         assert_eq!(state(project.path()), before);
 
-        // Without the boundary, uv runs the project's environment.
+        // From inside the project, uv runs the project's environment.
         user.push(("UV_NO_SYNC".into(), "1".into()));
-        let (outcome, output) = run_unprotected(&project, &copy, command, user);
+        project.write("sub/prefix.py", prefix_py);
+        let (outcome, output) = run_in_project(project.path(), command, &user);
         assert_eq!(outcome, Outcome::Passed, "{output}");
         let venv = fs::canonicalize(project.path().join(".venv")).unwrap();
         assert_eq!(prefix(&output), venv, "{output}");
+    }
+
+    #[test]
+    fn pnpm_in_a_step_without_its_workspace_file_never_runs_the_projects_workspace() {
+        if tool(&["pnpm.cmd", "pnpm"]).is_none() {
+            return;
+        }
+        let root = r#"{"name": "root", "version": "1.0.0", "private": true}"#;
+        let package = r#"{"name": "a", "version": "1.0.0", "scripts": {"test": "node ran.js"}}"#;
+        let ran = "require('fs').writeFileSync(require('path').join(__dirname, 'ran'), '')\n";
+        let files = [
+            ("package.json", root),
+            ("packages/a/package.json", package),
+            ("packages/a/ran.js", ran),
+        ];
+        let project = Project::new();
+        for (path, content) in files {
+            project.write(path, content);
+        }
+        project.write("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+        let before = state(project.path());
+
+        // The step has the packages, but not the workspace file yet.
+        let mut copy = copy_with(&project, &files);
+        let (_, output) = run_as_bisect(&mut copy, "pnpm -r test", environment());
+        assert!(!project.path().join("packages/a/ran").exists(), "{output}");
+        assert_eq!(state(project.path()), before);
+
+        // From inside the project, pnpm runs the tests of the project's workspace.
+        let (outcome, output) = run_in_project(project.path(), "pnpm -r test", &environment());
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        assert!(project.path().join("packages/a/ran").exists(), "{output}");
+    }
+
+    #[test]
+    fn npx_and_npm_exec_in_a_copy_never_find_the_projects_programs() {
+        if tool(&["npm.cmd", "npm"]).is_none() {
+            return;
+        }
+        let project = Project::new();
+        project.write(
+            "package.json",
+            r#"{"name": "project", "version": "1.0.0", "dependencies": {"yalper-test-bin": "file:./tool"}}"#,
+        );
+        project.write(
+            "tool/package.json",
+            r#"{"name": "yalper-test-bin", "version": "1.0.0", "bin": {"yalper-test-bin": "bin.js"}}"#,
+        );
+        project.write(
+            "tool/bin.js",
+            "#!/usr/bin/env node\nrequire('fs').writeFileSync(require('path').join(__dirname, 'ran'), '')\n",
+        );
+        // From a local folder: no network.
+        let install = "npm install --offline --no-audit --no-fund --loglevel=error";
+        let (outcome, output) = run_with(project.path(), install, &environment());
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        assert!(project.path().join("node_modules").join(".bin").is_dir());
+        let before = state(project.path());
+
+        // A step without the dependency, so no link to the project's packages.
+        let step = r#"{"name": "project", "version": "1.0.0"}"#;
+        let mut copy = copy_with(&project, &[("package.json", step), ("index.js", "")]);
+        // `--no`: without a terminal, npm would otherwise download a package of that name.
+        for command in [
+            "npx --no yalper-test-bin",
+            "npm exec --no -- yalper-test-bin",
+        ] {
+            let (outcome, output) = run_as_bisect(&mut copy, command, environment());
+            assert!(matches!(outcome, Outcome::Failed(_)), "{command}: {output}");
+        }
+        assert!(!project.path().join("tool").join("ran").exists());
+        assert_eq!(state(project.path()), before);
+
+        // From inside the project, npx runs the project's program.
+        let command = "npx --no yalper-test-bin";
+        let (outcome, output) = run_in_project(project.path(), command, &environment());
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        assert!(project.path().join("tool").join("ran").exists());
+    }
+
+    #[test]
+    fn cargo_in_a_copy_never_uses_the_projects_cargo_configuration() {
+        if tool(&["cargo"]).is_none() {
+            return;
+        }
+        let project = Project::new();
+        // A runner that writes a marker in the project instead of running the tests.
+        let marker = project.path().join("ran");
+        let marker_text = marker.to_str().unwrap();
+        if cfg!(windows) && marker_text.contains(' ') {
+            // `cmd /c` below would need quotes.
+            return;
+        }
+        let runner = if cfg!(windows) {
+            format!(
+                r#"["cmd", "/d", "/c", {:?}]"#,
+                format!("echo.>{marker_text}")
+            )
+        } else {
+            format!(r#"["sh", "-c", "echo > \"$1\"", "sh", {marker_text:?}]"#)
+        };
+        project.write(
+            ".cargo/config.toml",
+            &format!("[target.'cfg(all())']\nrunner = {runner}\n"),
+        );
+        let before = state(project.path());
+
+        let manifest = "[package]\nname = \"step\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib = "#[test]\nfn works() {}\n";
+        let with_config = [
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib),
+            (".cargo/config.toml", "[term]\nquiet = false\n"),
+        ];
+        // A package without, and one with, its own configuration.
+        for files in [&with_config[..2], &with_config[..]] {
+            let mut copy = copy_with(&project, files);
+            let command = "cargo test --offline";
+            let (outcome, output) = run_as_bisect(&mut copy, command, cargo_environment(&[]));
+            assert_eq!(outcome, Outcome::Passed, "{output}");
+            assert!(output.contains("1 passed"), "{output}");
+            assert!(!marker.exists());
+        }
+        assert_eq!(state(project.path()), before);
+
+        // A package inside the project gets the project's runner.
+        for (path, content) in with_config {
+            project.write(&format!("sub/{path}"), content);
+        }
+        let user = cargo_environment(&["CARGO_TARGET_DIR"]);
+        let (outcome, output) = run_in_project(project.path(), "cargo test --offline", &user);
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        assert!(marker.exists(), "{output}");
+    }
+
+    #[test]
+    fn prettier_in_a_copy_never_loads_the_projects_configuration() {
+        if tool(&["npm.cmd", "npm"]).is_none() {
+            return;
+        }
+        let package =
+            r#"{"name": "project", "version": "1.0.0", "devDependencies": {"prettier": "3.3.3"}}"#;
+        let project = Project::new();
+        project.write(".gitignore", "node_modules/\n");
+        project.write("package.json", package);
+        let install = "npm install --no-audit --no-fund --loglevel=error";
+        let (outcome, output) = run_with(project.path(), install, &environment());
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        // Prettier runs its configuration file when it loads it.
+        project.write(
+            "prettier.config.js",
+            "require('fs').writeFileSync(require('path').join(__dirname, 'ran'), '');\n\
+             module.exports = {};\n",
+        );
+        let before = state(project.path());
+
+        // The step has no Prettier configuration yet; its packages are the project's, through a link farm.
+        let formatted = "const a = 1;\n";
+        let mut copy = copy_with(
+            &project,
+            &[
+                (".gitignore", "node_modules/\n"),
+                ("package.json", package),
+                ("a.js", formatted),
+            ],
+        );
+        let mut node_modules = NodeModules::new(project.path()).unwrap();
+        node_modules.link(&mut copy).unwrap();
+        let command = "npx --no prettier --check a.js";
+        let (outcome, output) = run_as_bisect(&mut copy, command, environment());
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        assert!(!project.path().join("ran").exists());
+        assert_eq!(state(project.path()), before);
+
+        // From inside the project, Prettier loads the project's configuration.
+        project.write("sub/a.js", formatted);
+        let (outcome, output) = run_in_project(project.path(), command, &environment());
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+        assert!(project.path().join("ran").exists(), "{output}");
+    }
+
+    #[test]
+    fn a_workspace_of_every_folder_in_the_project_still_builds_after_a_test_run() {
+        if tool(&["cargo"]).is_none() {
+            return;
+        }
+        let workspace = "[workspace]\nmembers = [\"*/*\"]\nresolver = \"2\"\n";
+        let member = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib = "#[test]\nfn works() {}\n";
+        let files = [
+            ("Cargo.toml", workspace),
+            ("crates/a/Cargo.toml", member),
+            ("crates/a/src/lib.rs", lib),
+        ];
+        // The user's project, without a `.yalper/`: `*/*` would also match its folder `.yalper/snapshots.git`.
+        // The snapshots come from the store of another project.
+        let user_project = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            write(user_project.path(), path, content);
+        }
+        let target = tempfile::tempdir().unwrap();
+        let cargo_build = || {
+            let mut env = cargo_environment(&["CARGO_TARGET_DIR"]);
+            env.push(("CARGO_TARGET_DIR".into(), target.path().into()));
+            run_with(user_project.path(), "cargo build --offline", &env)
+        };
+        let (outcome, output) = cargo_build();
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+
+        let snapshots = Project::new();
+        let base = tempfile::tempdir().unwrap();
+        let token = Token::parse(&"d".repeat(32)).unwrap();
+        let folder = base.path().join("yalper");
+        let cache = CacheDir::open_in(&folder, user_project.path(), &token).unwrap();
+        let mut copy = TestCopy::open(&cache, 0).unwrap();
+        copy.switch(&snapshots.store, snapshots.tree(&files))
+            .unwrap();
+        let command = "cargo test --offline";
+        let (outcome, output) = run_as_bisect(&mut copy, command, cargo_environment(&[]));
+        assert_eq!(outcome, Outcome::Passed, "{output}");
+
+        let (outcome, output) = cargo_build();
+        assert_eq!(outcome, Outcome::Passed, "{output}");
     }
 }
