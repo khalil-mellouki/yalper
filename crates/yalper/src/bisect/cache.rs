@@ -439,13 +439,16 @@ fn find_in(
                 let place_is_ours = instance.is_none() || folder_id(name).is_some();
                 let interrupted =
                     !unmarked.marker || older(now, unmarked.changed, STALE_EMPTY_MARKER);
-                if place_is_ours && interrupted {
+                let why = if !place_is_ours {
+                    not_ours
+                } else if interrupted {
                     found.ours.push(ProjectFolder(dir));
+                    continue;
                 } else {
-                    found
-                        .others
-                        .push((dir.path().to_owned(), not_ours.to_owned()));
-                }
+                    // An empty marker just created: another bisect is creating the folder.
+                    "another bisect is starting in this project; run the purge again"
+                };
+                found.others.push((dir.path().to_owned(), why.to_owned()));
             }
             Look::Marked(dir, marker) => {
                 let shown = dir.path().to_owned();
@@ -639,9 +642,9 @@ fn delete_folder(dir: OwnedDir) -> io::Result<()> {
 /// `clock`, else their marker, last changed) for more than 7 days: those whose marker names a project that is
 /// gone or no longer gives the folder its name (moved, purged, set up again with `yalper init`), and those left
 /// holding nothing, or only an empty marker, by an interrupted creation or deletion. Only folders named as
-/// Yalper names them are looked at. Folders without a valid marker, links, and `current` are never touched;
-/// nothing is ever followed out of Yalper's cache folder, and a project on a network share, or whose `.git` is
-/// not a folder, is never looked up. Returns the deleted folders.
+/// Yalper names them are looked at. Folders with other content but no valid marker, links, and `current` are
+/// never touched; nothing is ever followed out of Yalper's cache folder, and a project on a network share, or
+/// whose `.git` is not a folder, is never looked up. Returns the deleted folders.
 ///
 /// Call it when a bisect starts: it lists one folder and reads a small marker in each entry, and looks at a
 /// project only for a folder unused for 7 days. A folder that cannot be checked or deleted is kept.
@@ -1937,7 +1940,10 @@ mod tests {
         fs::write(path.join(MARKER_FILE), "").unwrap();
         let fresh = found();
         assert!(fresh.ours.is_empty());
-        assert!(fresh.others[0].1.contains("not created by Yalper"));
+        assert_eq!(
+            fresh.others[0].1,
+            "another bisect is starting in this project; run the purge again"
+        );
         drop(fresh);
         // Left empty for longer than 5 seconds: purge takes it.
         last_changed(&path.join(MARKER_FILE), 1);
