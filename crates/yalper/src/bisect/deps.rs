@@ -15,14 +15,20 @@
 //!   Where the links cannot be made ([`CANNOT_LINK`]), `copy-0` is not used for the rest of the bisect.
 //! - Otherwise the step runs in the copy of its set, one of `copy-1` to `copy-3`, filled with the step's code and
 //!   installed once: with the `--setup` command at the top of the copy, or with the command of each lockfile
-//!   (see [`Tool`]) in its folder, only in the folders where the project has an installed folder of that tool
-//!   (`node_modules`, `.venv` or `venv`, cargo's `target`), or in every lockfile folder when it has none. The
-//!   copy is kept for the next steps and bisects of the set. When a set needs a copy and all three hold an
-//!   install, the least recently used one is deleted, with its Cargo target and Python bytecode folders. Which
-//!   copy holds which set is recorded in the event log (see [`Book`]).
+//!   (see [`Tool`]) in its folder. In each ecosystem (Node, Python, Rust), only the lockfiles next to which the
+//!   project has an installed folder of that ecosystem (`node_modules`, `.venv` or `venv`, cargo's `target`) are
+//!   installed, or all of them when it has none. `cargo fetch` always runs for the topmost Cargo lockfiles: it
+//!   costs nothing when the crates are already downloaded, and offline a crate that cannot be downloaded then
+//!   makes the set "cannot test" instead of failing the tests. The copy is kept for the next steps and bisects
+//!   of the set. When a set needs a copy and all three hold an install, the least recently used one is deleted,
+//!   with its Cargo target and Python bytecode folders. Which copy holds which set is recorded in the event log
+//!   (see [`Book`]).
 //! - An install that fails makes every step of its set "cannot test" for the rest of the bisect. So does a link
 //!   (or a file) in the step's code where an install writes, such as a `.venv` that links to an environment
-//!   elsewhere on the machine: the install would write through it, so it is not run.
+//!   elsewhere on the machine: the install would write through it, so it is not run. Each command checks the
+//!   folders it writes in (a `--setup` command, all of them). On Unix, no install runs at all while the step's
+//!   code holds a link whose target is absolute or climbs above the top of the copy (a workspace package, a
+//!   `.yarn` folder or `src` linked elsewhere): package managers write through such links.
 //!
 //! Installs get the protections of test runs: the root of the project's cache folder is cleaned and its
 //! boundary files written before each one, and they run with the environment of [`run_env`], through [`run`],
@@ -231,6 +237,30 @@ impl Tool {
             Self::Cargo => &[],
         }
     }
+
+    fn ecosystem(self) -> Ecosystem {
+        match self {
+            Self::Npm | Self::Pnpm | Self::Yarn | Self::YarnBerry | Self::Bun => Ecosystem::Node,
+            Self::Uv | Self::Poetry | Self::Pip => Ecosystem::Python,
+            Self::Cargo => Ecosystem::Rust,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ecosystem {
+    Node,
+    Python,
+    Rust,
+}
+
+/// One command of the install of a copy: `command` run in the folder `dir` of the copy, which writes in
+/// `folders` (relative, `/`-separated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Planned {
+    dir: String,
+    command: String,
+    folders: Vec<String>,
 }
 
 /// One install a step needs: `tool` run in the folder `dir` of the copy (relative, `/`-separated, `""` for its
@@ -451,6 +481,9 @@ struct Deps {
     installs: Vec<Install>,
     /// See [`install_folders`].
     folders: Vec<String>,
+    /// The first link of the tree whose target is absolute or climbs above the top of the tree (see
+    /// [`leaves_tree`]).
+    link_out: Option<String>,
 }
 
 /// Reads the dependency files of `tree`. `digests` holds the digest of each blob already read, by blob and the
@@ -470,13 +503,25 @@ fn read_deps(
     }
     let mut files = Vec::new();
     let mut setup_scripts = Vec::new();
+    let mut link_out = None;
     for change in &listing.files {
         let Some(file) = change.new else { continue };
         // A path that is not UTF-8 is refused by the switch of the copy.
         let Ok(path) = std::str::from_utf8(&change.path) else {
             continue;
         };
-        if file.kind == FileKind::Symlink || path.split('/').any(|part| part == "node_modules") {
+        if file.kind == FileKind::Symlink {
+            if link_out.is_none() {
+                let target = store
+                    .read_blob(file.blob)?
+                    .ok_or(Error::MissingObject(file.blob))?;
+                if leaves_tree(path, &target) {
+                    link_out = Some(path.to_owned());
+                }
+            }
+            continue;
+        }
+        if path.split('/').any(|part| part == "node_modules") {
             continue;
         }
         let name = path.rsplit('/').next().unwrap_or(path);
@@ -518,7 +563,29 @@ fn read_deps(
         folders: install_folders(paths().chain(setup_scripts), &installs),
         installs,
         files,
+        link_out,
     })
+}
+
+/// Whether the link at `path` (relative, `/`-separated) of a tree, whose target is `target`, points outside the
+/// tree: its target is absolute, or its `..` components climb above the top of the tree. An install could write
+/// through such a link to a place outside the test copy.
+fn leaves_tree(path: &str, target: &[u8]) -> bool {
+    if target.first() == Some(&b'/') {
+        return true;
+    }
+    let mut depth = parents(path).count();
+    for part in target.split(|&byte| byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return true,
+            },
+            _ => depth += 1,
+        }
+    }
+    false
 }
 
 /// The key under which a copy with its own install for the dependency set `key` is recorded: with `--setup`,
@@ -719,6 +786,9 @@ pub enum InstallFailure {
     /// The step's code has a link (or a file) at `path`, where an install writes: nothing was run, since the
     /// install would write through it.
     Blocked { path: String, link: bool },
+    /// Unix only: the step's code has a link at `path` whose target is outside the test copy (absolute, or
+    /// climbing above it): nothing was run, since an install could write through it.
+    LinkOut { path: String },
 }
 
 impl fmt::Display for InstallFailure {
@@ -730,6 +800,13 @@ impl fmt::Display for InstallFailure {
                     f,
                     "the step's code has {what} at {path}, where the install of its dependencies writes; \
                      Yalper does not install through it"
+                );
+            }
+            Self::LinkOut { path } => {
+                return write!(
+                    f,
+                    "the step's code has a link at {path} that points outside the test copy; Yalper does \
+                     not install its dependencies while it is there"
                 );
             }
             Self::Failed {
@@ -911,7 +988,7 @@ impl DependencySets {
     /// Whether the project has the folder `install` fills, installed: a `node_modules` or Python environment that
     /// `copy-0` links (the same checks as [`NodeModules::link`] and [`PythonEnvs::link`]), or cargo's `target`.
     fn project_has_installed(&mut self, install: &Install) -> Result<bool> {
-        if install.tool == Tool::Cargo {
+        if install.tool.ecosystem() == Ecosystem::Rust {
             let target = join(&install.dir, "target");
             let project = self.cache.project();
             return Ok(parents(&target)
@@ -919,8 +996,8 @@ impl DependencySets {
                 .all(|folder| is_real_dir_no_follow(&native(project, folder))));
         }
         let links = self.project_links()?;
-        Ok(match install.tool {
-            Tool::Uv | Tool::Poetry | Tool::Pip => links.python.reusable(&install.dir)?,
+        Ok(match install.tool.ecosystem() {
+            Ecosystem::Python => links.python.reusable(&install.dir)?,
             _ => links.node.reusable(&install.dir)?,
         })
     }
@@ -958,26 +1035,60 @@ impl DependencySets {
         }
     }
 
-    /// The commands that install the step whose dependencies are `deps` in a copy of its own, with their
-    /// folders: the `--setup` command at the top, or the command of each lockfile in the folders where the
-    /// project has installed what it installs, or in every lockfile folder if it has none of them (lockfiles of
-    /// documentation, examples or fixtures are not installed when the project never installed them).
-    fn own_installs(&mut self, deps: &Deps) -> Result<Vec<(String, String)>> {
+    /// The commands that install the step whose dependencies are `deps` in a copy of its own: the `--setup`
+    /// command at the top (which may write in every folder of [`install_folders`]), or the commands of its
+    /// lockfiles, parent folders first. In each ecosystem (Node, Python, Rust), a lockfile is installed only
+    /// where the project has installed that ecosystem's folder (`node_modules`, a Python environment, cargo's
+    /// `target`), or everywhere if the project has none of them: lockfiles of documentation, examples or
+    /// fixtures are not installed when the project never installed them. `cargo fetch` also always runs for the
+    /// topmost Cargo lockfiles, so that a crate that cannot be downloaded makes the set "cannot test" instead of
+    /// failing its tests; it costs nothing when the crates are already downloaded.
+    fn own_installs(&mut self, deps: &Deps) -> Result<Vec<Planned>> {
         if let Some(setup) = &self.setup {
-            return Ok(vec![(String::new(), setup.clone())]);
+            return Ok(vec![Planned {
+                dir: String::new(),
+                command: setup.clone(),
+                folders: deps.folders.clone(),
+            }]);
         }
-        let mut installed = Vec::new();
-        for install in &deps.installs {
-            if self.project_has_installed(install)? {
-                installed.push(install);
+        let mut chosen = vec![false; deps.installs.len()];
+        for ecosystem in [Ecosystem::Node, Ecosystem::Python, Ecosystem::Rust] {
+            let mut any_installed = false;
+            let mut all = Vec::new();
+            for (i, install) in deps.installs.iter().enumerate() {
+                if install.tool.ecosystem() == ecosystem {
+                    all.push(i);
+                    if self.project_has_installed(install)? {
+                        chosen[i] = true;
+                        any_installed = true;
+                    }
+                }
+            }
+            for &i in &all {
+                let dir = &deps.installs[i].dir;
+                let topmost = !all
+                    .iter()
+                    .any(|&other| is_inside(dir, &deps.installs[other].dir));
+                if !any_installed || (ecosystem == Ecosystem::Rust && topmost) {
+                    chosen[i] = true;
+                }
             }
         }
-        if installed.is_empty() {
-            installed = deps.installs.iter().collect();
-        }
-        Ok(installed
-            .into_iter()
-            .map(|install| (install.dir.clone(), install.tool.command().to_owned()))
+        Ok(deps
+            .installs
+            .iter()
+            .zip(chosen)
+            .filter(|(_, chosen)| *chosen)
+            .map(|(install, _)| Planned {
+                dir: install.dir.clone(),
+                command: install.tool.command().to_owned(),
+                folders: install
+                    .tool
+                    .folders()
+                    .iter()
+                    .map(|folder| join(&install.dir, folder))
+                    .collect(),
+            })
             .collect())
     }
 
@@ -1069,26 +1180,40 @@ impl DependencySets {
         Ok(set_copy)
     }
 
-    /// Runs `commands` (folder and command) in copy `number`, which holds a step whose dependencies are `deps`,
-    /// one after the other, with the protections of a test run, their output in one new log of `logs`. Before
-    /// each one, the folders an install may fill are checked: a link or a file there stops the install.
+    /// Runs `commands` in copy `number`, which holds a step whose dependencies are `deps`, one after the other,
+    /// with the protections of a test run, their output in one new log of `logs`. Nothing runs, on Unix, while
+    /// the step has a link that points outside the copy. Before each command, the folders it writes in are
+    /// checked: a link or a file there, or above them, stops the install.
     fn run_installs(
         &mut self,
         number: usize,
         deps: &Deps,
-        commands: &[(String, String)],
+        commands: &[Planned],
         logs: &Logs,
         stop: &AtomicBool,
     ) -> Result<Installed> {
+        // Windows writes the links of a tree as plain files, which nothing follows.
+        if cfg!(unix)
+            && let Some(path) = &deps.link_out
+        {
+            let path = path.clone();
+            return Ok(Installed::Failed(InstallFailure::LinkOut { path }));
+        }
         self.installs += 1;
         let name = format!("install-{}.log", self.installs);
         let mut log = logs.create(&name)?;
         let set_copy = &self.copies[&number];
         let root = set_copy.copy.path();
-        for (dir, command) in commands {
-            if let Some((path, link)) = deps.folders.iter().find_map(|folder| blocked(root, folder))
-            {
-                return Ok(Installed::Failed(InstallFailure::Blocked { path, link }));
+        for Planned {
+            dir,
+            command,
+            folders,
+        } in commands
+        {
+            for folder in folders {
+                if let Some((path, link)) = blocked(root, folder)? {
+                    return Ok(Installed::Failed(InstallFailure::Blocked { path, link }));
+                }
             }
             clean_root(&self.cache)?;
             write_boundaries(&self.cache)?;
@@ -1122,16 +1247,32 @@ fn copy_exists(cache: &CacheDir, number: usize) -> bool {
 
 /// The path (relative, `/`-separated) of a link or a file, with whether it is a link, found at the folder
 /// `folder` of the copy at `root` or at a folder above it: an install would write through it. `None` when
-/// `folder` is a real folder reached through real folders, or missing.
-fn blocked(root: &Path, folder: &str) -> Option<(String, bool)> {
+/// `folder` is a real folder reached through real folders, or missing. Any other error looking it up is returned.
+fn blocked(root: &Path, folder: &str) -> io::Result<Option<(String, bool)>> {
     for path in parents(folder).chain([folder]) {
         match fs::symlink_metadata(native(root, path)) {
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(metadata) => return Some((path.to_owned(), metadata.is_symlink())),
-            Err(_) => return None,
+            Ok(metadata) => return Ok(Some((path.to_owned(), metadata.is_symlink()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot check {path} in the test copy before the install: {error}"),
+                ));
+            }
         }
     }
-    None
+    Ok(None)
+}
+
+/// Whether the folder `dir` is inside the folder `other`, and not `other` itself (both relative,
+/// `/`-separated, `""` for the top).
+fn is_inside(dir: &str, other: &str) -> bool {
+    dir != other
+        && (other.is_empty()
+            || dir
+                .strip_prefix(other)
+                .is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// Deletes copy `number`, and its folders in `cargo-target/` and `pycache/`, from the project's cache folder
@@ -1285,7 +1426,9 @@ mod tests {
             Prepared::CannotTest(failure) => {
                 let log = match failure {
                     InstallFailure::Failed { log, .. } => fs::read_to_string(log).unwrap(),
-                    InstallFailure::Blocked { .. } => String::new(),
+                    InstallFailure::Blocked { .. } | InstallFailure::LinkOut { .. } => {
+                        String::new()
+                    }
                 };
                 panic!("{failure}\n{log}")
             }
@@ -1304,7 +1447,7 @@ mod tests {
                 log,
                 registry_error,
             } => (command, dir, *outcome, log, *registry_error),
-            InstallFailure::Blocked { .. } => panic!("{failure}"),
+            InstallFailure::Blocked { .. } | InstallFailure::LinkOut { .. } => panic!("{failure}"),
         }
     }
 
@@ -1970,42 +2113,59 @@ mod tests {
         let canary = tempfile::tempdir().unwrap();
         write(canary.path(), "keep", "canary");
         let before = state(canary.path());
-        let target = canary.path().to_str().unwrap();
         let counter = canary.path().join("counter");
         let link = FileKind::Symlink;
         let regular = FileKind::Regular;
-        // On Windows the copy holds tree links as plain files: refused as well.
-        let expected = InstallFailure::Blocked {
-            path: ".venv".to_owned(),
-            link: cfg!(unix),
-        };
 
-        // The commands of the lockfiles, and a `--setup` command for manifests without a lockfile.
-        let with_lockfiles = project.typed_tree(&[
-            ("package-lock.json", regular, "{}"),
-            ("requirements.txt", regular, ""),
-            (".venv", link, target),
-            ("node_modules", link, target),
-        ]);
-        let with_manifests = project.typed_tree(&[
-            ("package.json", regular, "{}"),
-            ("pyproject.toml", regular, ""),
-            (".venv", link, target),
-            ("node_modules", link, target),
-        ]);
-        for (setup, tree) in [
-            (None, with_lockfiles),
-            (Some(append_to(&counter)), with_manifests),
-        ] {
-            let mut bisect = Bisect::new(&project, setup);
-            let failure = bisect.cannot_test(&project, tree);
-            assert_eq!(failure, expected);
-            let message = failure.to_string();
-            assert!(
-                message.contains("Yalper does not install through it"),
-                "{message}"
-            );
+        // Links to the canary, and links to a folder of the step itself.
+        for target in [canary.path().to_str().unwrap(), "inside"] {
+            // The commands of the lockfiles (npm first), and a `--setup` command for manifests without a
+            // lockfile (which may write in every install folder).
+            let with_lockfiles = project.typed_tree(&[
+                ("package-lock.json", regular, "{}"),
+                ("requirements.txt", regular, ""),
+                ("inside/x", regular, ""),
+                (".venv", link, target),
+                ("node_modules", link, target),
+            ]);
+            let with_manifests = project.typed_tree(&[
+                ("package.json", regular, "{}"),
+                ("pyproject.toml", regular, ""),
+                ("inside/x", regular, ""),
+                (".venv", link, target),
+                ("node_modules", link, target),
+            ]);
+            for (setup, tree, first) in [
+                (None, with_lockfiles, "node_modules"),
+                (Some(append_to(&counter)), with_manifests, ".venv"),
+            ] {
+                let mut bisect = Bisect::new(&project, setup);
+                let failure = bisect.cannot_test(&project, tree);
+                let expected = if cfg!(unix) && target != "inside" {
+                    InstallFailure::LinkOut {
+                        path: ".venv".to_owned(),
+                    }
+                } else {
+                    // On Windows the copy holds tree links as plain files: refused as well.
+                    InstallFailure::Blocked {
+                        path: first.to_owned(),
+                        link: cfg!(unix),
+                    }
+                };
+                assert_eq!(failure, expected, "{target}");
+            }
         }
+        let message = InstallFailure::Blocked {
+            path: "api/.venv".to_owned(),
+            link: true,
+        }
+        .to_string();
+        assert!(message.contains("a link at api/.venv"), "{message}");
+        assert!(
+            message.contains("Yalper does not install through it"),
+            "{message}"
+        );
+        assert_eq!(lines(&counter), 0);
         assert_eq!(state(canary.path()), before);
     }
 
@@ -2034,16 +2194,163 @@ mod tests {
         let mut changed = files;
         changed[2] = ("package-lock.json", "2");
         let deps = read_deps(&project.store, project.tree(&changed), &mut HashMap::new()).unwrap();
+        // Python has no installed folder in the project: all of its lockfiles are installed.
         let commands = bisect.sets.own_installs(&deps).unwrap();
-        assert_eq!(commands, [(String::new(), "npm ci".to_owned())]);
+        assert_eq!(dirs(&commands), ["", "docs"]);
+        assert_eq!(commands[0].command, "npm ci");
+        assert_eq!(commands[0].folders, ["node_modules"]);
+        assert_eq!(commands[1].folders, ["docs/.venv", "docs/venv"]);
         drop(bisect);
 
         // A project that installed nothing: every lockfile folder.
         fs::remove_dir_all(project.path().join("node_modules")).unwrap();
         let mut bisect = Bisect::new(&project, None);
         let commands = bisect.sets.own_installs(&deps).unwrap();
-        let folders: Vec<&str> = commands.iter().map(|(dir, _)| dir.as_str()).collect();
-        assert_eq!(folders, ["", "docs", "examples/app"]);
+        assert_eq!(dirs(&commands), ["", "docs", "examples/app"]);
+    }
+
+    /// The folders of `commands`.
+    fn dirs(commands: &[Planned]) -> Vec<&str> {
+        commands
+            .iter()
+            .map(|planned| planned.dir.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn each_ecosystem_installs_where_the_project_installed_it_or_everywhere() {
+        let project = Project::new();
+        let files = [
+            (".gitignore", "node_modules/\ntarget/\n"),
+            ("package.json", "{}"),
+            ("package-lock.json", "1"),
+            ("examples/app/package-lock.json", "1"),
+            ("pyproject.toml", "[project]\nname = \"app\"\n"),
+            ("uv.lock", "1"),
+            ("Cargo.lock", "1"),
+            ("examples/tool/Cargo.lock", "1"),
+        ];
+        for (path, content) in files {
+            project.write(path, content);
+        }
+        // Node packages and a Rust build, but no Python environment.
+        project.write("node_modules/dep/index.js", "");
+        fs::create_dir_all(project.path().join("examples/tool/target")).unwrap();
+
+        let mut changed = files;
+        changed[5] = ("uv.lock", "2");
+        let deps = read_deps(&project.store, project.tree(&changed), &mut HashMap::new()).unwrap();
+        let mut bisect = Bisect::new(&project, None);
+        let commands = bisect.sets.own_installs(&deps).unwrap();
+        let plan: Vec<(&str, &str)> = commands
+            .iter()
+            .map(|planned| (planned.dir.as_str(), planned.command.as_str()))
+            .collect();
+        // Node where the project installed it; Python everywhere; Rust where the project built it and, always,
+        // for the topmost lockfile.
+        assert_eq!(
+            plan,
+            [
+                ("", "npm ci"),
+                ("", "uv sync --frozen"),
+                ("", "cargo fetch"),
+                ("examples/tool", "cargo fetch"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_harmless_link_elsewhere_does_not_block_the_install_of_other_folders() {
+        let project = Project::new();
+        let regular = FileKind::Regular;
+        // A committed `docs/venv` link inside the copy, next to a Python manifest that nothing installs.
+        let tree = project.typed_tree(&[
+            ("Cargo.lock", regular, ""),
+            ("docs/requirements-docs.txt", regular, "sphinx\n"),
+            ("docs/venv", FileKind::Symlink, "../src"),
+            ("src/lib.rs", regular, ""),
+        ]);
+        let mut bisect = Bisect::new(&project, None);
+        match bisect.prepare(&project, tree) {
+            Prepared::Ready(_) => {}
+            Prepared::CannotTest(failure) => {
+                assert!(
+                    matches!(failure, InstallFailure::Failed { .. }),
+                    "{failure}"
+                );
+            }
+            Prepared::Stopped => panic!("stopped"),
+        }
+        drop(bisect);
+
+        // A `--setup` command may write anywhere an install does: there the link blocks it.
+        let mut bisect = Bisect::new(&project, Some("exit 0".to_owned()));
+        let failure = bisect.cannot_test(&project, tree);
+        let expected = InstallFailure::Blocked {
+            path: "docs/venv".to_owned(),
+            link: cfg!(unix),
+        };
+        assert_eq!(failure, expected);
+    }
+
+    #[test]
+    fn links_that_leave_the_tree_are_found() {
+        for (path, target) in [
+            ("packages/lib", "/home/me/lib"),
+            ("vendor/x", "../../outside"),
+            ("a", ".."),
+            ("a/b", "../c/../../x"),
+        ] {
+            assert!(leaves_tree(path, target.as_bytes()), "{path} -> {target}");
+        }
+        for (path, target) in [
+            ("docs/venv", "../src"),
+            ("a", "b"),
+            ("a/b/c", "../../d/./e"),
+            ("a", "./b/"),
+        ] {
+            assert!(!leaves_tree(path, target.as_bytes()), "{path} -> {target}");
+        }
+    }
+
+    #[test]
+    fn on_unix_no_install_runs_while_a_link_points_outside_the_copy() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        let counter = canary.path().join("counter");
+        let regular = FileKind::Regular;
+        let absolute = canary.path().to_str().unwrap();
+        for (path, target) in [("packages/lib", absolute), ("vendor/x", "../../outside")] {
+            let tree = project.typed_tree(&[
+                ("package-lock.json", regular, path),
+                (path, FileKind::Symlink, target),
+            ]);
+            let mut bisect = Bisect::new(&project, Some(append_to(&counter)));
+            if cfg!(unix) {
+                let failure = bisect.cannot_test(&project, tree);
+                let expected = InstallFailure::LinkOut {
+                    path: path.to_owned(),
+                };
+                assert_eq!(failure, expected);
+                let message = failure.to_string();
+                assert!(
+                    message.contains("points outside the test copy"),
+                    "{message}"
+                );
+            } else {
+                // Windows writes the link as a plain file.
+                bisect.ready(&project, tree);
+            }
+        }
+        assert_eq!(lines(&counter), if cfg!(unix) { 0 } else { 2 });
+
+        // A link inside the copy does not stop the install.
+        let tree = project.typed_tree(&[
+            ("package-lock.json", regular, "inside"),
+            ("a", FileKind::Symlink, "b"),
+        ]);
+        let mut bisect = Bisect::new(&project, Some(append_to(&counter)));
+        bisect.ready(&project, tree);
     }
 
     #[test]
