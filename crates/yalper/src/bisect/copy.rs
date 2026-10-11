@@ -143,9 +143,19 @@ impl TestCopy {
 
     /// Sets the paths of the copy, relative and `/`-separated, that Yalper puts there besides the files of
     /// the tree (a folder of links to the project's dependencies, env files): switches keep them as they
-    /// are, a folder with everything inside it.
+    /// are, a folder with everything inside it, unless the tree has a folder at that path.
     pub fn set_extra_paths(&mut self, paths: impl IntoIterator<Item = String>) {
         self.extra = paths.into_iter().collect();
+    }
+
+    /// See [`set_extra_paths`](Self::set_extra_paths).
+    pub fn extra_paths(&self) -> &HashSet<String> {
+        &self.extra
+    }
+
+    /// The files of the tree the copy holds, relative and `/`-separated, or `None` until a switch succeeded.
+    pub fn tree_files(&self) -> Option<impl Iterator<Item = &str>> {
+        self.tree.map(|_| self.placed.keys().map(String::as_str))
     }
 
     /// Makes the copy hold exactly the tree `to` of `store`, plus the files its ignore rules ignore, writing
@@ -360,9 +370,10 @@ fn still_placed(path: &Path, placed: &mut Placed, clean_at: i64) -> io::Result<b
 /// `info/exclude` (`info_exclude`) and the user's global excludes file. A `.gitignore` that is not a file of
 /// the tree, such as one a test created, has no effect. Ignored folders are not entered; a folder that is
 /// neither part of the tree nor ignored is entered, and removed once empty, so ignored files inside it stay
-/// as a checkout would leave them. Extra paths are kept wherever they are. Links are never followed: a link
-/// is removed itself, never what it points to, and one that is neither a file of the tree nor an extra path
-/// is removed even where it is ignored.
+/// as a checkout would leave them. Extra paths are kept wherever they are, unless the tree now has a folder
+/// there, which is then cleaned like the tree's other folders. Links are never followed: a link is removed
+/// itself, never what it points to, and one that is neither a file of the tree nor an extra path is removed
+/// even where it is ignored.
 fn sweep(
     root: &Path,
     placed: &HashMap<String, Placed>,
@@ -421,7 +432,12 @@ fn sweep(
                 .as_deref()
                 .zip(name.to_str())
                 .map(|(dir_path, name)| join(dir_path, name));
-            if path.as_ref().is_some_and(|path| extra.contains(path)) {
+            // An extra path where the tree now has a folder belongs to the tree: it is cleaned like the
+            // tree's other folders.
+            if let Some(path) = &path
+                && extra.contains(path)
+                && !(in_tree && is_dir && dirs.contains(path.as_str()))
+            {
                 continue;
             }
             if in_tree {
@@ -486,7 +502,7 @@ fn in_copy_at(error: io::Error, root: &Path, full: &Path) -> io::Error {
 }
 
 /// The path `name` inside the folder `dir` of the tree (`""` for the root).
-fn join(dir: &str, name: &str) -> String {
+pub(super) fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_owned()
     } else {
@@ -541,14 +557,14 @@ fn checked(changes: &[FileChange]) -> Result<Vec<(&str, Option<TreeFile>)>> {
 }
 
 /// `path` of the copy at `root`, from its `/`-separated form.
-fn native(root: &Path, path: &str) -> PathBuf {
+pub(super) fn native(root: &Path, path: &str) -> PathBuf {
     let mut native = root.to_path_buf();
     native.extend(path.split('/'));
     native
 }
 
 /// The folders above `path`, outermost first: `a`, `a/b` for `a/b/c`.
-fn parents(path: &str) -> impl Iterator<Item = &str> {
+pub(super) fn parents(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(end, _)| &path[..end])
 }
 
@@ -685,7 +701,7 @@ fn is_real_dir(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn make_owner_writable(dir: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+pub(super) fn make_owner_writable(dir: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = metadata.permissions().mode();
     if mode & 0o700 != 0o700 {
@@ -696,7 +712,7 @@ fn make_owner_writable(dir: &Path, metadata: &fs::Metadata) -> io::Result<()> {
 
 /// Windows lets a folder's entries be replaced whatever the folder's attributes.
 #[cfg(windows)]
-fn make_owner_writable(_dir: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
+pub(super) fn make_owner_writable(_dir: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
@@ -738,7 +754,7 @@ fn is_blob(bytes: &[u8], id: ObjectId) -> io::Result<bool> {
 /// Whether the entry with `metadata` (not followed) is the kind of entry the copy writes for a file of kind
 /// `kind`: a link for a link of the tree on Unix, otherwise a regular file (see [`plain_as`]). On Windows, a
 /// link of the tree is a plain file holding its target.
-fn is_written_as(metadata: &fs::Metadata, kind: FileKind) -> bool {
+pub(super) fn is_written_as(metadata: &fs::Metadata, kind: FileKind) -> bool {
     if cfg!(unix) && kind == FileKind::Symlink {
         return metadata.is_symlink();
     }
@@ -859,7 +875,7 @@ fn write_files(store: &ShadowStore, root: &Path, files: &[(&str, TreeFile)]) -> 
 
 /// Removes whatever is at `path`, then creates the file anew with `bytes` (on Unix with mode 0644 or 0755).
 /// Creating a new file never follows a link and never writes into a file with another hard link.
-fn write_file(path: &Path, kind: FileKind, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_file(path: &Path, kind: FileKind, bytes: &[u8]) -> io::Result<()> {
     clear(path)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -904,7 +920,7 @@ fn clear(path: &Path) -> io::Result<()> {
 
 /// Removes the file, link or folder at `path`, whose metadata (not followed) is `metadata`. A link is
 /// removed itself, never what it points to, and so are the links inside a removed folder.
-fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+pub(super) fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.is_dir() {
         return fs::remove_dir_all(path).or_else(|_| remove_dir_forcing(path));
     }
@@ -2157,6 +2173,23 @@ mod tests {
         copy.set_extra_paths([]);
         copy.switch(&project.store, tree).unwrap();
         assert_holds(&copy, &files);
+    }
+
+    #[test]
+    fn an_extra_folder_where_the_tree_now_has_files_is_cleaned_like_the_trees() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        fs::write(canary.path().join("keep.txt"), "keep me").unwrap();
+        let before = contents(canary.path());
+        let files = [("node_modules/local.js", Regular, "local")];
+        let tree = project.tree(&files);
+        let mut copy = project.copy();
+        copy.set_extra_paths(["node_modules".to_owned()]);
+        create(copy.path(), "node_modules/stray.txt", "x");
+        link_dir(canary.path(), &copy.path().join("node_modules").join("dep"));
+        assert_eq!(copy.switch(&project.store, tree).unwrap().deleted, 2);
+        assert_holds(&copy, &files);
+        assert_eq!(contents(canary.path()), before);
     }
 
     #[test]

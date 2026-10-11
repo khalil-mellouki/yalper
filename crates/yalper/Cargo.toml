@@ -27,6 +27,11 @@ serde_json.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
+# Windows only: junctions, links to folders that need no privilege (std's `junction_point` is unstable). For the
+# test copy of a bisect, which links to the project's installed `node_modules` packages.
+[target.'cfg(windows)'.dependencies]
+junction = { version = "2.1", default-features = false }
+
 [build-dependencies]
 toml.workspace = true
 
