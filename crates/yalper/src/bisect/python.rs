@@ -218,6 +218,17 @@ impl PythonEnvs {
         Ok(paths)
     }
 
+    /// Whether the project has, in its folder `dir` (relative, `/`-separated, `""` for the top), a `.venv` or
+    /// `venv` that [`link`](Self::link) would link next to a manifest there (see [`find`](Self::find)).
+    pub(super) fn reusable(&mut self, dir: &str) -> io::Result<bool> {
+        for name in ENV_NAMES {
+            if self.find(&join(dir, name))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Reads, once, whether the project has a reusable environment at `env` (see [`found`](Self::found)).
     fn find(&mut self, env: &str) -> io::Result<bool> {
         if let Some(found) = self.found.get(env) {

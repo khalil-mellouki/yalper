@@ -1,23 +1,28 @@
 //! Dependency sets: which test copy runs the tests of a step, and the installs that fill the copies.
 //!
 //! What a step needs installed is given by its dependency files, in any folder of its tree: every lockfile,
-//! `requirements*.txt`, the package manager settings `pnpm-workspace.yaml`, `.npmrc` and `.yarnrc.yml`, and only
-//! the dependency sections of `package.json` and `pyproject.toml` (see [`PACKAGE_JSON_SECTIONS`] and
-//! [`PYPROJECT_SECTIONS`]), so that an agent editing a script or a tool setting does not cost an install. Files
-//! inside a `node_modules` folder do not count: packages committed with the code are code. Steps whose
-//! dependency files are the same have the same key and form one dependency set.
+//! `requirements*.txt`, the package manager settings of [`SETTINGS_FILES`], and only the dependency sections of
+//! `package.json` and `pyproject.toml` (see [`PACKAGE_JSON_SECTIONS`] and [`PYPROJECT_SECTIONS`]), so that an
+//! agent editing a script or a tool setting does not cost an install. Files inside a `node_modules` folder do
+//! not count: packages committed with the code are code. Steps whose dependency files are the same have the
+//! same key and form one dependency set.
 //!
 //! - When every dependency file of the step is the same in the project (read from its working tree: regular
-//!   files reached through real folders only) and the project has the folders the step's installs fill
-//!   (`node_modules`, `.venv` or `venv`), the step runs in `copy-0`, which links to the project's installed
-//!   dependencies (see [`NodeModules`] and [`PythonEnvs`]): no install. Where those links cannot be made
-//!   ([`CANNOT_LINK`]), `copy-0` is not used for the rest of the bisect.
+//!   files reached through real folders only), the step runs in `copy-0`, which links to the project's
+//!   installed dependencies (see [`NodeModules`] and [`PythonEnvs`]): no install. If the step has Node or Python
+//!   lockfiles, the project must have at least one installed folder next to one of them that those links can
+//!   reuse; lockfiles of documentation, examples or fixtures that the project never installed do not count.
+//!   Where the links cannot be made ([`CANNOT_LINK`]), `copy-0` is not used for the rest of the bisect.
 //! - Otherwise the step runs in the copy of its set, one of `copy-1` to `copy-3`, filled with the step's code and
-//!   installed once: with the command of each lockfile (see [`Tool`]) in its folder, or with the `--setup`
-//!   command at the top of the copy. The copy is kept for the next steps and bisects of the set. When a set
-//!   needs a copy and all three hold an install, the least recently used one is deleted, with its Cargo target
-//!   and Python bytecode folders. Which copy holds which set is recorded in the event log (see [`Book`]).
-//! - An install that fails makes every step of its set "cannot test" for the rest of the bisect.
+//!   installed once: with the `--setup` command at the top of the copy, or with the command of each lockfile
+//!   (see [`Tool`]) in its folder, only in the folders where the project has an installed folder of that tool
+//!   (`node_modules`, `.venv` or `venv`, cargo's `target`), or in every lockfile folder when it has none. The
+//!   copy is kept for the next steps and bisects of the set. When a set needs a copy and all three hold an
+//!   install, the least recently used one is deleted, with its Cargo target and Python bytecode folders. Which
+//!   copy holds which set is recorded in the event log (see [`Book`]).
+//! - An install that fails makes every step of its set "cannot test" for the rest of the bisect. So does a link
+//!   (or a file) in the step's code where an install writes, such as a `.venv` that links to an environment
+//!   elsewhere on the machine: the install would write through it, so it is not run.
 //!
 //! Installs get the protections of test runs: the root of the project's cache folder is cleaned and its
 //! boundary files written before each one, and they run with the environment of [`run_env`], through [`run`],
@@ -38,10 +43,12 @@
 //!   on its settings it fails every step, so the bisect reports that the good end fails, or it builds with
 //!   placeholder values.
 //! - A step that lists dependencies in a manifest without a lockfile installs nothing, unless `--setup` is given.
-//! - What an install puts in a copy is kept only in the folders it fills next to each lockfile (`node_modules`,
-//!   `.venv`) and in ignored files; Yarn Plug'n'Play files (`.pnp.cjs`, `.yarn/`) only when they are ignored. A
-//!   test that deletes or changes those folders in a copy with its own install changes them for the next runs
-//!   in that copy.
+//! - Not counted in the key: lockfiles of other ecosystems (`Gemfile.lock`, `composer.lock`, `go.sum`), patch
+//!   folders (`patches/` of patch-package or pnpm) and Yarn's `.yarn/releases`.
+//! - What an install puts in a copy is kept only in the folders it fills (`node_modules` next to each lockfile
+//!   or `package.json`, `.venv` and `venv` next to each Python lockfile or manifest) and in ignored files; Yarn
+//!   Plug'n'Play files (`.pnp.cjs`, `.yarn/`) only when they are ignored. A test that deletes or changes those
+//!   folders in a copy with its own install changes them for the next runs in that copy.
 
 use std::collections::btree_map;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -64,6 +71,7 @@ use super::{
     CacheDir, NodeModules, PythonEnvs, TestCopy, clean_root, env_additions, run_env,
     write_boundaries,
 };
+use crate::redact::redact_str;
 use crate::snapshot::{Error, FileKind, MAX_FILE_BYTES, Result, ShadowStore, validate_path};
 use crate::store::Store;
 
@@ -97,10 +105,20 @@ const LOCKFILES: [&str; 9] = [
 ];
 
 /// Package manager settings that change what gets installed: each counts as a whole.
-const SETTINGS_FILES: [&str; 3] = ["pnpm-workspace.yaml", ".npmrc", ".yarnrc.yml"];
+const SETTINGS_FILES: [&str; 8] = [
+    "pnpm-workspace.yaml",
+    ".pnpmfile.cjs",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    "uv.toml",
+    ".python-version",
+];
 
-/// The fields of `package.json` that count. npm accepts both spellings of bundled dependencies.
-const PACKAGE_JSON_SECTIONS: [&str; 10] = [
+/// The fields of `package.json` that count. npm accepts both spellings of bundled dependencies; `pnpm` holds
+/// pnpm's overrides and patches.
+const PACKAGE_JSON_SECTIONS: [&str; 11] = [
     "dependencies",
     "devDependencies",
     "optionalDependencies",
@@ -111,6 +129,7 @@ const PACKAGE_JSON_SECTIONS: [&str; 10] = [
     "resolutions",
     "workspaces",
     "packageManager",
+    "pnpm",
 ];
 
 /// The tables and keys of `pyproject.toml` that count, by their path.
@@ -126,6 +145,12 @@ const PYPROJECT_SECTIONS: [&[&str]; 10] = [
     &["tool", "poetry", "source"],
     &["tool", "uv"],
 ];
+
+/// The folders Node package managers install into, next to the lockfile or `package.json`.
+const NODE_FOLDERS: [&str; 1] = ["node_modules"];
+
+/// The folders Python environments are kept in, next to the lockfile or manifest. Installs make the first.
+const PYTHON_FOLDERS: [&str; 2] = [".venv", "venv"];
 
 /// Variables removed from the environment of the installs and runs of a copy with its own install, so that the
 /// install fills the copy's own environment, never one the user activated: Poetry installs into an activated
@@ -198,12 +223,11 @@ impl Tool {
         }
     }
 
-    /// The folders, next to the lockfile, where a project keeps what this tool installs. The command installs
-    /// into the first one.
+    /// The folders, next to the lockfile, that the command installs into.
     fn folders(self) -> &'static [&'static str] {
         match self {
-            Self::Npm | Self::Pnpm | Self::Yarn | Self::YarnBerry | Self::Bun => &["node_modules"],
-            Self::Uv | Self::Poetry | Self::Pip => &[".venv", "venv"],
+            Self::Npm | Self::Pnpm | Self::Yarn | Self::YarnBerry | Self::Bun => &NODE_FOLDERS,
+            Self::Uv | Self::Poetry | Self::Pip => &PYTHON_FOLDERS,
             Self::Cargo => &[],
         }
     }
@@ -265,6 +289,36 @@ fn installs<'a>(files: impl IntoIterator<Item = &'a str>) -> Vec<Install> {
         );
     }
     installs
+}
+
+/// The folders an install may fill in a step whose files include `files` (paths): the folders of each install
+/// of `installs`, `node_modules` next to each `package.json`, and `.venv` and `venv` next to each Python manifest
+/// (`pyproject.toml`, `setup.py`, `requirements*.txt`), where a `--setup` command would install. Sorted.
+fn install_folders<'a>(
+    files: impl IntoIterator<Item = &'a str>,
+    installs: &[Install],
+) -> Vec<String> {
+    let mut folders = BTreeSet::new();
+    for install in installs {
+        for folder in install.tool.folders() {
+            folders.insert(join(&install.dir, folder));
+        }
+    }
+    for path in files {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let names: &[&str] = if name == "package.json" {
+            &NODE_FOLDERS
+        } else if name == "pyproject.toml"
+            || name == "setup.py"
+            || (name.starts_with("requirements") && name.ends_with(".txt"))
+        {
+            &PYTHON_FOLDERS
+        } else {
+            &[]
+        };
+        folders.extend(names.iter().map(|folder| join(dir, folder)));
+    }
+    folders.into_iter().collect()
 }
 
 /// How a dependency file counts in the key of its step.
@@ -354,8 +408,9 @@ fn pyproject_sections(bytes: &[u8]) -> Option<String> {
     Some(sections)
 }
 
-/// Writes `value` as JSON with the keys of every object sorted, so that the order of a manifest's entries does
-/// not count. The parsers limit how deeply values nest (128 levels for JSON, 80 for TOML).
+/// Writes `value` as JSON with the keys of every object sorted, so that the order of a table's entries does not
+/// count (the order of an array's items does). The parsers limit how deeply values nest (128 levels for JSON,
+/// 80 for TOML).
 fn canonical(value: &Value, out: &mut String) {
     match value {
         Value::Object(fields) => {
@@ -394,6 +449,8 @@ struct Deps {
     /// The dependency files, path and digest, sorted by path.
     files: Vec<(String, String)>,
     installs: Vec<Install>,
+    /// See [`install_folders`].
+    folders: Vec<String>,
 }
 
 /// Reads the dependency files of `tree`. `digests` holds the digest of each blob already read, by blob and the
@@ -412,19 +469,23 @@ fn read_deps(
         .into());
     }
     let mut files = Vec::new();
+    let mut setup_scripts = Vec::new();
     for change in &listing.files {
         let Some(file) = change.new else { continue };
         // A path that is not UTF-8 is refused by the switch of the copy.
         let Ok(path) = std::str::from_utf8(&change.path) else {
             continue;
         };
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let Some(counted) = counted(name) else {
-            continue;
-        };
         if file.kind == FileKind::Symlink || path.split('/').any(|part| part == "node_modules") {
             continue;
         }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if name == "setup.py" {
+            setup_scripts.push(path);
+        }
+        let Some(counted) = counted(name) else {
+            continue;
+        };
         // The path is also read in the project: never outside it.
         validate_path(path, file.kind)?;
         if files.len() == MAX_DEPENDENCY_FILES {
@@ -450,9 +511,12 @@ fn read_deps(
     for (path, digest) in &files {
         parts.extend([path.as_bytes(), b"\0", digest.as_bytes(), b"\n"]);
     }
+    let paths = || files.iter().map(|(path, _)| path.as_str());
+    let installs = installs(paths());
     Ok(Deps {
         key: sha1(&parts)?,
-        installs: installs(files.iter().map(|(path, _)| path.as_str())),
+        folders: install_folders(paths().chain(setup_scripts), &installs),
+        installs,
         files,
     })
 }
@@ -478,17 +542,6 @@ fn read_project_file(project: &Path, path: &str) -> Option<Vec<u8>> {
     (metadata.is_file() && metadata.len() <= MAX_FILE_BYTES)
         .then(|| fs::read(&full).ok())
         .flatten()
-}
-
-/// Whether the project has one of `names` as a real folder, reached through real folders, in its folder `dir`.
-/// True if `names` is empty.
-fn project_has_folder(project: &Path, dir: &str, names: &[&str]) -> bool {
-    names.is_empty()
-        || names.iter().any(|name| {
-            let path = join(dir, name);
-            parents(&path).all(|parent| is_real_dir_no_follow(&native(project, parent)))
-                && is_real_dir_no_follow(&native(project, &path))
-        })
 }
 
 /// The copies with their own install, as recorded in the event log's `meta` table under [`COPIES_KEY`]: a JSON
@@ -646,30 +699,53 @@ impl SetCopy {
     }
 }
 
-/// Why the dependencies of a set could not be installed.
+/// Why the dependencies of a set could not be installed. The message (its `Display`) holds paths from the
+/// step's tree and of the cache folder: print it through `printable()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallFailure {
-    /// The command that failed.
-    pub command: String,
-    /// The folder of the copy it ran in (relative, `/`-separated, `""` for the top), as the step's tree names it.
-    pub dir: String,
-    pub outcome: Outcome,
-    /// The log holding the install's output.
-    pub log: PathBuf,
-    /// The end of the log shows what looks like a registry or login error.
-    pub registry_error: bool,
+pub enum InstallFailure {
+    /// An install command failed.
+    Failed {
+        /// The command, its secrets masked.
+        command: String,
+        /// The folder of the copy it ran in (relative, `/`-separated, `""` for the top), as the step's tree names
+        /// it.
+        dir: String,
+        outcome: Outcome,
+        /// The log holding the install's output.
+        log: PathBuf,
+        /// The end of the log shows what looks like a registry or login error.
+        registry_error: bool,
+    },
+    /// The step's code has a link (or a file) at `path`, where an install writes: nothing was run, since the
+    /// install would write through it.
+    Blocked { path: String, link: bool },
 }
 
-/// The message for the user. It holds a folder name from the step's tree and paths in the cache folder: print
-/// it through `printable()`.
 impl fmt::Display for InstallFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let place = if self.dir.is_empty() {
+        let (command, dir, outcome, log, registry_error) = match self {
+            Self::Blocked { path, link } => {
+                let what = if *link { "a link" } else { "a file" };
+                return write!(
+                    f,
+                    "the step's code has {what} at {path}, where the install of its dependencies writes; \
+                     Yalper does not install through it"
+                );
+            }
+            Self::Failed {
+                command,
+                dir,
+                outcome,
+                log,
+                registry_error,
+            } => (command, dir, outcome, log, registry_error),
+        };
+        let place = if dir.is_empty() {
             "at the top of the test copy".to_owned()
         } else {
-            format!("in {}", self.dir)
+            format!("in {dir}")
         };
-        let ended = match self.outcome {
+        let ended = match outcome {
             Outcome::Failed(exit) => exit.to_string(),
             Outcome::Skipped => format!("exit code {SKIP_EXIT_CODE}"),
             Outcome::OutputTooLarge => "more output than a log may hold".to_owned(),
@@ -678,14 +754,13 @@ impl fmt::Display for InstallFailure {
         };
         write!(
             f,
-            "installing the dependencies failed: `{}` {place} ended with {ended}",
-            self.command
+            "installing the dependencies failed: `{command}` {place} ended with {ended}"
         )?;
-        if let Some(hint) = self.outcome.hint() {
+        if let Some(hint) = outcome.hint() {
             write!(f, " ({hint})")?;
         }
-        write!(f, ". Its output is in {}", self.log.display())?;
-        if self.registry_error {
+        write!(f, ". Its output is in {}", log.display())?;
+        if *registry_error {
             write!(
                 f,
                 ". If the install needs a registry login or settings from a file your project ignores \
@@ -719,7 +794,8 @@ pub struct DependencySets {
     setup: Option<String>,
     user: Vec<(OsString, OsString)>,
     book: Book,
-    /// The copies used in this bisect, by number.
+    /// The copies used in this bisect, by number. `copy-0` is opened, with its links, as soon as the project's
+    /// installed folders are looked at.
     copies: BTreeMap<usize, SetCopy>,
     deps: HashMap<ObjectId, Rc<Deps>>,
     digests: HashMap<(ObjectId, Counted), String>,
@@ -771,7 +847,7 @@ impl DependencySets {
         stop: &AtomicBool,
     ) -> Result<Prepared<'_>> {
         let deps = self.deps_of(store, tree)?;
-        if !self.no_links && self.project_matches(&deps) && self.use_project_copy(store, tree)? {
+        if !self.no_links && self.project_matches(&deps)? && self.use_project_copy(store, tree)? {
             return Ok(Prepared::Ready(&self.copies[&0]));
         }
         let set = set_key(&deps.key, self.setup.as_deref())?;
@@ -801,8 +877,10 @@ impl DependencySets {
         Ok(deps)
     }
 
-    /// Whether the project has the same dependency files as the step, and the folders its installs fill.
-    fn project_matches(&mut self, deps: &Deps) -> bool {
+    /// Whether the step whose dependencies are `deps` can run with the project's installed dependencies: the
+    /// project has the same dependency files and, if the step has Node or Python lockfiles, an installed folder
+    /// next to at least one of them that `copy-0` can link.
+    fn project_matches(&mut self, deps: &Deps) -> Result<bool> {
         let project = self.cache.project();
         for (path, digest) in &deps.files {
             let found = self.project_digests.entry(path.clone()).or_insert_with(|| {
@@ -811,17 +889,44 @@ impl DependencySets {
                 self::digest(counted(name)?, &bytes).ok()
             });
             if found.as_deref() != Some(digest.as_str()) {
-                return false;
+                return Ok(false);
             }
         }
-        deps.installs
+        let mut linked = deps
+            .installs
             .iter()
-            .all(|install| project_has_folder(project, &install.dir, install.tool.folders()))
+            .filter(|install| install.tool != Tool::Cargo)
+            .peekable();
+        if linked.peek().is_none() {
+            return Ok(true);
+        }
+        for install in linked {
+            if self.project_has_installed(install)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    /// Switches `copy-0` to `tree` and links it to the project's installed dependencies. Returns `false`, and
-    /// stops using `copy-0` for the rest of the bisect, when the links cannot be made on this system.
-    fn use_project_copy(&mut self, store: &ShadowStore, tree: ObjectId) -> Result<bool> {
+    /// Whether the project has the folder `install` fills, installed: a `node_modules` or Python environment that
+    /// `copy-0` links (the same checks as [`NodeModules::link`] and [`PythonEnvs::link`]), or cargo's `target`.
+    fn project_has_installed(&mut self, install: &Install) -> Result<bool> {
+        if install.tool == Tool::Cargo {
+            let target = join(&install.dir, "target");
+            let project = self.cache.project();
+            return Ok(parents(&target)
+                .chain([target.as_str()])
+                .all(|folder| is_real_dir_no_follow(&native(project, folder))));
+        }
+        let links = self.project_links()?;
+        Ok(match install.tool {
+            Tool::Uv | Tool::Poetry | Tool::Pip => links.python.reusable(&install.dir)?,
+            _ => links.node.reusable(&install.dir)?,
+        })
+    }
+
+    /// The links of `copy-0` to the project's installed dependencies, opening `copy-0` if needed.
+    fn project_links(&mut self) -> Result<&mut Links> {
         if let btree_map::Entry::Vacant(entry) = self.copies.entry(0) {
             let project = self.cache.project();
             entry.insert(SetCopy {
@@ -832,6 +937,14 @@ impl DependencySets {
                 }),
             });
         }
+        let set_copy = self.copies.get_mut(&0).expect("opened above");
+        Ok(set_copy.links.as_mut().expect("copy-0 has links"))
+    }
+
+    /// Switches `copy-0` to `tree` and links it to the project's installed dependencies. Returns `false`, and
+    /// stops using `copy-0` for the rest of the bisect, when the links cannot be made on this system.
+    fn use_project_copy(&mut self, store: &ShadowStore, tree: ObjectId) -> Result<bool> {
+        self.project_links()?;
         let SetCopy { copy, links } = self.copies.get_mut(&0).expect("opened above");
         let links = links.as_mut().expect("copy-0 has links");
         copy.switch(store, tree)?;
@@ -843,6 +956,29 @@ impl DependencySets {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// The commands that install the step whose dependencies are `deps` in a copy of its own, with their
+    /// folders: the `--setup` command at the top, or the command of each lockfile in the folders where the
+    /// project has installed what it installs, or in every lockfile folder if it has none of them (lockfiles of
+    /// documentation, examples or fixtures are not installed when the project never installed them).
+    fn own_installs(&mut self, deps: &Deps) -> Result<Vec<(String, String)>> {
+        if let Some(setup) = &self.setup {
+            return Ok(vec![(String::new(), setup.clone())]);
+        }
+        let mut installed = Vec::new();
+        for install in &deps.installs {
+            if self.project_has_installed(install)? {
+                installed.push(install);
+            }
+        }
+        if installed.is_empty() {
+            installed = deps.installs.iter().collect();
+        }
+        Ok(installed
+            .into_iter()
+            .map(|install| (install.dir.clone(), install.tool.command().to_owned()))
+            .collect())
     }
 
     /// Installs the dependency set of the step `tree`, whose dependencies are `deps`, into a copy of its own: the
@@ -857,6 +993,7 @@ impl DependencySets {
         stop: &AtomicBool,
     ) -> Result<Prepared<'_>> {
         let set = set_key(&deps.key, self.setup.as_deref())?;
+        let commands = self.own_installs(deps)?;
         let holds_install = |number: usize| {
             self.book.copies.iter().any(|copy| {
                 copy.number == number
@@ -885,7 +1022,7 @@ impl DependencySets {
         self.book.save(events, self.cache.instance())?;
 
         self.open_own(number, deps)?.copy.switch(store, tree)?;
-        let state = match self.run_installs(number, deps, logs, stop)? {
+        let state = match self.run_installs(number, deps, &commands, logs, stop)? {
             Installed::Done => {
                 // Undoes what the install changed in the step's files, as before every run.
                 self.copies
@@ -916,8 +1053,8 @@ impl DependencySets {
         })
     }
 
-    /// Opens copy `number`, a copy with its own install for `deps`, and keeps the folders its installs fill
-    /// (`node_modules`, `.venv` next to each lockfile) through every switch, ignored or not.
+    /// Opens copy `number`, a copy with its own install for `deps`, and keeps the folders an install may fill
+    /// (see [`install_folders`]) through every switch, ignored or not.
     fn open_own(&mut self, number: usize, deps: &Deps) -> Result<&mut SetCopy> {
         let set_copy = match self.copies.entry(number) {
             btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -927,49 +1064,46 @@ impl DependencySets {
             }),
         };
         let mut extra = set_copy.copy.extra_paths().clone();
-        extra.extend(deps.installs.iter().filter_map(|install| {
-            let folder = install.tool.folders().first()?;
-            Some(join(&install.dir, folder))
-        }));
+        extra.extend(deps.folders.iter().cloned());
         set_copy.copy.set_extra_paths(extra);
         Ok(set_copy)
     }
 
-    /// Runs the installs of `deps`, or the `--setup` command, in copy `number`, one after the other, with the
-    /// protections of a test run, their output in one new log of `logs`.
+    /// Runs `commands` (folder and command) in copy `number`, which holds a step whose dependencies are `deps`,
+    /// one after the other, with the protections of a test run, their output in one new log of `logs`. Before
+    /// each one, the folders an install may fill are checked: a link or a file there stops the install.
     fn run_installs(
         &mut self,
         number: usize,
         deps: &Deps,
+        commands: &[(String, String)],
         logs: &Logs,
         stop: &AtomicBool,
     ) -> Result<Installed> {
-        let commands: Vec<(&str, &str)> = match &self.setup {
-            Some(setup) => vec![("", setup.as_str())],
-            None => deps
-                .installs
-                .iter()
-                .map(|install| (install.dir.as_str(), install.tool.command()))
-                .collect(),
-        };
         self.installs += 1;
         let name = format!("install-{}.log", self.installs);
         let mut log = logs.create(&name)?;
         let set_copy = &self.copies[&number];
+        let root = set_copy.copy.path();
         for (dir, command) in commands {
+            if let Some((path, link)) = deps.folders.iter().find_map(|folder| blocked(root, folder))
+            {
+                return Ok(Installed::Failed(InstallFailure::Blocked { path, link }));
+            }
             clean_root(&self.cache)?;
             write_boundaries(&self.cache)?;
             let env = set_copy.run_env(self.user.iter().cloned())?;
-            let cwd = folder_in_copy(set_copy.copy.path(), dir)?;
+            let cwd = folder_in_copy(root, dir)?;
+            let shown = redact_str(command).unwrap_or_else(|| command.clone());
             let place = if dir.is_empty() { "." } else { dir };
-            writeln!(log, "$ {command}    (in {place})")?;
+            writeln!(log, "$ {shown}    (in {place})")?;
             match run(command, &cwd, &env, &log, None, stop)?.outcome {
                 Outcome::Passed => {}
                 Outcome::Stopped => return Ok(Installed::Stopped),
                 outcome => {
-                    return Ok(Installed::Failed(InstallFailure {
-                        command: command.to_owned(),
-                        dir: dir.to_owned(),
+                    return Ok(Installed::Failed(InstallFailure::Failed {
+                        command: shown,
+                        dir: dir.clone(),
                         outcome,
                         log: logs.path().join(&name),
                         registry_error: shows_registry_error(&log),
@@ -984,6 +1118,20 @@ impl DependencySets {
 /// Whether copy `number` of the project's cache folder `cache` is a real folder.
 fn copy_exists(cache: &CacheDir, number: usize) -> bool {
     is_real_dir_no_follow(&cache.path().join(format!("copy-{number}")))
+}
+
+/// The path (relative, `/`-separated) of a link or a file, with whether it is a link, found at the folder
+/// `folder` of the copy at `root` or at a folder above it: an install would write through it. `None` when
+/// `folder` is a real folder reached through real folders, or missing.
+fn blocked(root: &Path, folder: &str) -> Option<(String, bool)> {
+    for path in parents(folder).chain([folder]) {
+        match fs::symlink_metadata(native(root, path)) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(metadata) => return Some((path.to_owned(), metadata.is_symlink())),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Deletes copy `number`, and its folders in `cargo-target/` and `pycache/`, from the project's cache folder
@@ -1051,11 +1199,11 @@ fn is_registry_error(output: &[u8]) -> bool {
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|word| REGISTRY_ERROR_WORDS.contains(&word))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::process::Command;
 
     use crate::bisect::link::make_link;
     use crate::bisect::run::Exit;
@@ -1135,10 +1283,28 @@ mod tests {
         match prepared {
             Prepared::Ready(set_copy) => (name(set_copy), set_copy),
             Prepared::CannotTest(failure) => {
-                let log = fs::read_to_string(&failure.log).unwrap_or_default();
+                let log = match failure {
+                    InstallFailure::Failed { log, .. } => fs::read_to_string(log).unwrap(),
+                    InstallFailure::Blocked { .. } => String::new(),
+                };
                 panic!("{failure}\n{log}")
             }
             Prepared::Stopped => panic!("stopped"),
+        }
+    }
+
+    /// What a failed install command gives: the command, its folder, how it ended, its log and whether it shows
+    /// a registry error.
+    fn failed(failure: &InstallFailure) -> (&str, &str, Outcome, &Path, bool) {
+        match failure {
+            InstallFailure::Failed {
+                command,
+                dir,
+                outcome,
+                log,
+                registry_error,
+            } => (command, dir, *outcome, log, *registry_error),
+            InstallFailure::Blocked { .. } => panic!("{failure}"),
         }
     }
 
@@ -1224,6 +1390,32 @@ mod tests {
         assert_ne!(
             with_web(r#""x": "1""#, "jest"),
             with_web(r#""x": "2""#, "jest")
+        );
+
+        // Package manager settings count as whole files.
+        for settings in [
+            ".python-version",
+            "uv.toml",
+            "bunfig.toml",
+            ".yarnrc",
+            ".pnpmfile.cjs",
+            "pnpm-workspace.yaml",
+            ".npmrc",
+            ".yarnrc.yml",
+        ] {
+            let with = |content: &str| key_of(&project, &[("index.js", ""), (settings, content)]);
+            assert_ne!(with("1"), with("2"), "{settings}");
+        }
+        // pnpm's field of `package.json` counts.
+        let pnpm = |overrides: &str| {
+            let manifest = format!(r#"{{"pnpm": {{"overrides": {{"a": "{overrides}"}}}}}}"#);
+            key_of(&project, &[("package.json", &manifest)])
+        };
+        assert_ne!(pnpm("1"), pnpm("2"));
+        // The order of a table's entries does not count, the order of a list's items does.
+        assert_ne!(
+            key(&node, &pyproject(r#""a", "b""#, "-q"), "1", &[]),
+            key(&node, &pyproject(r#""b", "a""#, "-q"), "1", &[])
         );
 
         // A manifest that does not parse counts as a whole.
@@ -1406,17 +1598,16 @@ mod tests {
 
         let mut bisect = Bisect::new(&project, Some(setup.clone()));
         let failure = bisect.cannot_test(&project, step("a", "1"));
-        assert_eq!(failure.outcome, Outcome::Failed(Exit::Code(1)));
-        assert_eq!(failure.command, setup);
-        assert_eq!(failure.dir, "");
-        assert!(failure.log.is_file());
-        assert!(!failure.registry_error);
+        let (command, dir, outcome, log, registry_error) = failed(&failure);
+        assert_eq!(
+            (command, dir, outcome),
+            (setup.as_str(), "", Outcome::Failed(Exit::Code(1)))
+        );
+        assert!(log.is_file());
+        assert!(!registry_error);
         let message = failure.to_string();
         assert!(message.contains("ended with exit code 1"), "{message}");
-        assert!(
-            message.contains(&failure.log.display().to_string()),
-            "{message}"
-        );
+        assert!(message.contains(&log.display().to_string()), "{message}");
         assert!(!message.contains("--with"), "{message}");
 
         // Another step of the same set is not installed again.
@@ -1457,7 +1648,7 @@ mod tests {
         let setup = "echo npm error code E401&& exit 1".to_owned();
         let mut bisect = Bisect::new(&project, Some(setup));
         let failure = bisect.cannot_test(&project, project.tree(&[("package-lock.json", "")]));
-        assert!(failure.registry_error);
+        assert!(failed(&failure).4);
         let message = failure.to_string();
         assert!(
             message.contains("add that file with --with <path>"),
@@ -1705,7 +1896,19 @@ mod tests {
 
     #[test]
     fn pip_installs_the_requirements_into_an_environment_of_the_copy() {
-        if tool(&["python3", "python"]).is_none() {
+        // The interpreter the install command starts.
+        let Some(python) = tool(if cfg!(windows) {
+            &["python"]
+        } else {
+            &["python3"]
+        }) else {
+            return;
+        };
+        let has_venv = Command::new(python)
+            .args(["-c", "import venv, ensurepip"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !has_venv {
             return;
         }
         let project = Project::new();
@@ -1733,5 +1936,169 @@ mod tests {
             assert!(passes(set_copy, logs, &command));
         }
         assert!(!bisect.logs.path().join("install-2.log").exists());
+    }
+
+    #[test]
+    fn installs_may_fill_the_folders_next_to_lockfiles_and_manifests() {
+        let files = [
+            "package.json",
+            "web/package-lock.json",
+            "api/pyproject.toml",
+            "tools/setup.py",
+            "docs/requirements-docs.txt",
+            "Cargo.lock",
+        ];
+        let installs = installs(files);
+        assert_eq!(
+            install_folders(files, &installs),
+            [
+                "api/.venv",
+                "api/venv",
+                "docs/.venv",
+                "docs/venv",
+                "node_modules",
+                "tools/.venv",
+                "tools/venv",
+                "web/node_modules",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_in_the_step_where_an_install_writes_stops_the_install() {
+        let project = Project::new();
+        let canary = tempfile::tempdir().unwrap();
+        write(canary.path(), "keep", "canary");
+        let before = state(canary.path());
+        let target = canary.path().to_str().unwrap();
+        let counter = canary.path().join("counter");
+        let link = FileKind::Symlink;
+        let regular = FileKind::Regular;
+        // On Windows the copy holds tree links as plain files: refused as well.
+        let expected = InstallFailure::Blocked {
+            path: ".venv".to_owned(),
+            link: cfg!(unix),
+        };
+
+        // The commands of the lockfiles, and a `--setup` command for manifests without a lockfile.
+        let with_lockfiles = project.typed_tree(&[
+            ("package-lock.json", regular, "{}"),
+            ("requirements.txt", regular, ""),
+            (".venv", link, target),
+            ("node_modules", link, target),
+        ]);
+        let with_manifests = project.typed_tree(&[
+            ("package.json", regular, "{}"),
+            ("pyproject.toml", regular, ""),
+            (".venv", link, target),
+            ("node_modules", link, target),
+        ]);
+        for (setup, tree) in [
+            (None, with_lockfiles),
+            (Some(append_to(&counter)), with_manifests),
+        ] {
+            let mut bisect = Bisect::new(&project, setup);
+            let failure = bisect.cannot_test(&project, tree);
+            assert_eq!(failure, expected);
+            let message = failure.to_string();
+            assert!(
+                message.contains("Yalper does not install through it"),
+                "{message}"
+            );
+        }
+        assert_eq!(state(canary.path()), before);
+    }
+
+    #[test]
+    fn lockfiles_the_project_never_installed_do_not_decide_the_copy() {
+        let project = Project::new();
+        let package = r#"{"dependencies": {"dep": "1"}}"#;
+        let files = [
+            (".gitignore", "node_modules/\n"),
+            ("package.json", package),
+            ("package-lock.json", "1"),
+            ("docs/requirements.txt", "sphinx\n"),
+            ("examples/app/package.json", package),
+            ("examples/app/package-lock.json", "1"),
+        ];
+        for (path, content) in files {
+            project.write(path, content);
+        }
+        project.write("node_modules/dep/index.js", "");
+
+        let mut bisect = Bisect::new(&project, None);
+        // The same dependency files: `copy-0`, although the docs and the example were never installed.
+        assert_eq!(bisect.ready(&project, project.tree(&files)), "copy-0");
+
+        // Another lockfile at the top: only it is installed, where the project has installed packages.
+        let mut changed = files;
+        changed[2] = ("package-lock.json", "2");
+        let deps = read_deps(&project.store, project.tree(&changed), &mut HashMap::new()).unwrap();
+        let commands = bisect.sets.own_installs(&deps).unwrap();
+        assert_eq!(commands, [(String::new(), "npm ci".to_owned())]);
+        drop(bisect);
+
+        // A project that installed nothing: every lockfile folder.
+        fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+        let mut bisect = Bisect::new(&project, None);
+        let commands = bisect.sets.own_installs(&deps).unwrap();
+        let folders: Vec<&str> = commands.iter().map(|(dir, _)| dir.as_str()).collect();
+        assert_eq!(folders, ["", "docs", "examples/app"]);
+    }
+
+    #[test]
+    fn an_interrupted_install_does_not_count() {
+        let project = Project::new();
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter = counter_dir.path().join("counter");
+        let tree = project.tree(&[("package-lock.json", "a")]);
+
+        let mut bisect = Bisect::new(&project, Some(append_to(&counter)));
+        assert_eq!(bisect.ready(&project, tree), "copy-1");
+        // As if the install had been stopped before it ended.
+        let recorded = bisect.events.meta(COPIES_KEY).unwrap().unwrap();
+        let started = recorded.replace("\"ok\"", "\"started\"");
+        assert_ne!(started, recorded);
+        bisect.events.set_meta(COPIES_KEY, Some(&started)).unwrap();
+        drop(bisect);
+
+        let mut bisect = Bisect::new(&project, Some(append_to(&counter)));
+        assert_eq!(bisect.ready(&project, tree), "copy-1");
+        assert_eq!(lines(&counter), 2);
+    }
+
+    #[test]
+    fn what_an_install_changes_in_the_steps_files_is_undone() {
+        let project = Project::new();
+        let tree = project.tree(&[("package-lock.json", "a"), ("index.js", "1")]);
+        let mut bisect = Bisect::new(&project, Some("echo changed> index.js".to_owned()));
+        assert_eq!(bisect.ready(&project, tree), "copy-1");
+        let index = project.cache.path().join("copy-1").join("index.js");
+        assert_eq!(fs::read_to_string(index).unwrap(), "1");
+    }
+
+    #[test]
+    fn a_setup_without_lockfiles_keeps_the_folders_it_fills() {
+        let project = Project::new();
+        let setup = if cfg!(windows) {
+            "mkdir node_modules && mkdir .venv && echo x> node_modules\\x && echo y> .venv\\y"
+        } else {
+            "mkdir -p node_modules .venv && echo x > node_modules/x && echo y > .venv/y"
+        };
+        // No `.gitignore`: nothing ignores the folders.
+        let step = |code: &str| {
+            project.tree(&[
+                ("package.json", "{}"),
+                ("pyproject.toml", ""),
+                ("index.js", code),
+            ])
+        };
+        let mut bisect = Bisect::new(&project, Some(setup.to_owned()));
+        for code in ["1", "2"] {
+            assert_eq!(bisect.ready(&project, step(code)), "copy-1");
+            let copy = project.cache.path().join("copy-1");
+            assert!(copy.join("node_modules").join("x").is_file());
+            assert!(copy.join(".venv").join("y").is_file());
+        }
     }
 }
