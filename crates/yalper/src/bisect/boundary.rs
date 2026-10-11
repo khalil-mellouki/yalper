@@ -309,10 +309,11 @@ mod tests {
         };
         let project = Project::new();
         let git_in_project = |args: &[&str]| {
-            // No automatic maintenance: git would run it in the background after the commit, changing `.git`
-            // while its state is read.
+            // No automatic maintenance and no file system monitor: git would run them in the background,
+            // changing `.git` while its state is read.
             let output = Command::new(git)
                 .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(["-c", "core.fsmonitor=false"])
                 .args(["-c", "user.name=Yalper Test"])
                 .args(["-c", "user.email=test@example.com"])
                 .args(args)
@@ -507,6 +508,9 @@ mod tests {
             for (path, content) in files {
                 project.write(path, content);
             }
+            // A relative build folder in the project's cargo settings, which cargo also reads for the copy:
+            // it would be resolved against the project.
+            project.write(".cargo/config.toml", "[build]\nbuild-dir = \"build-out\"\n");
             let before = state(project.path());
             let mut copy = copy_with(&project, files);
             let user = cargo_environment(&[]);
