@@ -53,6 +53,33 @@ jobs:
         env:
           YALPER_REQUIRE_TOOLS: "1"
 
+  end-to-end:
+    name: Bisect end-to-end (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Done criterion 9 of M2: `yalper bisect` names the planted step of real Node, Python and Rust projects.
+      # The runners have Node, npm, Python and cargo; npm and pip download from their registries. The samples are
+      # ignored by a plain `cargo test` and run one at a time, so their run times are comparable.
+      - name: Bisect sample projects
+        shell: bash
+        env:
+          YALPER_REQUIRE_TOOLS: "1"
+        run: |
+          status=0
+          cargo test --locked --test bisect_end_to_end -- --ignored --nocapture --test-threads 1 2>&1 | tee e2e.txt || status=$?
+          grep -E '^bisect_end_to_end' e2e.txt >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+
   bench:
     name: Hook latency (${{ matrix.os }})
     strategy:
