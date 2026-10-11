@@ -193,6 +193,13 @@ impl TestCopy {
         &self.extra
     }
 
+    /// Fails if the copy's folder, or the cache folder that holds it, is no longer the folder Yalper opened (a
+    /// test run replaced it), so that nothing is removed through what took its place.
+    pub(super) fn check_still_at_path(&self) -> io::Result<()> {
+        self.cache.dir().check_still_at_path()?;
+        self.dir.check_still_at_path()
+    }
+
     /// The tree the copy holds, or `None` until a switch succeeded.
     pub fn tree(&self) -> Option<ObjectId> {
         self.tree
@@ -241,8 +248,7 @@ impl TestCopy {
 
         // Checked right before writing: a test run could have replaced the copy's folder, or the cache folder,
         // which holds the bytecode folder cleaned below.
-        self.cache.dir().check_still_at_path()?;
-        self.dir.check_still_at_path()?;
+        self.check_still_at_path()?;
         let root = self.dir.path();
         make_owner_writable(root, &fs::symlink_metadata(root)?)?;
 

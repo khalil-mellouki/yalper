@@ -1146,7 +1146,7 @@ fn copy_file(source: &Path, target: &Path) -> io::Result<()> {
 /// in its place, never following a link. Returns `true` when the file is gone (deleted, or not there, with the
 /// copy or a folder above it), and `false` when it was not looked for: the copy is no longer at its canonical
 /// path, or a folder on the way is a link or a file. A test moved or replaced it; the file may be elsewhere.
-fn remove_copied(root: &Path, path: &str) -> io::Result<bool> {
+pub(super) fn remove_copied(root: &Path, path: &str) -> io::Result<bool> {
     match fs::canonicalize(root) {
         Ok(now) if plain(&now) == root => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),

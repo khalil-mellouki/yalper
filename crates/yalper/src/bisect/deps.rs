@@ -12,7 +12,9 @@
 //!   installed dependencies (see [`NodeModules`] and [`PythonEnvs`]): no install. If the step has Node or Python
 //!   lockfiles, the project must have at least one installed folder next to one of them that those links can
 //!   reuse; lockfiles of documentation, examples or fixtures that the project never installed do not count.
-//!   Where the links cannot be made ([`CANNOT_LINK`]), `copy-0` is not used for the rest of the bisect.
+//!   Where the links cannot be made ([`CANNOT_LINK`]), `copy-0` is not used for the rest of the bisect. The
+//!   links are removed when the bisect ends (see [`DependencySets::remove_project_links`]), and by a second
+//!   Ctrl-C, so that a tool that follows links cannot reach the project's packages through the cache folder.
 //! - Otherwise the step runs in the copy of its set, one of `copy-1` to `copy-3`, filled with the step's code and
 //!   installed once: with the `--setup` command at the top of the copy, or with the command of each lockfile
 //!   (see [`Tool`]) in its folder. In each ecosystem (Node, Python, Rust), only the lockfiles next to which the
@@ -68,13 +70,15 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use gix::ObjectId;
 use serde_json::{Value, json};
 
 use super::copy::{CARGO_TARGET_DIR, PYCACHE_DIR, join, native, parents, remove_entry};
 use super::env::same_name;
-use super::link::{CANNOT_LINK, is_real_dir_no_follow};
+use super::link::{CANNOT_LINK, is_real_dir_no_follow, plain};
+use super::local_files::remove_copied;
 use super::run::{Logs, Outcome, SKIP_EXIT_CODE, run};
 use super::{
     CacheDir, LocalFiles, NodeModules, PythonEnvs, TestCopy, clean_root, env_additions, run_env,
@@ -96,6 +100,11 @@ const MAX_TREE_ENTRIES: usize = 1_000_000;
 /// The most dependency files a step may have: far more than a large monorepo has, while a crafted tree with
 /// millions of manifests is refused instead of read.
 const MAX_DEPENDENCY_FILES: usize = 10_000;
+
+/// The links into the project that `copy-0` holds (its `node_modules` farms and its links to Python
+/// environments), as the canonical path of the copy and the path in it, for [`remove_all_project_links`]. Held
+/// while they are made or removed, so that [`remove_all_project_links`] waits for that and then removes them.
+static PROJECT_LINKS: Mutex<BTreeSet<(PathBuf, String)>> = Mutex::new(BTreeSet::new());
 
 /// How much of the end of a failed install's log is searched for a registry or login error.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
@@ -738,7 +747,8 @@ impl Book {
     }
 }
 
-/// A test copy of one dependency set.
+/// A test copy of one dependency set. Dropping `copy-0` removes its links to the project's installed
+/// dependencies (see [`DependencySets::remove_project_links`]).
 pub struct SetCopy {
     copy: TestCopy,
     /// `copy-0` only: its links to the project's installed dependencies.
@@ -748,11 +758,108 @@ pub struct SetCopy {
 struct Links {
     node: NodeModules,
     python: PythonEnvs,
+    /// The canonical path of the copy, under which [`PROJECT_LINKS`] lists its links.
+    canonical: PathBuf,
+}
+
+impl Links {
+    /// Makes the links of `copy` match the step it holds (see [`NodeModules::link`] and [`PythonEnvs::link`]),
+    /// listing them in [`PROJECT_LINKS`], also when making them fails halfway.
+    fn link(&mut self, copy: &mut TestCopy) -> io::Result<()> {
+        let mut listed = listed_links();
+        let linked = self
+            .node
+            .link(copy)
+            .and_then(|_| self.python.link(copy))
+            .map(|_| ());
+        self.list(&mut listed);
+        linked
+    }
+
+    /// Removes the links of `copy`, never following them (see [`NodeModules::unlink`] and
+    /// [`PythonEnvs::unlink`]), and from [`PROJECT_LINKS`]. Nothing is removed if a test replaced the copy's
+    /// folder. Returns the first error; the links not removed stay listed.
+    fn unlink(&mut self, copy: &mut TestCopy) -> io::Result<()> {
+        if self.node.farms().next().is_none() && self.python.links().next().is_none() {
+            return Ok(());
+        }
+        let mut listed = listed_links();
+        copy.check_still_at_path()?;
+        let node = self.node.unlink(copy);
+        let python = self.python.unlink(copy);
+        self.list(&mut listed);
+        node.and(python)
+    }
+
+    /// Makes `listed` hold, for this copy, exactly the links it has now.
+    fn list(&self, listed: &mut BTreeSet<(PathBuf, String)>) {
+        listed.retain(|(root, _)| *root != self.canonical);
+        listed.extend(
+            self.node
+                .farms()
+                .chain(self.python.links())
+                .map(|path| (self.canonical.clone(), path.to_owned())),
+        );
+    }
+}
+
+fn listed_links() -> MutexGuard<'static, BTreeSet<(PathBuf, String)>> {
+    PROJECT_LINKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Removes every link into the project that a `copy-0` of this process holds, for a second Ctrl-C, which makes
+/// Yalper exit without dropping anything. Links being made or removed are waited for, then removed. Returns the
+/// list, locked and empty: held until Yalper exits, it keeps a bisect still going from making any more.
+pub(super) fn remove_all_project_links() -> MutexGuard<'static, BTreeSet<(PathBuf, String)>> {
+    let mut listed = listed_links();
+    remove_listed(&mut listed);
+    listed
+}
+
+/// Removes the links into the project that a bisect which did not end left in `copy-0` of the project's cache
+/// folder `cache` (see [`NodeModules::remove_left_links`]), whether or not this bisect uses `copy-0`. Call it at
+/// the start of a bisect, after [`clean_root`], which removes a link in place of a copy, and before any copy is
+/// used. Nothing is removed unless `copy-0` and the cache folder are the real folders Yalper opened. Returns a
+/// message if the links could not be looked for or removed.
+pub(super) fn remove_left_links(cache: &CacheDir) -> Option<String> {
+    let path = cache.path().join("copy-0");
+    if !is_real_dir_no_follow(&path) {
+        return None;
+    }
+    let removed = TestCopy::open(cache, 0).and_then(|copy| {
+        copy.check_still_at_path()?;
+        NodeModules::new(cache.project())?.remove_left_links(&copy)
+    });
+    removed.err().map(|error| {
+        format!(
+            "cannot remove the links to your project's installed dependencies that an earlier bisect left in the \
+             test copy {}: {error}. If you delete it by hand, use a tool that does not follow links.",
+            path.display()
+        )
+    })
+}
+
+/// Removes every link of `listed` (see [`PROJECT_LINKS`]) and empties it. A link is removed only through a copy
+/// still at its canonical path and real folders, never followed (see [`remove_copied`]).
+fn remove_listed(listed: &mut BTreeSet<(PathBuf, String)>) {
+    for (root, path) in std::mem::take(listed) {
+        let _ = remove_copied(&root, &path);
+    }
 }
 
 impl SetCopy {
     pub fn copy(&self) -> &TestCopy {
         &self.copy
+    }
+
+    /// `copy-0` only: removes its links to the project's installed dependencies (`node_modules` farms, links to
+    /// Python environments), never following them, so that none stays in the cache folder between bisects. The
+    /// next step that runs in `copy-0` makes them again.
+    fn remove_links(&mut self) -> io::Result<()> {
+        match self.links.as_mut() {
+            Some(links) => links.unlink(&mut self.copy),
+            None => Ok(()),
+        }
     }
 
     /// The complete environment of a run in this copy, for [`run`]: [`run_env`] of the user's environment `user`
@@ -780,6 +887,12 @@ impl SetCopy {
             );
         }
         Ok(env)
+    }
+}
+
+impl Drop for SetCopy {
+    fn drop(&mut self) {
+        let _ = self.remove_links();
     }
 }
 
@@ -956,6 +1069,28 @@ impl DependencySets {
             .unwrap_or_default()
     }
 
+    /// Removes the links of `copy-0` to the project's installed dependencies, never following them: call it
+    /// when the bisect ends. Dropping these sets does the same, without the message. Returns a message if some
+    /// could not be removed.
+    pub fn remove_project_links(&mut self) -> Option<String> {
+        let set_copy = self.copies.get_mut(&0)?;
+        set_copy.remove_links().err().map(|error| {
+            format!(
+                "cannot remove the links to your project's installed dependencies from the test copy {}: \
+                 {error}. If you delete it by hand, use a tool that does not follow links.",
+                set_copy.copy.path().display()
+            )
+        })
+    }
+
+    /// Forgets the links of `copy-0` without removing them, as when Yalper is killed or crashes.
+    #[cfg(test)]
+    pub(super) fn leak_project_links(&mut self) {
+        if let Some(set_copy) = self.copies.get_mut(&0) {
+            std::mem::forget(set_copy.links.take());
+        }
+    }
+
     /// Puts the env files and `--with` files into copy `number`, which holds a step.
     fn sync_local_files(&mut self, number: usize) -> io::Result<()> {
         if let (Some(files), Some(set_copy)) =
@@ -1070,11 +1205,14 @@ impl DependencySets {
     fn project_links(&mut self) -> Result<&mut Links> {
         if let btree_map::Entry::Vacant(entry) = self.copies.entry(0) {
             let project = self.cache.project();
+            let copy = TestCopy::open(&self.cache, 0)?;
+            let canonical = plain(&fs::canonicalize(copy.path())?);
             entry.insert(SetCopy {
-                copy: TestCopy::open(&self.cache, 0)?,
+                copy,
                 links: Some(Links {
                     node: NodeModules::new(project)?,
                     python: PythonEnvs::new(project)?,
+                    canonical,
                 }),
             });
         }
@@ -1089,8 +1227,8 @@ impl DependencySets {
         let SetCopy { copy, links } = self.copies.get_mut(&0).expect("opened above");
         let links = links.as_mut().expect("copy-0 has links");
         copy.switch(store, tree)?;
-        match links.node.link(copy).and_then(|_| links.python.link(copy)) {
-            Ok(_) => Ok(true),
+        match links.link(copy) {
+            Ok(()) => Ok(true),
             Err(error) if error.kind() == CANNOT_LINK => {
                 self.no_links = true;
                 Ok(false)
@@ -1406,7 +1544,7 @@ mod tests {
 
     use crate::bisect::link::make_link;
     use crate::bisect::run::Exit;
-    use crate::bisect::testing::{Project, state, token, tool, venv_python, write};
+    use crate::bisect::testing::{Project, links_under, state, token, tool, venv_python, write};
 
     fn environment() -> Vec<(OsString, OsString)> {
         std::env::vars_os().collect()
@@ -1963,6 +2101,138 @@ mod tests {
         let mut bisect = Bisect::new(&project, Some(append_to(&counter)));
         assert_eq!(bisect.ready(&project, step("vitest", "1")), "copy-2");
         assert_eq!(lines(&counter), 2);
+    }
+
+    /// A project with installed Node packages in `web/` and a Python environment in `api/`, both ignored, and
+    /// the tree of a step with the same dependency files, which runs in `copy-0`.
+    fn with_installed() -> (Project, ObjectId) {
+        let project = Project::new();
+        let files = [
+            (".gitignore", "node_modules/\n.venv/\n"),
+            ("web/package.json", r#"{"dependencies": {"dep": "1"}}"#),
+            ("web/package-lock.json", "1"),
+            ("api/pyproject.toml", "[project]\nname = \"api\"\n"),
+            ("api/uv.lock", "1"),
+        ];
+        for (path, content) in files {
+            project.write(path, content);
+        }
+        project.write("web/node_modules/dep/index.js", "");
+        project.write("api/.venv/pyvenv.cfg", "home = /usr/bin\n");
+        let mut step = files.to_vec();
+        step.push(("index.js", ""));
+        let tree = project.tree(&step);
+        (project, tree)
+    }
+
+    /// What [`PROJECT_LINKS`] lists for the copy at `copy`.
+    fn listed_for(copy: &Path) -> BTreeSet<(PathBuf, String)> {
+        let canonical = plain(&fs::canonicalize(copy).unwrap());
+        listed_links()
+            .iter()
+            .filter(|(root, _)| *root == canonical)
+            .cloned()
+            .collect()
+    }
+
+    fn paths(listed: &BTreeSet<(PathBuf, String)>) -> Vec<&str> {
+        listed.iter().map(|(_, path)| path.as_str()).collect()
+    }
+
+    #[test]
+    fn copy_0_loses_its_links_into_the_project_when_the_bisect_ends_and_on_a_second_ctrl_c() {
+        let (project, step) = with_installed();
+        let before = state(project.path());
+        let copy_0 = project.cache.path().join("copy-0");
+        let mut bisect = Bisect::new(&project, None);
+        assert_eq!(bisect.ready(&project, step), "copy-0");
+        assert_eq!(links_under(&copy_0).len(), 2);
+        assert_eq!(
+            paths(&listed_for(&copy_0)),
+            ["api/.venv", "web/node_modules"]
+        );
+
+        // The end of the bisect.
+        assert_eq!(bisect.sets.remove_project_links(), None);
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert!(copy_0.join("web/package.json").is_file());
+        assert!(listed_for(&copy_0).is_empty());
+        assert_eq!(state(project.path()), before);
+        assert_eq!(bisect.sets.remove_project_links(), None);
+
+        // Dropped without that call (an error, a panic): the same.
+        assert_eq!(bisect.ready(&project, step), "copy-0");
+        assert_eq!(links_under(&copy_0).len(), 2);
+        drop(bisect);
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert!(listed_for(&copy_0).is_empty());
+        assert_eq!(state(project.path()), before);
+
+        // A second Ctrl-C removes what is listed, through the copy only.
+        let mut bisect = Bisect::new(&project, None);
+        assert_eq!(bisect.ready(&project, step), "copy-0");
+        let mut listed = listed_for(&copy_0);
+        assert_eq!(listed.len(), 2);
+        remove_listed(&mut listed);
+        assert!(listed.is_empty());
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert_eq!(state(project.path()), before);
+        drop(bisect);
+        assert_eq!(state(project.path()), before);
+    }
+
+    #[test]
+    fn links_a_bisect_that_did_not_end_left_in_copy_0_are_removed_by_the_next_one() {
+        let (project, step) = with_installed();
+        let before = state(project.path());
+        let copy_0 = project.cache.path().join("copy-0");
+        let leave_links = || {
+            let mut bisect = Bisect::new(&project, None);
+            assert_eq!(bisect.ready(&project, step), "copy-0");
+            // Yalper ends without removing them: killed, or crashed.
+            bisect.sets.leak_project_links();
+            drop(bisect);
+            assert_eq!(links_under(&copy_0).len(), 2);
+        };
+
+        // The next bisect's first step in `copy-0` has neither `web/` nor `api/`: its switch removes the link to
+        // the environment, and its first link removes the farm, which the switch keeps as ignored.
+        leave_links();
+        let mut bisect = Bisect::new(&project, None);
+        let other = project.tree(&[(".gitignore", "node_modules/\n.venv/\n"), ("index.js", "")]);
+        assert_eq!(bisect.ready(&project, other), "copy-0");
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert!(!copy_0.join("web").exists());
+        assert!(listed_for(&copy_0).is_empty());
+        drop(bisect);
+        assert_eq!(state(project.path()), before);
+
+        // A bisect that never uses `copy-0` removes them at its start, wherever they point, never following
+        // them. Real folders stay.
+        leave_links();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep.txt"), "keep").unwrap();
+        let out_link = copy_0.join("tools").join("node_modules").join("out");
+        fs::create_dir_all(out_link.parent().unwrap()).unwrap();
+        make_link(outside.path(), &out_link).unwrap();
+        write(&copy_0, "tools/.venv/pyvenv.cfg", "made by a test\n");
+        assert_eq!(links_under(&copy_0).len(), 3);
+        assert_eq!(remove_left_links(&project.cache), None);
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert!(copy_0.join("web/package.json").is_file());
+        assert!(copy_0.join("tools/.venv/pyvenv.cfg").is_file());
+        assert!(outside.path().join("keep.txt").is_file());
+        let mut bisect = Bisect::new(&project, Some("exit 0".to_owned()));
+        let other_lockfile = project.tree(&[
+            (".gitignore", "node_modules/\n.venv/\n"),
+            ("web/package.json", r#"{"dependencies": {"dep": "1"}}"#),
+            ("web/package-lock.json", "2"),
+            ("index.js", ""),
+        ]);
+        assert_eq!(bisect.ready(&project, other_lockfile), "copy-1");
+        drop(bisect);
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert_eq!(state(project.path()), before);
     }
 
     #[test]

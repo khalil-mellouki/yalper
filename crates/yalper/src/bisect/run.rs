@@ -70,9 +70,10 @@ const LOG_TAIL_BYTES: u64 = 1 << 20;
 /// Installs the handler of Ctrl-C, and also of SIGTERM and SIGHUP on Unix. The first one sets [`STOP`]: the run
 /// going on is stopped and its processes killed, and the bisect ends. A second one makes Yalper exit at once
 /// with [`STOPPED_EXIT_CODE`], after giving a run going on up to 1 s to kill its processes, and after waiting
-/// for a file being copied into a test copy and deleting every env file and `--with` file copied. Closing the
-/// console on Windows is not handled: Windows ends Yalper right away, and the job object kills the run's
-/// processes; the next bisect deletes the copied files (see [`remove_left_over`](super::remove_left_over)).
+/// for a file being copied into a test copy and deleting every env file and `--with` file copied, and removing
+/// the links of `copy-0` into the project. Closing the console on Windows is not handled: Windows ends Yalper
+/// right away, and the job object kills the run's processes; the next bisect deletes the copied files (see
+/// [`remove_left_over`](super::remove_left_over)) and the links of `copy-0` at its start.
 /// Install it once per process.
 pub fn handle_ctrl_c() -> io::Result<()> {
     ctrlc::set_handler(|| {
@@ -80,6 +81,8 @@ pub fn handle_ctrl_c() -> io::Result<()> {
             wait_for_runs(&RUNNING, SECOND_PRESS_WAIT);
             // Held until the exit: a copy going on is waited for and deleted, and nothing more is copied.
             let _copied = super::local_files::remove_all_copied();
+            // Taken after the list of copied files, never before: the bisect never holds both at once.
+            let _links = super::deps::remove_all_project_links();
             std::process::exit(STOPPED_EXIT_CODE);
         }
     })

@@ -3,7 +3,8 @@
 //! It reads the snapshots of what is bisected ([`entries`]), opens the project's cache folder and takes its
 //! [`BisectLock`], and lets the engine ([`bisect`]) pick the entries to test. Each run goes through the same
 //! protections: the step's copy and dependencies from [`DependencySets::prepare`] (with the env files and
-//! `--with` files of [`LocalFiles`], deleted when the bisect ends), the cache folder's root cleaned and its
+//! `--with` files of [`LocalFiles`], deleted when the bisect ends, like the links of `copy-0` into the project,
+//! see [`DependencySets::remove_project_links`]), the cache folder's root cleaned and its
 //! boundary files written, the environment of [`SetCopy::run_env`](super::SetCopy::run_env), and [`run`] with the
 //! stop flag of Ctrl-C. Nothing is written into the project: only the `meta` table of its event log records
 //! where the bisect data is and which files to copy (see [`choose`]).
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
 
+use super::deps::remove_left_links;
 use super::entries::{
     Entries, Entry, Kind, Scope, another_session_running, entries, others_between, step_name,
 };
@@ -340,6 +342,9 @@ fn command_in(
     for warning in remove_left_over(&cache, &store) {
         say(out, &printable(&format!("warning: {warning}")));
     }
+    if let Some(warning) = remove_left_links(&cache) {
+        say(out, &printable(&format!("warning: {warning}")));
+    }
     let logs = Logs::open(&cache).map_err(io_failed)?;
     let existed = copies_in(&cache).map_err(io_failed)?;
     // Its own connection, so it can update the list of copied files until it is dropped.
@@ -409,7 +414,11 @@ fn command_in(
         Ok(report) => report,
         Err(error) => {
             let mut message = error.to_string();
-            for not_deleted in tester.sets.remove_local_files() {
+            let not_deleted = tester.sets.remove_local_files();
+            for not_deleted in not_deleted
+                .into_iter()
+                .chain(tester.sets.remove_project_links())
+            {
                 message.push_str(&format!(". Also: {not_deleted}"));
             }
             return Err(message);
@@ -417,7 +426,8 @@ fn command_in(
     };
     // Deleted before the result is shown, so they stay no longer than the runs need them.
     let used = tester.sets.local_files().map(LocalFiles::used);
-    let not_deleted = tester.sets.remove_local_files();
+    let mut not_deleted = tester.sets.remove_local_files();
+    not_deleted.extend(tester.sets.remove_project_links());
     let history = tester.history;
     say(out, "");
     let ended = write_answer(out, &report, &entries, &history, &names);
@@ -1262,7 +1272,7 @@ fn ticking<T>(heading: &str, live: bool, work: impl FnOnce() -> T) -> (T, usize)
 mod tests {
     use super::*;
     use crate::bisect::COPIED_KEY;
-    use crate::bisect::testing::{state, token, write};
+    use crate::bisect::testing::{links_under, state, token, write};
     use crate::repo::{GIT_ID_FILE, ID_FILE};
     use crate::safe_fs::OwnedDir;
     use crate::snapshot::{Change, FileKind};
@@ -1476,35 +1486,56 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_flag_kills_the_run_deletes_the_copied_env_files_and_leaves_the_project_unchanged() {
+    fn the_stop_flag_kills_the_run_deletes_the_copied_env_files_and_links_and_leaves_the_project_unchanged()
+     {
         let project = tempfile::tempdir().unwrap();
         let markers = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
+        let pyproject = "[project]\nname = \"demo\"\n";
         recorded(
             project.path(),
-            &[&[("a.txt", "a")], &[("b.txt", "b")], &[("c.txt", "c")]],
+            &[
+                &[("pyproject.toml", pyproject)],
+                &[("b.txt", "b")],
+                &[("c.txt", "c")],
+            ],
         );
         write(project.path(), "src/main.rs", "fn main() {}\n");
-        write(project.path(), ".gitignore", ".env\n");
+        write(
+            project.path(),
+            ".gitignore",
+            ".env\nnode_modules/\n.venv/\n",
+        );
         write(project.path(), ".env", "SECRET=stop-test-secret\n");
+        // Installed dependencies, which `copy-0` links to.
+        write(project.path(), "pyproject.toml", pyproject);
+        write(project.path(), "node_modules/dep/index.js", "");
+        write(project.path(), ".venv/pyvenv.cfg", "home = /usr/bin\n");
         let before = state(project.path());
 
         let (started, late) = (markers.path().join("started"), markers.path().join("late"));
         let test = if cfg!(windows) {
             format!(
-                "if exist .env (echo.>\"{}\")& ping -n 6 127.0.0.1 >nul& echo.>\"{}\"",
+                "if exist .env if exist node_modules\\dep\\index.js if exist .venv\\pyvenv.cfg \
+                 (echo.>\"{}\")& ping -n 6 127.0.0.1 >nul& echo.>\"{}\"",
                 started.display(),
                 late.display()
             )
         } else {
             format!(
-                "test -f .env && echo > '{}'; sleep 5; echo > '{}'",
+                "test -f .env && test -f node_modules/dep/index.js && test -f .venv/pyvenv.cfg && echo > '{}'; \
+                 sleep 5; echo > '{}'",
                 started.display(),
                 late.display()
             )
         };
         let options = Options {
             test,
+            // The first step with `pyproject.toml`, next to which `.venv` is linked.
+            good: Some(StepRef {
+                session: None,
+                step: 2,
+            }),
             files: Choice {
                 env: Some(true),
                 ..Choice::default()
@@ -1550,14 +1581,16 @@ mod tests {
             out.ends_with("Stopped. Your project was not changed.\n"),
             "{out}"
         );
-        assert!(out.contains("Testing step 1, the good end"), "{out}");
+        assert!(out.contains("Testing step 2, the good end"), "{out}");
         // The whole tree was killed: the command never got to its last part, 5 s after its first.
         thread::sleep(
             (started_at + Duration::from_secs(6)).saturating_duration_since(Instant::now()),
         );
-        // The run started with the env file in its copy (it writes `started` only then), which is gone.
+        // The run started with the env file and the links to the project's packages and environment in its
+        // copy (it writes `started` only then), which are gone.
         assert!(started.exists() && !late.exists(), "{out}");
         assert_eq!(state(project.path()), before);
+        assert_eq!(links_under(cache_base.path()), Vec::<PathBuf>::new());
         let cached = state(cache_base.path());
         assert!(cached.keys().any(|path| path.ends_with("copy-0/README.md")));
         assert!(
@@ -1646,5 +1679,94 @@ mod tests {
         let yalper = OwnedDir::open(&project.path().join(".yalper")).unwrap();
         let events = Store::open(&yalper, &token()).unwrap();
         assert_eq!(events.meta(COPIED_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn links_left_in_copy_0_are_removed_at_the_start_of_a_bisect_that_never_uses_it() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        let package = r#"{"dependencies": {"dep": "1"}}"#;
+        let pyproject = "[project]\nname = \"demo\"\n";
+        // Every step has another lockfile than the project: none runs in `copy-0`.
+        recorded(
+            project.path(),
+            &[
+                &[("package.json", package), ("package-lock.json", "2")],
+                &[("b.txt", "b")],
+                &[("c.txt", "c")],
+            ],
+        );
+        write(project.path(), ".gitignore", "node_modules/\n.venv/\n");
+        write(project.path(), "package.json", package);
+        write(project.path(), "package-lock.json", "1");
+        write(project.path(), "pyproject.toml", pyproject);
+        write(project.path(), "node_modules/dep/index.js", "");
+        write(project.path(), ".venv/pyvenv.cfg", "home = /usr/bin\n");
+        let before = state(project.path());
+        let folder = cache_base.path().join("yalper");
+        let copy_0 = {
+            let cache = CacheDir::open_in(&folder, project.path(), &token()).unwrap();
+            let yalper = OwnedDir::open(&project.path().join(".yalper")).unwrap();
+            let shadow = ShadowStore::open(&yalper, &token()).unwrap();
+            let events = Store::open(&yalper, &token()).unwrap();
+            let files = [
+                ("package.json", package),
+                ("package-lock.json", "1"),
+                ("pyproject.toml", pyproject),
+            ];
+            let changes: Vec<Change> = files
+                .iter()
+                .map(|&(path, content)| Change::Upsert {
+                    path: path.to_owned(),
+                    kind: FileKind::Regular,
+                    blob: shadow.write_blob(content.as_bytes()).unwrap(),
+                })
+                .collect();
+            let tree = shadow.edit_tree(shadow.empty_tree(), &changes).unwrap();
+            let mut sets = DependencySets::new(&cache, &events, None, Vec::new()).unwrap();
+            let logs = Logs::open(&cache).unwrap();
+            let prepared = sets
+                .prepare(&events, &shadow, tree, &logs, &AtomicBool::new(false))
+                .unwrap();
+            let Prepared::Ready(set_copy) = prepared else {
+                panic!("not ready");
+            };
+            let copy_0 = set_copy.copy().path().to_owned();
+            // Yalper ends without removing them: killed, or crashed.
+            sets.leak_project_links();
+            copy_0
+        };
+        assert_eq!(links_under(&copy_0).len(), 2);
+
+        let options = Options {
+            test: "exit 0".to_owned(),
+            good: Some(StepRef {
+                session: None,
+                step: 2,
+            }),
+            setup: Some("exit 0".to_owned()),
+            ..Options::default()
+        };
+        let screen = Screen {
+            live: false,
+            time_zone: TimeZone::UTC,
+        };
+        let open_cache = |project: &Path, token: &Token| CacheDir::open_in(&folder, project, token);
+        let mut out = Vec::new();
+        let ended = command_in(
+            project.path(),
+            &options,
+            &screen,
+            &mut out,
+            &AtomicBool::new(false),
+            &open_cache,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(ended, Ok(Ended::NotNamed), "{out}");
+        assert!(out.contains("The bad end, step 4, passes"), "{out}");
+        assert!(!out.contains("warning"), "{out}");
+        assert!(copy_0.with_file_name("copy-1").is_dir());
+        assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
+        assert_eq!(state(project.path()), before);
     }
 }
