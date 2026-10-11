@@ -24,7 +24,7 @@
 //! gone, by the next bisect of any project (see [`remove_stale`]).
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -290,6 +290,146 @@ impl CacheDir {
     }
 }
 
+/// The bisect lock of a project's cache folder: while it is held, another bisect of the project, `yalper uninstall
+/// --purge` and the stale cleanup of another project's bisect are refused. Released when dropped, and by the
+/// operating system when the process ends in any way.
+#[derive(Debug)]
+pub struct BisectLock {
+    file: File,
+}
+
+impl BisectLock {
+    /// Takes the lock of the cache folder `cache`. Fails with [`io::ErrorKind::ResourceBusy`] while another
+    /// process holds it.
+    pub fn acquire(cache: &CacheDir) -> io::Result<Self> {
+        lock(&cache.dir)
+    }
+}
+
+impl Drop for BisectLock {
+    fn drop(&mut self) {
+        // Closing the file releases the lock too, but Windows may do that with a delay.
+        let _ = self.file.unlock();
+    }
+}
+
+/// How many times [`lock`] starts over while other processes create or remove the lock file at the same time.
+const LOCK_ATTEMPTS: usize = 3;
+
+/// Takes the bisect lock of the project's cache folder `dir` (see [`BisectLock`]).
+///
+/// The lock file is never opened in place to be held: a lock file left by a bisect that ended is removed and
+/// created anew, as `clock` is, because on Windows a hard link a test put at its name cannot be told from a
+/// plain file and locking it would lock the file it links to. A lock file in use cannot be removed:
+///
+/// - On Unix it is locked (`flock`): before removing a lock file that is there, the lock on it is taken, and
+///   checked to be the file still at that name, so no running bisect loses it.
+/// - On Windows it is held open without delete sharing, so removing it fails while a bisect holds it.
+fn lock(dir: &OwnedDir) -> io::Result<BisectLock> {
+    dir.check_still_at_path()?;
+    let path = dir.path().join(LOCK_FILE);
+    let busy = || {
+        io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!(
+                "a bisect of this project is running: it holds {}",
+                path.display()
+            ),
+        )
+    };
+    for _ in 0..LOCK_ATTEMPTS {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                let _old = if metadata.is_file() {
+                    let old = safe_fs::open_regular_file(&path)?;
+                    match old.try_lock() {
+                        Ok(()) => {}
+                        Err(fs::TryLockError::WouldBlock) => return Err(busy()),
+                        Err(fs::TryLockError::Error(error)) => return Err(error),
+                    }
+                    if !is_at_path(&old, &path)? {
+                        continue;
+                    }
+                    // Held until the file is removed, so no other bisect can take it meanwhile.
+                    Some(old)
+                } else {
+                    None
+                };
+                match remove_entry(&path, &metadata) {
+                    // ERROR_SHARING_VIOLATION: a running bisect holds it open.
+                    Err(error) if cfg!(windows) && error.raw_os_error() == Some(32) => {
+                        return Err(busy());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    result => result?,
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        #[cfg(windows)]
+        {
+            use safe_fs::windows::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            use std::os::windows::fs::OpenOptionsExt;
+            options
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(busy()),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+        #[cfg(unix)]
+        if !is_at_path(&file, &path)? {
+            continue;
+        }
+        return Ok(BisectLock { file });
+    }
+    Err(busy())
+}
+
+/// Whether `path` names the open file `file` (Unix: same device and inode), not a file put there since.
+#[cfg(unix)]
+fn is_at_path(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    Ok(match fs::symlink_metadata(path) {
+        Ok(named) => (named.dev(), named.ino()) == (held.dev(), held.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    })
+}
+
+/// Removes the lock file `lock` holds in the folder at `dir`, and releases the lock.
+fn remove_lock(dir: &Path, lock: BisectLock) -> io::Result<()> {
+    let path = dir.join(LOCK_FILE);
+    // On Windows a file held open without delete sharing cannot be removed. On Unix it is removed while held, so
+    // no other bisect takes it and then loses its own lock file to this removal.
+    #[cfg(windows)]
+    drop(lock);
+    let result = match fs::symlink_metadata(&path) {
+        Ok(metadata) => remove_entry(&path, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    #[cfg(unix)]
+    drop(lock);
+    result
+}
+
 /// Removes every entry at the top of the project's cache folder that Yalper does not put there, never following
 /// a link: folders that tools made where the boundary files sent them (`node_modules/` of an `npm install`, uv's
 /// `.venv/`, `.pytest_cache/`, `Cargo.lock`), and files a test planted to be found from every copy
@@ -334,16 +474,35 @@ pub fn clean_root(cache: &CacheDir) -> io::Result<usize> {
 
 /// A cache folder of a project, held open, found by [`find_project_folders`].
 #[derive(Debug)]
-pub struct ProjectFolder(OwnedDir);
+pub struct ProjectFolder {
+    dir: OwnedDir,
+    lock: Option<BisectLock>,
+}
 
 impl ProjectFolder {
-    pub fn path(&self) -> &Path {
-        self.0.path()
+    fn new(dir: OwnedDir) -> Self {
+        Self { dir, lock: None }
     }
 
-    /// Deletes the folder and everything in it, never following a link (see [`delete_folder`]).
-    pub fn delete(self) -> io::Result<()> {
-        delete_folder(self.0)
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Takes the folder's bisect lock (see [`BisectLock`]) until it is deleted, so that no bisect of the project
+    /// starts meanwhile. Fails with [`io::ErrorKind::ResourceBusy`] while a bisect of the project runs.
+    pub fn lock(&mut self) -> io::Result<()> {
+        if self.lock.is_none() {
+            self.lock = Some(lock(&self.dir)?);
+        }
+        Ok(())
+    }
+
+    /// Deletes the folder and everything in it, never following a link (see [`delete_folder`]), after taking its
+    /// bisect lock if [`lock`](Self::lock) did not.
+    pub fn delete(mut self) -> io::Result<()> {
+        self.lock()?;
+        let lock = self.lock.take().expect("taken above");
+        delete_folder(self.dir, lock)
     }
 }
 
@@ -442,7 +601,7 @@ fn find_in(
                 let why = if !place_is_ours {
                     not_ours
                 } else if interrupted {
-                    found.ours.push(ProjectFolder(dir));
+                    found.ours.push(ProjectFolder::new(dir));
                     continue;
                 } else {
                     // An empty marker just created: another bisect is creating the folder.
@@ -455,13 +614,13 @@ fn find_in(
                 if !named_for(name, &marker.digest) {
                     found.others.push((shown, not_ours.to_owned()));
                 } else if Some(marker.digest.as_str()) == digest {
-                    found.ours.push(ProjectFolder(dir));
+                    found.ours.push(ProjectFolder::new(dir));
                 } else if instance.as_deref() != Some(marker.instance.as_str()) {
                     found.others.push((shown, not_ours.to_owned()));
                 } else {
                     let owner = marker.project.as_deref();
                     match owner.and_then(|owner| gives_name(Path::new(owner), name)) {
-                        Some(false) => found.ours.push(ProjectFolder(dir)),
+                        Some(false) => found.ours.push(ProjectFolder::new(dir)),
                         _ => found.others.push((
                             shown,
                             owner.map_or_else(
@@ -614,20 +773,22 @@ fn unmarked(path: &Path) -> io::Result<Option<Unmarked>> {
     }))
 }
 
-/// Deletes the project's cache folder `dir` without following any link inside it (a link is removed, never
-/// what it points to: the test copies link to the project's dependencies). The folder is checked to still be
-/// at its path first (see [`OwnedDir::check_still_at_path`]). Its marker goes last: if a file in use stops the
-/// deletion halfway (Windows), the folder still says whose it is, so running the deletion again finishes it.
-fn delete_folder(dir: OwnedDir) -> io::Result<()> {
+/// Deletes the project's cache folder `dir`, whose bisect lock is `lock`, without following any link inside it
+/// (a link is removed, never what it points to: the test copies link to the project's dependencies). The folder
+/// is checked to still be at its path first (see [`OwnedDir::check_still_at_path`]). The lock file goes once
+/// everything else but the marker is gone, and the marker last: if a file in use stops the deletion halfway
+/// (Windows), the folder still says whose it is, so running the deletion again finishes it.
+fn delete_folder(dir: OwnedDir, lock: BisectLock) -> io::Result<()> {
     dir.check_still_at_path()?;
     let path = dir.path().to_owned();
     for entry in fs::read_dir(&path)? {
         let entry = entry?;
-        if entry.file_name() != MARKER_FILE {
+        if entry.file_name() != MARKER_FILE && entry.file_name() != LOCK_FILE {
             let entry = entry.path();
             remove_entry(&entry, &fs::symlink_metadata(&entry)?)?;
         }
     }
+    remove_lock(&path, lock)?;
     let marker = path.join(MARKER_FILE);
     match fs::symlink_metadata(&marker).and_then(|metadata| remove_entry(&marker, &metadata)) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
@@ -676,8 +837,10 @@ pub fn remove_stale(current: &CacheDir) -> Vec<PathBuf> {
             Look::Marked(dir, marker) => is_stale(dir.path(), name, &marker, now).then_some(dir),
             Look::Missing | Look::Other(..) => None,
         };
+        // A folder whose lock is held is in use by a bisect.
         if let Some(dir) = stale
-            && delete_folder(dir).is_ok()
+            && let Ok(lock) = lock(&dir)
+            && delete_folder(dir, lock).is_ok()
         {
             removed.push(path);
         }
@@ -2020,5 +2183,101 @@ mod tests {
         assert_eq!(marker_project(&marker("/a\rb")), None);
         assert_eq!(marker_project(&marker("/a\u{FFFD}b")), None);
         assert_eq!(marker_project("digest d\ninstance i\n"), None);
+    }
+
+    #[test]
+    fn one_bisect_of_a_project_at_a_time() {
+        let (_base, folder) = base();
+        let project = Project::new();
+        let cache = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+        let held = BisectLock::acquire(&cache).unwrap();
+        let error = BisectLock::acquire(&cache).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy, "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("a bisect of this project is running")
+        );
+        // The lock file stays: removing it would let a second bisect in.
+        assert!(cache.path().join(LOCK_FILE).is_file());
+        assert_eq!(clean_root(&cache).unwrap(), 0);
+        drop(held);
+        // A lock file left by a bisect that ended is no obstacle.
+        drop(BisectLock::acquire(&cache).unwrap());
+        BisectLock::acquire(&cache).unwrap();
+    }
+
+    #[test]
+    fn a_lock_file_planted_by_a_test_is_replaced_never_used() {
+        let (_base, folder) = base();
+        let project = Project::new();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary");
+        fs::write(&canary, "keep me").unwrap();
+        let cache = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+        let lock_path = cache.path().join(LOCK_FILE);
+
+        fs::hard_link(&canary, &lock_path).unwrap();
+        let held = BisectLock::acquire(&cache).unwrap();
+        // The canary is neither locked (Windows locks are mandatory) nor changed.
+        fs::write(&canary, "still mine").unwrap();
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "still mine");
+        assert_eq!(fs::symlink_metadata(&lock_path).unwrap().len(), 0);
+        drop(held);
+
+        fs::remove_file(&lock_path).unwrap();
+        make_link(outside.path(), &lock_path).unwrap();
+        drop(BisectLock::acquire(&cache).unwrap());
+        assert!(fs::symlink_metadata(&lock_path).unwrap().is_file());
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "still mine");
+    }
+
+    #[test]
+    fn a_folder_in_use_by_a_bisect_is_neither_purged_nor_removed_as_stale() {
+        let (_base, folder) = base();
+        let project = set_up(&token('a'));
+        let cache = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+        let held = BisectLock::acquire(&cache).unwrap();
+        let path = cache.path().to_owned();
+
+        let found = find_in(Ok(folder.clone()), project.path(), &token('a'), None);
+        let [mut ours] = <[ProjectFolder; 1]>::try_from(found.ours).unwrap();
+        assert_eq!(ours.lock().unwrap_err().kind(), io::ErrorKind::ResourceBusy);
+        let error = ours.delete().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+        assert!(path.join(MARKER_FILE).is_file());
+
+        // Stale: the project is gone and the folder unused for 8 days, but a bisect holds it.
+        drop(project);
+        write(&path, CLOCK_FILE, "x");
+        last_changed(&path.join(CLOCK_FILE), 8);
+        let other = Project::new();
+        let current = CacheDir::open_in(&folder, other.path(), &token('b')).unwrap();
+        assert!(remove_stale(&current).is_empty());
+        assert!(path.join(MARKER_FILE).is_file());
+        drop((held, cache));
+        assert_eq!(remove_stale(&current), std::slice::from_ref(&path));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_purge_takes_the_lock_and_deletes_it_with_the_folder() {
+        let (_base, folder) = base();
+        let project = set_up(&token('a'));
+        let path = cache_of(&folder, project.path(), &token('a'));
+        drop(BisectLock::acquire(
+            &CacheDir::open_in(&folder, project.path(), &token('a')).unwrap(),
+        ));
+        let found = find_in(Ok(folder.clone()), project.path(), &token('a'), None);
+        let [mut ours] = <[ProjectFolder; 1]>::try_from(found.ours).unwrap();
+        ours.lock().unwrap();
+        let reopened = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+        assert_eq!(
+            BisectLock::acquire(&reopened).unwrap_err().kind(),
+            io::ErrorKind::ResourceBusy
+        );
+        drop(reopened);
+        ours.delete().unwrap();
+        assert!(!path.exists());
     }
 }

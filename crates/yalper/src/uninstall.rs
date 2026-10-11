@@ -61,7 +61,7 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
     let was_set_up = removes_hooks || fs::symlink_metadata(&token_path).is_ok();
     let recordings_kept = !purge && matches!(yalper, Yalper::Ours(..));
     // Looked for while the init token that names the folder is still there.
-    let bisect_data = match &yalper {
+    let mut bisect_data = match &yalper {
         Yalper::Ours(dir, token) => Some(bisect::find_project_folders(
             root,
             token,
@@ -69,6 +69,24 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
         )),
         _ => None,
     };
+    // Held until each folder is deleted: no bisect of the project runs during the purge.
+    if purge && let Some(folders) = &mut bisect_data {
+        for folder in &mut folders.ours {
+            folder.lock().map_err(|error| {
+                if error.kind() == io::ErrorKind::ResourceBusy {
+                    format!(
+                        "{error}. Wait for that bisect to end, or stop it, then run `yalper uninstall --purge` \
+                         again. Nothing was changed."
+                    )
+                } else {
+                    format!(
+                        "cannot lock the bisect data in {}: {error}. Nothing was changed.",
+                        folder.path().display()
+                    )
+                }
+            })?;
+        }
+    }
     // Lines that say what is kept: printed even when nothing changed.
     let mut kept_lines = Vec::new();
 

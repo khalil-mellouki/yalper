@@ -31,7 +31,7 @@ mod testing;
 
 pub use boundary::write_boundaries;
 pub use cache::{
-    CACHE_DIR_KEY, CACHE_DIR_VAR, CacheDir, ProjectFolder, ProjectFolders, clean_root,
+    BisectLock, CACHE_DIR_KEY, CACHE_DIR_VAR, CacheDir, ProjectFolder, ProjectFolders, clean_root,
     find_project_folders, remove_stale,
 };
 pub use command::{Ended, MAX_RETRIES, Options, Screen, command, parse_timeout};
