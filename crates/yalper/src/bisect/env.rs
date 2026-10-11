@@ -94,7 +94,9 @@ mod tests {
         python.link(&mut copy).unwrap();
         let additions = env_additions(&copy, &python).unwrap();
 
-        let bisect = plain(&std::path::absolute(project.path().join(".yalper/bisect")).unwrap());
+        // The copy's folder: canonical on Unix, where `/var` may be a link to `/private/var`.
+        let bisect = plain(&std::path::absolute(copy.path().parent().unwrap()).unwrap());
+        assert!(bisect.ends_with(".yalper/bisect"));
         let pycache = bisect.join("pycache").join("copy-0");
         let cargo_target = bisect.join("cargo-target");
         assert_eq!(
