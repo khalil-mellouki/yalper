@@ -23,6 +23,7 @@ jiff.workspace = true
 regex-automata.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 # Unix only: the current user id (to check who owns `.yalper`), O_NOFOLLOW and openat, without unsafe code.
 # Also the process group of a bisect test run: waiting with WNOWAIT and killing the group.

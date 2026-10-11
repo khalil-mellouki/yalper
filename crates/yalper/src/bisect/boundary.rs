@@ -247,7 +247,7 @@ mod tests {
             .unwrap();
         Logs::open(&project.cache).unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        env_additions(&copy, &python).unwrap();
+        env_additions(&copy, Some(&python)).unwrap();
         assert_eq!(clean_root(&project.cache).unwrap(), 0);
         assert_eq!(write_boundaries(&project.cache).unwrap(), 0);
     }
@@ -297,7 +297,7 @@ mod tests {
         write_boundaries(copy.cache()).unwrap();
         let mut python = PythonEnvs::new(&project).unwrap();
         python.link(copy).unwrap();
-        let additions = env_additions(copy, &python).unwrap();
+        let additions = env_additions(copy, Some(&python)).unwrap();
         let env = run_env(user, &project, copy, additions).unwrap();
         run_with(copy.path(), command, &env)
     }

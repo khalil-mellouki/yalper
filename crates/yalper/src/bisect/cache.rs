@@ -1586,7 +1586,7 @@ mod tests {
         write_boundaries(&project.cache).unwrap();
         Logs::open(&project.cache).unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        env_additions(&copy, &python).unwrap();
+        env_additions(&copy, Some(&python)).unwrap();
         write(&root, "lock", "");
         let kept: Vec<_> = fs::read_dir(&root)
             .unwrap()

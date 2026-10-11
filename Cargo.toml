@@ -39,7 +39,8 @@ regex-automata = { version = "0.4", default-features = false, features = ["std",
 # file as it was apart from the hooks it adds.
 serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
-# Build time only: reads the vendored gitleaks rules into a Rust table.
+# Reads the vendored gitleaks rules into a Rust table at build time, and the dependency sections of a step's
+# `pyproject.toml` during a bisect.
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 
 [workspace.lints.rust]

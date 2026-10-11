@@ -100,10 +100,11 @@ pub struct EnvAdditions {
     pub vars: Vec<(&'static str, OsString)>,
 }
 
-/// The environment additions for a test run in `copy`, whose Python environments are `python`. Call it
-/// before every run, after [`PythonEnvs::link`]: it also makes sure that the folders the variables name are
+/// The environment additions for a test run in `copy`, whose links to the project's Python environments are
+/// `python` (`None` for a copy with its own install, whose environments are its own). Call it before every run
+/// and every install, after [`PythonEnvs::link`]: it also makes sure that the folders the variables name are
 /// real folders inside the project's cache folder, since a test run could have put a link in their place.
-pub fn env_additions(copy: &TestCopy, python: &PythonEnvs) -> io::Result<EnvAdditions> {
+pub fn env_additions(copy: &TestCopy, python: Option<&PythonEnvs>) -> io::Result<EnvAdditions> {
     copy.cache().dir().check_still_at_path()?;
     let pycache = plain(&std::path::absolute(copy.pycache_path())?);
     let cargo_target = plain(&std::path::absolute(copy.cargo_target_path())?);
@@ -115,7 +116,10 @@ pub fn env_additions(copy: &TestCopy, python: &PythonEnvs) -> io::Result<EnvAddi
         make_real_dir(folder)?;
     }
     Ok(EnvAdditions {
-        python_path: python.python_path(copy)?,
+        python_path: match python {
+            Some(python) => python.python_path(copy)?,
+            None => Vec::new(),
+        },
         vars: vec![
             ("PYTHONPYCACHEPREFIX", pycache.into_os_string()),
             ("UV_NO_SYNC", OsString::from("1")),
@@ -319,7 +323,7 @@ pub fn run_env(
 }
 
 /// Whether the variable name `name` is `var`, without regard to case on Windows, where names ignore it.
-fn same_name(name: &OsStr, var: &str) -> bool {
+pub(super) fn same_name(name: &OsStr, var: &str) -> bool {
     if cfg!(windows) {
         name.eq_ignore_ascii_case(var)
     } else {
@@ -539,7 +543,7 @@ mod tests {
             .unwrap();
         let mut python = PythonEnvs::new(project.path()).unwrap();
         python.link(&mut copy).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
 
         // The copy's folder: canonical on Unix, where `/var` may be a link to `/private/var`.
         let bisect = plain(&std::path::absolute(copy.path().parent().unwrap()).unwrap());
@@ -716,7 +720,7 @@ mod tests {
             .unwrap();
         let mut python = PythonEnvs::new(project.path()).unwrap();
         python.link(&mut copy).unwrap();
-        let mut additions = env_additions(&copy, &python).unwrap();
+        let mut additions = env_additions(&copy, Some(&python)).unwrap();
         let root = plain(&std::path::absolute(project.path()).unwrap());
         let copy_root = plain(&std::path::absolute(copy.path()).unwrap());
         additions.python_path = vec![copy_root.join("src")];
@@ -805,7 +809,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         (project, copy, additions)
     }
 
@@ -1018,7 +1022,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         let user = vec![
             (OsString::from("git_dir"), OsString::from("x")),
             (OsString::from("Cargo_Target_Dir"), OsString::from("x")),
@@ -1037,7 +1041,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         let env = run_env(Vec::new(), project.path(), &copy, additions.clone()).unwrap();
         assert_eq!(value(&env, "PYTHONPATH"), None);
         let empty = vec![(OsString::from("PYTHONPATH"), OsString::new())];
@@ -1052,7 +1056,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        let mut additions = env_additions(&copy, &python).unwrap();
+        let mut additions = env_additions(&copy, Some(&python)).unwrap();
         let folder = |index: usize| p(&format!("/{index:0>99}"));
         // Each folder takes its length plus a separator, except the last; then comes `PYTHONPATH=`.
         let with_separator = folder(0).as_os_str().len() + 1;
@@ -1080,7 +1084,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(&root).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         let error = run_env(Vec::new(), &root, &copy, additions).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("project's path"), "{error}");
@@ -1100,7 +1104,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         let error = run_env(Vec::new(), project.path(), &copy, additions).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("git"), "{error}");
@@ -1117,7 +1121,7 @@ mod tests {
         copy.switch(&project.store, project.tree(&[("README.md", "")]))
             .unwrap();
         let python = PythonEnvs::new(project.path()).unwrap();
-        env_additions(&copy, &python).unwrap();
+        env_additions(&copy, Some(&python)).unwrap();
 
         // A test run replaces the folders with links to the canary, then the copy's own folders with files.
         let bisect = project.cache.path().to_owned();
@@ -1126,12 +1130,12 @@ mod tests {
             fs::remove_dir_all(&path).unwrap();
             make_link(canary.path(), &path).unwrap();
         }
-        env_additions(&copy, &python).unwrap();
+        env_additions(&copy, Some(&python)).unwrap();
         for folder in ["pycache/copy-0", "cargo-target/copy-0"] {
             fs::remove_dir_all(bisect.join(folder)).unwrap();
             fs::write(bisect.join(folder), "a file").unwrap();
         }
-        env_additions(&copy, &python).unwrap();
+        env_additions(&copy, Some(&python)).unwrap();
 
         for folder in [
             "pycache",
@@ -1232,13 +1236,13 @@ mod tests {
         let mut copy = project.copy();
         let python = PythonEnvs::new(project.path()).unwrap();
         copy.switch(&project.store, tree(&lib_b1)).unwrap();
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         assert_eq!(compiled(&cargo_test(cargo, &copy, &additions)), ["a", "b"]);
 
         // One file of `b` changes: only `b` is compiled again.
         let switched = copy.switch(&project.store, tree(&lib_b2)).unwrap();
         assert_eq!(switched.written, 1);
-        let additions = env_additions(&copy, &python).unwrap();
+        let additions = env_additions(&copy, Some(&python)).unwrap();
         assert_eq!(compiled(&cargo_test(cargo, &copy, &additions)), ["b"]);
 
         assert!(!copy.path().join("target").exists());
@@ -1264,7 +1268,7 @@ mod tests {
             ])
         };
         let cargo_run = |copy: &TestCopy| {
-            let additions = env_additions(copy, &python).unwrap();
+            let additions = env_additions(copy, Some(&python)).unwrap();
             let output = Command::new(cargo)
                 .args(["run", "--offline", "--quiet"])
                 .current_dir(copy.path())
