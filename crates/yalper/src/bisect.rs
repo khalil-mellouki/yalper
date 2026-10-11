@@ -47,7 +47,9 @@ pub use engine::{
     Answer, End, Failure, LINKER_RERUNS, Reason, Report, Settings, Skip, Tested, Trial,
     automatic_limit, bisect,
 };
-pub use entries::{Entries, Entry, Kind, Scope, entries, others_between, step_name};
+pub use entries::{
+    Entries, Entry, Kind, Scope, another_session_running, entries, others_between, step_name,
+};
 pub use env::{EnvAdditions, env_additions, run_env};
 pub use link::CANNOT_LINK;
 pub use local_files::{

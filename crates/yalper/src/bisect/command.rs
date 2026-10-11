@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
 
-use super::entries::{Entries, Entry, Kind, Scope, entries, others_between, step_name};
+use super::entries::{
+    Entries, Entry, Kind, Scope, another_session_running, entries, others_between, step_name,
+};
 use super::{
     Answer, BisectLock, CACHE_DIR_KEY, CacheDir, Choice, DependencySets, End, Exit, Failure,
     InstallFailure, LocalFiles, Logs, Outcome, Prepared, Reason, Report, Run, SKIP_EXIT_CODE,
@@ -33,12 +35,14 @@ use super::{
     remove_stale, run, write_boundaries,
 };
 use crate::init::{printable, say};
-use crate::log::{NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars};
+use crate::log::{
+    ELLIPSIS, NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars,
+};
 use crate::redact::{redact_str, strip_escapes};
 use crate::repo::Token;
 use crate::show::{self, Changes, Format, StepView};
 use crate::snapshot::ShadowStore;
-use crate::store::{Event, Session, Store};
+use crate::store::{Event, Session, StepRange, Store};
 
 /// The most `--retries` accepted: more runs of a failing step would rather hide a real failure.
 pub const MAX_RETRIES: u32 = 10;
@@ -48,6 +52,9 @@ const TAIL_LINES: usize = 20;
 
 /// The prefix of each line of a log shown on screen, so that no line a test prints can pass for Yalper's own.
 const TAIL_PREFIX: &str = "  | ";
+
+/// The "other sessions changed files" note names at most this many sessions.
+const MAX_OTHER_SESSIONS: usize = 5;
 
 /// How `--since` is shown.
 const SINCE_FORMAT: &str = "%Y-%m-%d %H:%M";
@@ -216,14 +223,6 @@ fn command_in(
     for warning in &chosen.warnings {
         say(out, &printable(&format!("warning: {warning}")));
     }
-    let steps = store.steps_in_recorded_order().map_err(failed)?;
-    let names = Names {
-        steps: &steps,
-        id_chars,
-        across,
-    };
-    let good = find_end(&names, &sessions, session, "--good", options.good.as_ref())?;
-    let bad = find_end(&names, &sessions, session, "--bad", options.bad.as_ref())?;
     let since = options
         .since
         .map(|since| since.strftime(SINCE_FORMAT).to_string());
@@ -237,23 +236,64 @@ fn command_in(
         ),
         None => None,
     };
-    let (scope, what) = match (across, &since) {
-        (false, _) => (Scope::Session(&session.id), format!("session {short}")),
-        (true, None) => (Scope::All { since_ms }, "across sessions".to_owned()),
-        (true, Some(since)) => (
+    // Only the steps the bisect can need are read: those of the session, with the steps of other sessions
+    // recorded in between, or those from the date asked.
+    let (range, scope, what, pick_good) = match (across, since_ms, &since) {
+        (false, ..) => (
+            StepRange::Spanning(&session.id),
+            Scope::Session(&session.id),
+            format!("session {short}"),
+            "Pick a good end with --good <step>.",
+        ),
+        (true, Some(ms), Some(since)) => (
+            StepRange::Since(ms),
             Scope::All { since_ms },
             format!("the sessions since {since}"),
+            "Pick a later date with --since, or a good end with --all --good <session>:<step>.",
+        ),
+        (true, ..) => (
+            StepRange::All,
+            Scope::All { since_ms: None },
+            "across sessions".to_owned(),
+            "Pick a good end with --good <session>:<step>.",
         ),
     };
+    let steps = store.steps_in_recorded_order(range).map_err(failed)?;
+    let names = Names {
+        steps: &steps,
+        id_chars,
+        across,
+    };
+    let good = find_end(
+        &store,
+        &names,
+        &sessions,
+        session,
+        "--good",
+        options.good.as_ref(),
+    )?;
+    let bad = find_end(
+        &store,
+        &names,
+        &sessions,
+        session,
+        "--bad",
+        options.bad.as_ref(),
+    )?;
     let shadow = ShadowStore::open(&yalper.dir, &yalper.token)
         .map_err(|error| format!("cannot read the snapshots: {error}"))?;
     let Entries {
         entries,
         bad,
         missing,
-    } = entries(&steps, &shadow, scope, good, bad, &|order| {
-        names.step(order)
-    })
+    } = entries(
+        &steps,
+        &shadow,
+        scope,
+        (good, bad),
+        &|order| names.step(order),
+        pick_good,
+    )
     .map_err(|why| format!("cannot bisect {what}: {why}"))?;
     let (good_end, bad_end) = (entries[0], entries[entries.len() - 1]);
     if entries.len() < 2 || good_end.tree == bad_end.tree {
@@ -479,6 +519,7 @@ impl Names<'_> {
 /// `session`: the session bisected, or the most recently active one across sessions. In a bisect of one session
 /// it must be a step of that session.
 fn find_end(
+    store: &Store,
     names: &Names<'_>,
     sessions: &[Session],
     session: &Session,
@@ -500,17 +541,23 @@ fn find_end(
             short_id(&session.id, names.id_chars)
         ));
     }
-    let of_session = || {
-        names
-            .steps
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| event.session_id == named.id)
-    };
-    if let Some((order, _)) = of_session().find(|(_, event)| event.step == end.step) {
+    if let Some(order) = names
+        .steps
+        .iter()
+        .position(|event| event.session_id == named.id && event.step == end.step)
+    {
         return Ok(Some(order));
     }
-    Err(match of_session().count() {
+    // Not among the steps read: recorded before the date of `--since`, or not recorded at all.
+    let failed = |error: crate::store::Error| format!("cannot read the recordings: {error}");
+    if store.event(&named.id, end.step).map_err(failed)?.is_some() {
+        return Err(format!(
+            "{option} names step {} of session {short}, which was recorded before the first snapshot since the \
+             date given with --since.",
+            end.step
+        ));
+    }
+    Err(match store.step_count(&named.id).map_err(failed)? {
         0 => format!("session {short} has no steps recorded yet ({option})."),
         count => format!(
             "session {short} has no step {} ({option}): its steps are 1 to {count}. `yalper log --session \
@@ -542,8 +589,9 @@ fn write_others(
             None => sessions.push((&event.session_id, 1, event.step, event.step)),
         }
     }
-    let listed: Vec<String> = sessions
+    let mut listed: Vec<String> = sessions
         .iter()
+        .take(MAX_OTHER_SESSIONS)
         .map(|&(id, count, first, last)| {
             let short = short_id(id, names.id_chars);
             match count {
@@ -552,6 +600,9 @@ fn write_others(
             }
         })
         .collect();
+    if sessions.len() > MAX_OTHER_SESSIONS {
+        listed.push(ELLIPSIS.to_owned());
+    }
     let failed = names.entry(failed);
     let diff = if found {
         " (and so does the diff below)"
@@ -656,25 +707,43 @@ fn write_answer(
         Answer::Found { entry, failure } => {
             let breaking = &entries[*entry];
             let name = label(*entry);
+            let session = names.short(breaking.order);
+            // Changes found when a session started or resumed: made by no recorded step, unless another
+            // session was running then, whose agent may have made them in a step without a snapshot.
+            let outside_sessions = if another_session_running(names.steps, breaking.order) {
+                "No tool step of an agent made them (they may come from you, another program, or a step of the \
+                 session that was running then). The diff below shows them."
+            } else {
+                "No agent step made them: they were made outside the recorded sessions (by you or another \
+                 program). The diff below shows them."
+            };
+            let between_turns = "No tool step of the agent made them: they were made between two of its turns \
+                                 (by you or another program). The diff below shows them.";
             let (cause, outside) = match breaking.kind {
                 Kind::SessionStart => (
                     format!(
-                        "The changes made between sessions, before session {} (recorded at its step {}), broke \
-                         the tests",
-                        names.short(breaking.order),
+                        "The changes made between sessions, before session {session} (recorded at its step {}), \
+                         broke the tests",
                         breaking.step
                     ),
-                    Some(
-                        "No agent step made them: they were made outside the recorded sessions (by you or \
-                         another program). The diff below shows them.",
+                    Some(outside_sessions),
+                ),
+                Kind::Resume => (
+                    format!(
+                        "The changes made before session {session} resumed (at its step {}) broke the tests",
+                        breaking.step
                     ),
+                    Some(outside_sessions),
+                ),
+                Kind::Compact => (
+                    format!(
+                        "The changes made before this point of the session, at {name}, broke the tests"
+                    ),
+                    Some(between_turns),
                 ),
                 Kind::Prompt => (
                     format!("The changes made before the prompt at {name} broke the tests"),
-                    Some(
-                        "No tool step of the agent made them: they were made between two of its turns (by you \
-                         or another program). The diff below shows them.",
-                    ),
+                    Some(between_turns),
                 ),
                 Kind::Step | Kind::Before => {
                     (format!("{} broke the tests", capitalized(&name)), None)
@@ -1218,6 +1287,52 @@ mod tests {
         ] {
             assert!(parse_timeout(wrong).is_err(), "{wrong}");
         }
+    }
+
+    #[test]
+    fn the_note_on_other_sessions_names_at_most_five() {
+        let step = |session: &str, step: u32| Event {
+            session_id: session.to_owned(),
+            step,
+            ts_ms: 0,
+            kind: "PostToolUse".to_owned(),
+            tool_name: None,
+            tool_use_id: None,
+            agent_id: None,
+            success: None,
+            tree_id: None,
+            base_tree_id: None,
+            files_changed: None,
+            payload: serde_json::Value::Null,
+        };
+        let steps: Vec<Event> = ["s1", "s2", "s3", "s4", "s5", "s6", "s7"]
+            .iter()
+            .flat_map(|session| [step(session, 3), step(session, 4)])
+            .collect();
+        let names = Names {
+            steps: &steps,
+            id_chars: 8,
+            across: false,
+        };
+        let entry = |step| Entry {
+            order: 0,
+            step,
+            kind: super::Kind::Step,
+            tree: gix::ObjectId::null(gix::hash::Kind::Sha1),
+            base: None,
+        };
+        let mut out = Vec::new();
+        let others: Vec<usize> = (0..steps.len()).collect();
+        write_others(&mut out, &names, &others, (&entry(7), &entry(8)), false);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(
+                ": session s1 (2 steps, 3 to 4), session s2 (2 steps, 3 to 4), session s3 (2 steps, 3 to 4), \
+                 session s4 (2 steps, 3 to 4), session s5 (2 steps, 3 to 4), .... `yalper bisect --all`"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("s6"), "{out}");
     }
 
     #[test]

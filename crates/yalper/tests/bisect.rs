@@ -135,10 +135,15 @@ impl Project {
     }
 
     fn start(&self, session: &str) {
+        self.start_from(session, "startup");
+    }
+
+    /// The start of a session, with Claude Code's `source`: `startup`, `resume`, `compact` or `clear`.
+    fn start_from(&self, session: &str, source: &str) {
         self.hook(
             session,
             "SessionStart",
-            json!({"source": "startup", "model": "claude-opus-5"}),
+            json!({"source": source, "model": "claude-opus-5"}),
         );
     }
 
@@ -921,8 +926,11 @@ fn testing_lines(out: &str) -> Vec<&str> {
 fn changes_made_between_sessions_are_an_entry_of_their_own() {
     let project = Project::new("good");
     record(&project, EARLIER_SESSION, &notes_steps(0));
-    // Between the first two sessions, outside any of them, an edit breaks the tests.
-    project.edit(&[("status.txt", Some("bad\n"))]);
+    // Between the first two sessions, outside any of them, an edit breaks the tests, and another writes a
+    // secret into a tracked file: the diff shows it masked.
+    let token = fake_token();
+    let readme = format!("# demo\ngithub_token = \"{token}\"\n");
+    project.edit(&[("status.txt", Some("bad\n")), ("README.md", Some(&readme))]);
     record(&project, SESSION, &notes_steps(0));
     record(&project, LATER_SESSION, &later_steps());
 
@@ -974,17 +982,115 @@ fn changes_made_between_sessions_are_an_entry_of_their_own() {
         "{out}"
     );
     assert!(runs(&out) <= 8, "{out}");
-    // The diff from the last code that passed: the edit made between the sessions.
+    // The diff from the last code that passed: the edits made between the sessions, the secret masked.
     assert!(out.contains("Session 5f3c2a1e, step 1 of 13"), "{out}");
     assert!(
         out.contains("Session started (startup), model claude-opus-5"),
         "{out}"
     );
     assert!(
-        out.contains("1 file changed:\n  modified  status.txt"),
+        out.contains("2 files changed:\n  modified  README.md\n  modified  status.txt"),
         "{out}"
     );
     assert!(out.contains("-good\n+bad"), "{out}");
+    assert!(out.contains("+github_token = \"[REDACTED:"), "{out}");
+    assert!(!out.contains(&token), "{out}");
+}
+
+#[test]
+fn changes_found_when_a_session_is_compacted_or_cleared_are_between_turns() {
+    for source in ["compact", "clear"] {
+        let project = Project::new("good");
+        project.start(SESSION);
+        project.prompt(SESSION, "Add a note.");
+        project.tool(SESSION, 3, &[("notes.txt", Some("one\n"))]);
+        project.stop(SESSION);
+        project.edit(&[("status.txt", Some("bad\n"))]);
+        project.start_from(SESSION, source);
+        project.prompt(SESSION, "Add another note.");
+        project.tool(SESSION, 7, &[("notes.txt", Some("two\n"))]);
+        project.stop(SESSION);
+
+        let (code, out, _) = project.bisect(&["--test", TEST, "--all"], &[]);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(
+            out.contains(
+                "Testing step 5 of session 5f3c2a1e, changes made before this point of the session (about "
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "The changes made before this point of the session, at step 5 of session 5f3c2a1e, broke the \
+                 tests: they pass at step 3 of session 5f3c2a1e and fail at step 5 of session 5f3c2a1e"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "No tool step of the agent made them: they were made between two of its turns"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("between sessions"), "{out}");
+    }
+}
+
+#[test]
+fn changes_found_when_a_session_resumes_are_named_with_it() {
+    let project = Project::new("good");
+    record(&project, EARLIER_SESSION, &notes_steps(0));
+    project.edit(&[("status.txt", Some("bad\n"))]);
+    project.start_from(EARLIER_SESSION, "resume");
+    project.prompt(EARLIER_SESSION, "Go on.");
+    project.tool(EARLIER_SESSION, 16, &[("notes.txt", Some("more\n"))]);
+    project.stop(EARLIER_SESSION);
+
+    let (code, out, _) = project.bisect(&["--test", TEST], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("Testing step 14, changes made before the session resumed (about "),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "The changes made before session 0a9b8c7d resumed (at its step 14) broke the tests: they pass at \
+             step 12 and fail at step 14 (exit code 1)."
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("No agent step made them: they were made outside the recorded sessions"),
+        "{out}"
+    );
+
+    // While it was not running, another session was: its agent may have made the changes.
+    let project = Project::new("good");
+    record(&project, EARLIER_SESSION, &notes_steps(0));
+    project.start(SESSION);
+    project.prompt(SESSION, "Work meanwhile.");
+    project.tool(SESSION, 3, &[("other.txt", Some("1\n"))]);
+    project.edit(&[("status.txt", Some("bad\n"))]);
+    project.start_from(EARLIER_SESSION, "resume");
+    project.tool(SESSION, 4, &[("other.txt", Some("2\n"))]);
+    project.tool(EARLIER_SESSION, 15, &[("notes.txt", Some("more\n"))]);
+    project.stop(EARLIER_SESSION);
+    project.stop(SESSION);
+
+    let (code, out, _) = project.bisect(&["--test", TEST, "--all"], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains(
+            "The changes made before session 0a9b8c7d resumed (at its step 14) broke the tests: they pass at \
+             step 3 of session 5f3c2a1e and fail at step 14 of session 0a9b8c7d (exit code 1)."
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("No tool step of an agent made them (they may come from you, another program"),
+        "{out}"
+    );
+    assert!(!out.contains("outside the recorded sessions"), "{out}");
 }
 
 #[test]
@@ -1158,6 +1264,18 @@ fn since_leaves_out_the_older_sessions() {
     assert!(
         err.contains(
             "error: cannot bisect the sessions since 2999-01-01 10:30: no snapshot was taken since then."
+        ),
+        "{err}"
+    );
+    let (code, _, err) = project.bisect(
+        &["--test", TEST, "--since", "2001-01-01", "--bad", "0a9b:5"],
+        &[],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains(
+            "error: --bad names step 5 of session 0a9b8c7d, which was recorded before the first snapshot \
+             since the date given with --since."
         ),
         "{err}"
     );

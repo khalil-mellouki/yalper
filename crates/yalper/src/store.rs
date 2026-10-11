@@ -166,6 +166,18 @@ pub struct Event {
     pub payload: Value,
 }
 
+/// Which steps [`Store::steps_in_recorded_order`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepRange<'a> {
+    /// Every step.
+    All,
+    /// The steps from the first step of the session with this id to its last, with the steps of other sessions
+    /// recorded in between.
+    Spanning(&'a str),
+    /// The steps from the first snapshot taken at or after this time, in milliseconds since the Unix epoch.
+    Since(i64),
+}
+
 /// What the stat cache knew about one file of the latest snapshot when the file was last read.
 ///
 /// Rows come from a file on disk, so callers must check them before use (see `snapshot::snapshot`).
@@ -534,15 +546,32 @@ impl Store {
         Ok(events)
     }
 
-    /// The steps of every session in the order they were recorded, which is the order their snapshots were taken
-    /// (sessions that ran at the same time interleave), without their payloads (`Value::Null`).
-    pub fn steps_in_recorded_order(&self) -> Result<Vec<Event>> {
-        let columns = EVENT_COLUMNS.replace("payload", "NULL");
-        let mut statement = self
-            .conn
-            .prepare(&format!("SELECT {columns} FROM events ORDER BY id"))?;
+    /// The steps `which` names, of every session, in the order they were recorded, which is the order their
+    /// snapshots were taken (sessions that ran at the same time interleave). Their payloads are left out
+    /// (`Value::Null`), except the `source` of a session's start (`startup`, `resume`, `compact`, `clear`).
+    pub fn steps_in_recorded_order(&self, which: StepRange<'_>) -> Result<Vec<Event>> {
+        let columns = EVENT_COLUMNS.replace(
+            "payload",
+            "CASE WHEN kind = 'SessionStart' AND json_valid(payload)
+                 THEN json_object('source', json_extract(payload, '$.source')) END",
+        );
+        let (filter, param) = match which {
+            StepRange::All => ("", None),
+            StepRange::Spanning(session_id) => (
+                "WHERE id BETWEEN (SELECT MIN(id) FROM events WHERE session_id = ?1)
+                              AND (SELECT MAX(id) FROM events WHERE session_id = ?1)",
+                Some(rusqlite::types::Value::Text(session_id.to_owned())),
+            ),
+            StepRange::Since(ms) => (
+                "WHERE id >= (SELECT MIN(id) FROM events WHERE tree_id IS NOT NULL AND ts_ms >= ?1)",
+                Some(rusqlite::types::Value::Integer(ms)),
+            ),
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {columns} FROM events {filter} ORDER BY id"
+        ))?;
         let events = statement
-            .query_map([], event_from_row)?
+            .query_map(rusqlite::params_from_iter(param.iter()), event_from_row)?
             .collect::<rusqlite::Result<_>>()?;
         Ok(events)
     }
@@ -1625,24 +1654,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let owned = OwnedDir::open(dir.path()).unwrap();
         let store = Store::open(&owned, &token()).unwrap();
-        for session in ["a", "b"] {
+        for session in ["a", "b", "c"] {
             store.upsert_session(&Session::new(session, 1)).unwrap();
         }
-        let order = [("b", 1), ("a", 1), ("b", 2), ("a", 2), ("a", 3)];
+        let order = [
+            ("c", 1),
+            ("b", 1),
+            ("a", 1),
+            ("b", 2),
+            ("a", 2),
+            ("a", 3),
+            ("c", 2),
+        ];
         for (session, step) in order {
-            store.insert_event(&event(session, step)).unwrap();
+            let mut recorded = event(session, step);
+            match (session, step) {
+                // A late step without a snapshot: not where `Since` starts.
+                ("c", 1) => {
+                    recorded.ts_ms = 5_000;
+                    recorded.tree_id = None;
+                }
+                ("b", 1) => {
+                    recorded.kind = "SessionStart".to_owned();
+                    recorded.payload = json!({"source": "resume", "model": "m", "other": "x"});
+                }
+                _ => {}
+            }
+            store.insert_event(&recorded).unwrap();
         }
-        let steps = store.steps_in_recorded_order().unwrap();
-        let found: Vec<(&str, u32)> = steps
-            .iter()
-            .map(|event| (event.session_id.as_str(), event.step))
-            .collect();
-        assert_eq!(found, order);
+        let read = |which| -> Vec<(String, u32)> {
+            store
+                .steps_in_recorded_order(which)
+                .unwrap()
+                .into_iter()
+                .map(|event| (event.session_id, event.step))
+                .collect()
+        };
+        let pairs = |list: &[(&str, u32)]| -> Vec<(String, u32)> {
+            list.iter()
+                .map(|&(session, step)| (session.to_owned(), step))
+                .collect()
+        };
+        assert_eq!(read(StepRange::All), pairs(&order));
+        assert_eq!(read(StepRange::Spanning("a")), pairs(&order[2..6]));
+        assert_eq!(read(StepRange::Since(1_002)), pairs(&order[3..]));
+        assert!(read(StepRange::Spanning("none")).is_empty());
+        assert!(read(StepRange::Since(10_000)).is_empty());
+
+        // Only the source of a session's start is kept from the payloads.
+        let steps = store.steps_in_recorded_order(StepRange::All).unwrap();
+        assert_eq!(steps[1].payload, json!({"source": "resume"}));
         assert_eq!(
-            steps[0],
+            steps[2],
             Event {
                 payload: Value::Null,
-                ..event("b", 1)
+                ..event("a", 1)
             }
         );
     }

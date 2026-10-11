@@ -14,8 +14,11 @@
 //!   of the latest snapshot at or before it: its changes are in the next snapshot.
 //! - Between the ends, only the steps whose code differs from the entry before are entries, so the engine never
 //!   tests the same code twice. Besides the agent's tool steps, a prompt's snapshot holds the changes made
-//!   between two turns, and a session start's snapshot the changes made between sessions ([`Kind`]). A step
-//!   whose snapshot is no longer in the snapshot store is left out and named.
+//!   between two turns, and a session start's snapshot the changes made between sessions, or, by its source,
+//!   before the session resumed or before its context was compacted or cleared ([`Kind`]). A step whose
+//!   snapshot is no longer in the snapshot store is left out and named.
+
+use std::collections::HashSet;
 
 use gix::ObjectId;
 
@@ -42,9 +45,14 @@ pub enum Kind {
     Step,
     /// The snapshot taken when a prompt was sent: the changes made between two turns of the agent.
     Prompt,
-    /// The snapshot taken when a session started: the changes made since the snapshot before the session,
-    /// outside any recorded session.
+    /// The snapshot taken when a session started (Claude Code's `startup` source, or one Yalper does not know):
+    /// the changes made since the snapshot before the session, by no recorded step.
     SessionStart,
+    /// The snapshot taken when a session was resumed: the changes made while it was not running.
+    Resume,
+    /// The snapshot taken when a session's context was compacted or cleared (`compact`, `clear`): like a
+    /// prompt's, the changes made between two turns.
+    Compact,
 }
 
 /// The code of one entry: the snapshot of a step.
@@ -67,7 +75,7 @@ impl Entry {
         let step = step_name(self.step, session);
         match self.kind {
             Kind::Before => format!("the code before {step}"),
-            Kind::Step | Kind::Prompt | Kind::SessionStart => step,
+            _ => step,
         }
     }
 
@@ -75,6 +83,8 @@ impl Entry {
     pub fn changes(&self) -> Option<&'static str> {
         match self.kind {
             Kind::Prompt => Some("changes made before this prompt"),
+            Kind::Compact => Some("changes made before this point of the session"),
+            Kind::Resume => Some("changes made before the session resumed"),
             Kind::SessionStart => Some("changes made between sessions"),
             Kind::Before | Kind::Step => None,
         }
@@ -103,15 +113,16 @@ pub struct Entries {
 
 /// The entries of `scope` among `steps` (every recorded step of the project, in the order they were recorded),
 /// with the snapshots of `shadow`, between the steps at `good` and `bad` (positions in `steps`; see the module
-/// documentation). `name` names the step at a position in messages. Returns why there are none when the ends
-/// are in the wrong order or no snapshot gives the code of an end.
+/// documentation). `name` names the step at a position in messages, and `pick_good` says how to pick another
+/// good end. Returns why there are none when the ends are in the wrong order or no snapshot gives the code of an
+/// end.
 pub fn entries(
     steps: &[Event],
     shadow: &ShadowStore,
     scope: Scope<'_>,
-    good: Option<usize>,
-    bad: Option<usize>,
+    (good, bad): (Option<usize>, Option<usize>),
     name: &dyn Fn(usize) -> String,
+    pick_good: &str,
 ) -> Result<Entries, String> {
     let covered: Vec<usize> = match scope {
         Scope::Session(id) => (0..steps.len())
@@ -181,8 +192,8 @@ pub fn entries(
             };
             let Some(base) = first.base else {
                 return Err(format!(
-                    "the code before {} is not known (its snapshot does not say what it was built from). Pick \
-                     a good end with --good <step>.",
+                    "the code before {} is not known (its snapshot does not say what it was built from). \
+                     {pick_good}",
                     name(first.order)
                 ));
             };
@@ -197,7 +208,7 @@ pub fn entries(
     // The first step whose snapshot can come after the good end: its own when it is the code before it.
     let start = match good_end.kind {
         Kind::Before => good_end.order,
-        Kind::Step | Kind::Prompt | Kind::SessionStart => good_end.order + 1,
+        _ => good_end.order + 1,
     };
     let bad_at = bad.unwrap_or(last);
     let in_order = match good_at {
@@ -236,10 +247,29 @@ pub fn entries(
 /// What the snapshot of `event` holds (see [`Kind`]).
 fn kind(event: &Event) -> Kind {
     match HookEvent::from_name(&event.kind) {
-        HookEvent::SessionStart => Kind::SessionStart,
+        HookEvent::SessionStart => match event.payload.get("source").and_then(|s| s.as_str()) {
+            Some("resume") => Kind::Resume,
+            Some("compact" | "clear") => Kind::Compact,
+            _ => Kind::SessionStart,
+        },
         HookEvent::UserPromptSubmit => Kind::Prompt,
         _ => Kind::Step,
     }
+}
+
+/// Whether a session other than the one of the entry at `order` in `steps` was running when that entry's
+/// snapshot was taken: it has steps both before and after it. Its agent may then have made the entry's changes
+/// in a step without a snapshot of its own.
+pub fn another_session_running(steps: &[Event], order: usize) -> bool {
+    let session = &steps[order].session_id;
+    let after: HashSet<&str> = steps[order + 1..]
+        .iter()
+        .map(|event| event.session_id.as_str())
+        .filter(|id| id != session)
+        .collect();
+    steps[..order]
+        .iter()
+        .any(|event| after.contains(event.session_id.as_str()))
 }
 
 /// Where the steps of sessions other than `session` whose snapshot changed files, taken after entry `from` and
@@ -260,7 +290,7 @@ pub fn others_between(steps: &[Event], session: &str, from: &Entry, to: &Entry) 
 mod tests {
     use super::*;
     use crate::bisect::testing::Project;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     fn event(step: u32, kind: &str, tree: Option<ObjectId>, base: Option<ObjectId>) -> Event {
         in_session("s", step, kind, tree, base)
@@ -319,9 +349,9 @@ mod tests {
             events,
             &project.store,
             Scope::Session("s"),
-            at(good),
-            at(bad),
+            (at(good), at(bad)),
             &name,
+            "Pick a good end.",
         )
     }
 
@@ -400,6 +430,82 @@ mod tests {
         assert_eq!(
             found.entries[1].changes(),
             Some("changes made before this prompt")
+        );
+    }
+
+    #[test]
+    fn a_session_start_is_named_by_its_source() {
+        let project = Project::new();
+        let (mut events, [before, ..]) = session(&project);
+        let cases = [
+            (
+                Some("startup"),
+                Kind::SessionStart,
+                "changes made between sessions",
+            ),
+            (None, Kind::SessionStart, "changes made between sessions"),
+            (
+                Some("other"),
+                Kind::SessionStart,
+                "changes made between sessions",
+            ),
+            (
+                Some("resume"),
+                Kind::Resume,
+                "changes made before the session resumed",
+            ),
+            (
+                Some("compact"),
+                Kind::Compact,
+                "changes made before this point of the session",
+            ),
+            (
+                Some("clear"),
+                Kind::Compact,
+                "changes made before this point of the session",
+            ),
+        ];
+        for (source, kind, changes) in cases {
+            // A session start that is not the first step: the code before it is the good end.
+            events[0].kind = "UserPromptSubmit".to_owned();
+            events[1].kind = "SessionStart".to_owned();
+            events[1].tree_id = Some(project.tree(&[("f", "z")]).to_string());
+            events[1].payload = source.map_or(Value::Null, |source| json!({ "source": source }));
+            let found = of_session(&events, &project, None, None).unwrap();
+            let entry = found.entries.iter().find(|entry| entry.step == 2).unwrap();
+            assert_eq!(
+                (entry.kind, entry.changes()),
+                (kind, Some(changes)),
+                "{source:?}"
+            );
+            assert_eq!(entry.label(None), "step 2");
+            assert_eq!(found.entries[0].tree, before);
+        }
+    }
+
+    #[test]
+    fn another_session_is_running_when_it_has_steps_before_and_after() {
+        let project = Project::new();
+        let steps = sessions(&project);
+        // a starts (0), b starts (1) while a runs, ..., c starts (9) after a and b ended.
+        assert!(!another_session_running(&steps, 0));
+        assert!(another_session_running(&steps, 1));
+        assert!(another_session_running(&steps, 4));
+        assert!(!another_session_running(&steps, 9));
+        assert!(!another_session_running(&steps, 11));
+    }
+
+    #[test]
+    fn a_good_end_whose_code_is_not_known_says_how_to_pick_another() {
+        let project = Project::new();
+        let (mut events, _) = session(&project);
+        events[0].kind = "UserPromptSubmit".to_owned();
+        events[0].base_tree_id = None;
+        let error = of_session(&events, &project, None, None).unwrap_err();
+        assert_eq!(
+            error,
+            "the code before step 1 is not known (its snapshot does not say what it was built from). Pick a \
+             good end."
         );
     }
 
@@ -521,9 +627,9 @@ mod tests {
             steps,
             &project.store,
             Scope::All { since_ms },
-            good,
-            bad,
+            (good, bad),
             &name,
+            "Pick a good end.",
         )
     }
 
@@ -601,9 +707,9 @@ mod tests {
             &steps,
             &project.store,
             Scope::Session("a"),
-            None,
-            None,
+            (None, None),
             &name,
+            "Pick a good end.",
         )
         .unwrap();
         let labels: Vec<String> = found
