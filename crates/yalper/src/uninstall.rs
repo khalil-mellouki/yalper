@@ -3,8 +3,9 @@
 //! It removes Yalper's hook registration from Claude Code's personal settings file, deleting the file if
 //! nothing else is left in it, and the git exclude lines `yalper init` adds once the paths they exclude are
 //! gone. Recordings in `.yalper/` are kept, with the init token that ties them to the repository, so a later
-//! `yalper init` picks them up again. `--purge` also deletes `.yalper/` and the token. The shared
-//! `.claude/settings.json` is never touched, and running it again changes nothing.
+//! `yalper init` picks them up again, and so is the project's bisect data in the user's cache folder (see
+//! [`CacheDir`](crate::bisect::CacheDir)). `--purge` also deletes the bisect data, `.yalper/` and the token. The
+//! shared `.claude/settings.json` is never touched, and running it again changes nothing.
 
 use std::fs;
 use std::io::{self, Write};
@@ -12,20 +13,23 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::bisect::{self, CACHE_DIR_KEY, ProjectFolders};
 use crate::hook::YALPER_DIR;
 use crate::init::{
     self, BOM, CLAUDE_DIR, EXCLUDE_LINES, Repository, SETTINGS_FILE, is_registration, matches_all,
-    replace_file, say,
+    printable, replace_file, say,
 };
-use crate::repo::{self, GIT_ID_FILE, ID_FILE, Refusal};
+use crate::repo::{self, GIT_ID_FILE, ID_FILE, Refusal, Token};
 use crate::safe_fs::OwnedDir;
+use crate::store::Store;
 
 /// Removes Yalper from the git repository around `start` and reports each step to `out`. With `purge`,
-/// `.yalper/` and its recordings are deleted too.
+/// the project's bisect data, then `.yalper/` and its recordings, are deleted too.
 ///
 /// Nothing is changed when the settings file or the git exclude file cannot be edited safely, or when
-/// `purge` is set and `.yalper/` is not a folder `yalper init` created for this repository. Returns the
-/// message to show when uninstall fails.
+/// `purge` is set and `.yalper/` is not a folder `yalper init` created for this repository. A folder of bisect
+/// data that is not the project's, or that cannot be found, never stops the purge: it is kept and named in the
+/// report. Returns the message to show when uninstall fails.
 pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), String> {
     let repository = Repository::find(
         start,
@@ -55,7 +59,18 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
     // Without either, the project was never set up (or is already cleaned up): an empty `.yalper/` and the
     // exclude lines are then the user's own and are left alone.
     let was_set_up = removes_hooks || fs::symlink_metadata(&token_path).is_ok();
-    let recordings_kept = !purge && matches!(yalper, Yalper::Ours(_));
+    let recordings_kept = !purge && matches!(yalper, Yalper::Ours(..));
+    // Looked for while the init token that names the folder is still there.
+    let bisect_data = match &yalper {
+        Yalper::Ours(dir, token) => Some(bisect::find_project_folders(
+            root,
+            token,
+            recorded_cache_dir(dir, token).as_deref(),
+        )),
+        _ => None,
+    };
+    // Lines that say what is kept: printed even when nothing changed.
+    let mut kept_lines = Vec::new();
 
     // What was done, and whether anything changed: a line saying what was kept is not a change.
     let mut report = Vec::new();
@@ -96,15 +111,27 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
     match yalper {
         // `yalper init` uses an empty folder like a missing one.
         Yalper::Missing | Yalper::Empty => {}
-        Yalper::Ours(dir) if purge => {
+        Yalper::Ours(dir, _) if purge => {
+            if let Some(folders) = bisect_data {
+                purge_bisect_data(folders, &mut report)?;
+            }
             delete_yalper_dir(dir).map_err(failed_to_delete)?;
             report.push("  .yalper/: deleted".to_owned());
             changed = true;
         }
-        Yalper::Ours(_) => report.push(
-            "  .yalper/: kept, with your recordings (`yalper uninstall --purge` deletes them)"
-                .to_owned(),
-        ),
+        Yalper::Ours(..) => {
+            report.push(
+                "  .yalper/: kept, with your recordings (`yalper uninstall --purge` deletes them)"
+                    .to_owned(),
+            );
+            for folder in bisect_data.map(|folders| folders.ours).unwrap_or_default() {
+                kept_lines.push(printable(&format!(
+                    "  Bisect data: kept in {} (`yalper uninstall --purge` deletes it)",
+                    folder.path().display()
+                )));
+            }
+            report.extend(kept_lines.iter().cloned());
+        }
         // With `purge`, a foreign one was refused above.
         Yalper::Foreign(_) => report.push("  .yalper/: kept".to_owned()),
     }
@@ -165,6 +192,9 @@ pub fn uninstall(start: &Path, purge: bool, out: &mut dyn Write) -> Result<(), S
                 )
             },
         );
+        for line in kept_lines {
+            say(out, &line);
+        }
         return Ok(());
     }
     say(out, &format!("Removing Yalper from {}", root.display()));
@@ -181,8 +211,8 @@ enum Yalper {
     Missing,
     /// An empty folder (git never creates one, so a clone cannot plant it).
     Empty,
-    /// A folder `yalper init` created for this repository (its init token matches), held open.
-    Ours(OwnedDir),
+    /// A folder `yalper init` created for this repository, held open, and its init token.
+    Ours(OwnedDir, Token),
     /// Anything else, with the reason it is not Yalper's to delete.
     Foreign(String),
 }
@@ -206,10 +236,49 @@ fn inspect(root: &Path, path: &Path) -> Yalper {
     // Who may write to it does not matter here (`repo::open_yalper_dir` checks that for recording), only
     // where it comes from.
     match OwnedDir::open(path) {
-        Ok(dir) if repo::init_token(root, &dir).is_some() => Yalper::Ours(dir),
-        Ok(_) => Yalper::Foreign(Refusal::TokenMismatch.to_string()),
+        Ok(dir) => match repo::init_token(root, &dir) {
+            Some(token) => Yalper::Ours(dir, token),
+            None => Yalper::Foreign(Refusal::TokenMismatch.to_string()),
+        },
         Err(error) => Yalper::Foreign(error.to_string()),
     }
+}
+
+/// The [`CACHE_DIR_KEY`] value of the event log in the `.yalper/` folder `dir`, if it can be read: where the
+/// last bisect kept its data.
+fn recorded_cache_dir(dir: &OwnedDir, token: &Token) -> Option<String> {
+    let store = Store::open_for_reading(dir, token).ok()?;
+    store.meta(CACHE_DIR_KEY).ok().flatten()
+}
+
+/// Deletes the project's folders of bisect data in `folders` and adds what was done, and what was kept, to
+/// `report`. A folder that cannot be deleted stops the purge before `.yalper/` is deleted, so that running it
+/// again (the init token is still there) finds the folder again.
+fn purge_bisect_data(folders: ProjectFolders, report: &mut Vec<String>) -> Result<(), String> {
+    for folder in folders.ours {
+        let path = folder.path().to_owned();
+        folder.delete().map_err(|error| {
+            format!(
+                "cannot delete the bisect data in {}: {error}. Stop any bisect running in this project and \
+                 run `yalper uninstall --purge` again.",
+                path.display()
+            )
+        })?;
+        report.push(printable(&format!(
+            "  Bisect data: deleted {}",
+            path.display()
+        )));
+    }
+    for (path, why) in folders.others {
+        report.push(printable(&format!(
+            "  Bisect data: kept {} ({why}; delete it by hand if it holds this project's bisect data)",
+            path.display()
+        )));
+    }
+    if let Some(why) = folders.unknown {
+        report.push(printable(&format!("  Bisect data: not looked for ({why})")));
+    }
+    Ok(())
 }
 
 /// Deletes the `.yalper/` folder `dir` without following any link inside it. The folder is held open and

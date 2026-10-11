@@ -25,7 +25,8 @@ enum Command {
     },
     /// Stop recording in the current git project: remove Yalper's Claude Code hooks. Recordings are kept.
     Uninstall {
-        /// Also delete the .yalper folder with every recording.
+        /// Also delete the .yalper folder with every recording, and the project's bisect data in your cache
+        /// folder.
         #[arg(long)]
         purge: bool,
     },
