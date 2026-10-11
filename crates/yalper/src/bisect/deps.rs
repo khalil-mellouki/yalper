@@ -40,8 +40,9 @@
 //! Known limits:
 //!
 //! - Installs run in the copy, outside the project, so configuration the project ignores (an ignored `.npmrc`
-//!   with a private registry, an ignored `.cargo/config.toml`) does not apply to them; when an install fails
-//!   with what looks like a registry or login error, [`InstallFailure`] suggests bringing the file in.
+//!   with a private registry, an ignored `.cargo/config.toml`) does not apply to them unless the user brings it
+//!   in with `--with` (see [`LocalFiles`]); when an install fails with what looks like a registry or login
+//!   error, [`InstallFailure`] suggests it.
 //! - Packages that take their version from git cannot find a repository in a copy (it is outside the project,
 //!   and runs and installs never search above it). An install that builds a Python project versioned by
 //!   setuptools-scm or hatch-vcs (`uv sync`, `poetry install`) fails with "LookupError: setuptools-scm was
@@ -76,7 +77,7 @@ use super::env::same_name;
 use super::link::{CANNOT_LINK, is_real_dir_no_follow};
 use super::run::{Logs, Outcome, SKIP_EXIT_CODE, run};
 use super::{
-    CacheDir, NodeModules, PythonEnvs, TestCopy, clean_root, env_additions, run_env,
+    CacheDir, LocalFiles, NodeModules, PythonEnvs, TestCopy, clean_root, env_additions, run_env,
     write_boundaries,
 };
 use crate::redact::redact_str;
@@ -902,6 +903,8 @@ pub struct DependencySets {
     installs: usize,
     /// Copies deleted and filled anew for a set in this bisect (see [`copies_filled`](Self::copies_filled)).
     filled: usize,
+    /// The env files and `--with` files put in every copy before its runs and installs.
+    local_files: Option<LocalFiles>,
 }
 
 impl DependencySets {
@@ -927,7 +930,40 @@ impl DependencySets {
             failed: HashMap::new(),
             installs: 0,
             filled: 0,
+            local_files: None,
         })
+    }
+
+    /// Puts `files` (the env files and `--with` files of the bisect) into every copy, before each run and
+    /// install. They are deleted from every copy when these sets are dropped, or by
+    /// [`remove_local_files`](Self::remove_local_files).
+    pub fn with_local_files(mut self, files: LocalFiles) -> Self {
+        self.local_files = Some(files);
+        self
+    }
+
+    /// See [`with_local_files`](Self::with_local_files).
+    pub fn local_files(&self) -> Option<&LocalFiles> {
+        self.local_files.as_ref()
+    }
+
+    /// Deletes the env files and `--with` files from every copy. Returns a message for each one that could not
+    /// be deleted.
+    pub fn remove_local_files(&mut self) -> Vec<String> {
+        self.local_files
+            .as_mut()
+            .map(LocalFiles::remove)
+            .unwrap_or_default()
+    }
+
+    /// Puts the env files and `--with` files into copy `number`, which holds a step.
+    fn sync_local_files(&mut self, number: usize) -> io::Result<()> {
+        if let (Some(files), Some(set_copy)) =
+            (self.local_files.as_mut(), self.copies.get_mut(&number))
+        {
+            files.sync(&mut set_copy.copy)?;
+        }
+        Ok(())
     }
 
     /// How many times a copy was deleted and filled anew for a dependency set (installed) in this bisect. When
@@ -951,6 +987,7 @@ impl DependencySets {
     ) -> Result<Prepared<'_>> {
         let deps = self.deps_of(store, tree)?;
         if !self.no_links && self.project_matches(&deps)? && self.use_project_copy(store, tree)? {
+            self.sync_local_files(0)?;
             return Ok(Prepared::Ready(&self.copies[&0]));
         }
         let set = set_key(&deps.key, self.setup.as_deref())?;
@@ -968,6 +1005,7 @@ impl DependencySets {
         let number = recorded.number;
         self.book.save(events, self.cache.instance())?;
         self.open_own(number, &deps)?.copy.switch(store, tree)?;
+        self.sync_local_files(number)?;
         Ok(Prepared::Ready(&self.copies[&number]))
     }
 
@@ -1157,6 +1195,7 @@ impl DependencySets {
         self.book.save(events, self.cache.instance())?;
 
         self.open_own(number, deps)?.copy.switch(store, tree)?;
+        self.sync_local_files(number)?;
         let state = match self.run_installs(number, deps, &commands, logs, stop)? {
             Installed::Done => {
                 // Undoes what the install changed in the step's files, as before every run.
@@ -1165,6 +1204,7 @@ impl DependencySets {
                     .expect("opened above")
                     .copy
                     .switch(store, tree)?;
+                self.sync_local_files(number)?;
                 State::Done
             }
             Installed::Failed(failure) => {

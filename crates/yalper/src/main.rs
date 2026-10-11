@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -84,6 +85,23 @@ struct BisectArgs {
     #[arg(long, value_name = "N", default_value_t = 0,
           value_parser = clap::value_parser!(u32).range(0..=i64::from(yalper::bisect::MAX_RETRIES)))]
     retries: u32,
+    /// Copy the project's env files (.env and .env.* files its ignore rules ignore) into the test copies. They
+    /// are the current files, not those from the time of each step, and are deleted when the bisect ends.
+    /// Remembered for the project until --no-env.
+    #[arg(long, conflicts_with = "no_env")]
+    with_env: bool,
+    /// Stop copying the env files into the test copies.
+    #[arg(long)]
+    no_env: bool,
+    /// Copy an ignored file or folder of the project, or a file over 10 MiB (which snapshots skip), into the
+    /// test copies; repeat it for several. Runs and installs happen outside the project, so this is also how
+    /// ignored local configuration reaches them: an ignored .cargo/config.toml, .npmrc or mise.local.toml.
+    /// Deleted when the bisect ends. Remembered for the project until --no-with.
+    #[arg(long = "with", value_name = "PATH")]
+    with: Vec<PathBuf>,
+    /// Forget the paths remembered with --with (paths given with --with in the same command are still used).
+    #[arg(long)]
+    no_with: bool,
 }
 
 fn main() -> ExitCode {
@@ -179,6 +197,15 @@ fn bisect(args: BisectArgs) -> ExitCode {
             good: args.good,
             bad: args.bad,
             setup: args.setup,
+            files: yalper::bisect::Choice {
+                env: match (args.with_env, args.no_env) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
+                with: args.with,
+                no_with: args.no_with,
+            },
             settings: yalper::bisect::Settings {
                 timeout: args.timeout,
                 retries: args.retries,

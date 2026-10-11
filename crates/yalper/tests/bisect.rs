@@ -652,6 +652,222 @@ fn a_second_bisect_and_a_purge_are_refused_while_one_runs() {
     assert!(!project.root.join(".yalper").exists());
 }
 
+/// The test of the env file tests: it fails without `ready` in `.env`, and when `.env` holds `dirty`, which it
+/// then appends to it, so a run that finds the `.env` an earlier run changed fails; then it passes while
+/// `status.txt` says `good`.
+const ENV_TEST: &str = if cfg!(windows) {
+    r".\envcheck.cmd"
+} else {
+    "sh envcheck.sh"
+};
+
+fn env_script() -> (&'static str, String) {
+    if cfg!(windows) {
+        let lines = [
+            "@echo off",
+            "findstr /c:ready .env >nul || exit /b 1",
+            "findstr /c:dirty .env >nul && exit /b 1",
+            "echo dirty>>.env",
+            "findstr /c:good status.txt >nul",
+            "exit /b %errorlevel%",
+        ];
+        ("envcheck.cmd", lines.join("\r\n") + "\r\n")
+    } else {
+        let lines = [
+            "grep -q ready .env || exit 1",
+            "if grep -q dirty .env; then exit 1; fi",
+            "echo dirty >> .env",
+            "grep -q good status.txt",
+        ];
+        ("envcheck.sh", lines.join("\n") + "\n")
+    }
+}
+
+impl Project {
+    /// Checks that no file of the cache folder is named one of `names` or holds `secret`.
+    fn assert_nothing_copied_left(&self, names: &[&str], secret: &str) {
+        for (path, bytes) in files(self.cache.path()) {
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(
+                !names.contains(&name.as_ref()),
+                "{} is left",
+                path.display()
+            );
+            assert!(
+                !contains(&bytes, secret),
+                "{} holds the secret",
+                path.display()
+            );
+        }
+    }
+}
+
+fn contains(bytes: &[u8], text: &str) -> bool {
+    bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
+#[test]
+fn env_files_are_copied_only_when_asked_remembered_and_never_recorded() {
+    let project = Project::new("good");
+    let (name, content) = env_script();
+    fs::write(project.root.join(name), content).unwrap();
+    fs::write(project.root.join(".gitignore"), ".env\n").unwrap();
+    // No secret keyword in its key and a low-entropy value, so redaction would leave it as it is: redaction
+    // cannot be what keeps it out of the recordings.
+    let secret = "plainnote".repeat(4);
+    fs::write(
+        project.root.join(".env"),
+        format!("READY=ready\nREADY_NOTE={secret}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        yalper::redact::redact_str(&format!("READY_NOTE={secret}")),
+        None
+    );
+    record(&project, SESSION, &notes_steps(8));
+
+    // Without --with-env the test copies have no `.env`.
+    let (code, out, _) = project.bisect(&["--test", ENV_TEST], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The good end, step 1, already fails"), "{out}");
+    assert!(!out.contains("Note: the tests used"), "{out}");
+
+    let (code, out, _) = project.bisect(&["--test", ENV_TEST, "--with-env"], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains(
+            "Copied into the test copies until the bisect ends: env files (1 found). Remembered for this \
+             project; --no-env turns it off.\n"
+        ),
+        "{out}"
+    );
+    // Every run after the first found the `.env` of the project again, not the one the run before changed.
+    assert!(runs(&out) >= 4, "{out}");
+    assert!(out.contains("Step 8 broke the tests"), "{out}");
+    assert!(
+        out.contains(
+            "Note: the tests used your current env files, not the ones from the time of each step."
+        ),
+        "{out}"
+    );
+    project.assert_nothing_copied_left(&[".env"], &secret);
+
+    // Remembered for the next bisect, until --no-env.
+    let (code, out, _) = project.bisect(&["--test", ENV_TEST], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("Step 8 broke the tests"), "{out}");
+    let (code, out, _) = project.bisect(&["--test", ENV_TEST, "--no-env"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The good end, step 1, already fails"), "{out}");
+    let (code, _, _) = project.bisect(&["--test", ENV_TEST], &[]);
+    assert_eq!(code, Some(1));
+    project.assert_nothing_copied_left(&[".env"], &secret);
+
+    // The secret is nowhere in the recordings: not in the database or its WAL, nor in any object of the snapshot
+    // store, read uncompressed through git.
+    let yalper = project.root.join(".yalper");
+    let mut recorded: Vec<u8> = files(&yalper).into_values().flatten().collect();
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(yalper.join("snapshots.git"))
+        .args(["cat-file", "--batch-all-objects", "--batch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    recorded.extend(output.stdout);
+    assert!(
+        contains(&recorded, "notes.txt"),
+        "the search sees the recordings"
+    );
+    assert!(!contains(&recorded, &secret), "the secret reached .yalper/");
+}
+
+#[test]
+fn with_paths_are_copied_remembered_refused_and_forgotten() {
+    let project = Project::new("good");
+    fs::write(project.root.join(".gitignore"), "local/\n").unwrap();
+    fs::create_dir(project.root.join("local")).unwrap();
+    fs::write(project.root.join("local").join("settings.txt"), "ready\n").unwrap();
+    record(&project, SESSION, &notes_steps(8));
+    let test = if cfg!(windows) {
+        r"findstr /c:ready local\settings.txt >nul && findstr /c:good status.txt"
+    } else {
+        "grep -q ready local/settings.txt && grep good status.txt"
+    };
+
+    let (code, out, _) = project.bisect(&["--test", test], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The good end, step 1, already fails"), "{out}");
+
+    let (code, out, _) = project.bisect(&["--test", test, "--with", "local"], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains(
+            "Copied into the test copies until the bisect ends: local. Remembered for this project; \
+             --no-with turns it off.\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("Step 8 broke the tests"), "{out}");
+    assert!(
+        out.contains(
+            "Note: the tests used the current files given with --with, not the ones from the time of each step."
+        ),
+        "{out}"
+    );
+    project.assert_nothing_copied_left(&["settings.txt"], "ready");
+
+    let (code, out, _) = project.bisect(&["--test", test], &[]);
+    assert_eq!(code, Some(0), "{out}");
+
+    for (path, why) in [
+        (
+            "README.md",
+            "error: --with README.md: the project's ignore rules do not ignore it, so the snapshots already \
+             hold it.",
+        ),
+        (
+            "../elsewhere.txt",
+            "error: --with ../elsewhere.txt: it is outside the project.",
+        ),
+    ] {
+        let (code, out, err) = project.bisect(&["--test", test, "--with", path], &[]);
+        assert_eq!(code, Some(1), "{out}{err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.starts_with(why), "{err}");
+    }
+
+    let (code, out, _) = project.bisect(&["--test", test, "--no-with"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The good end, step 1, already fails"), "{out}");
+    project.assert_nothing_copied_left(&["settings.txt"], "ready");
+}
+
+#[test]
+fn an_ignored_cargo_config_given_with_with_is_used_by_cargo() {
+    let project = Project::new("good");
+    fs::write(project.root.join(".gitignore"), ".cargo/\n").unwrap();
+    fs::create_dir(project.root.join(".cargo")).unwrap();
+    fs::write(
+        project.root.join(".cargo").join("config.toml"),
+        "[alias]\nyalper-probe = \"version\"\n",
+    )
+    .unwrap();
+    record(&project, SESSION, &notes_steps(8));
+    // The cargo that builds these tests; the alias exists only where cargo finds the config.
+    let test = format!("\"{}\" yalper-probe && {TEST}", env!("CARGO"));
+
+    let (code, out, _) = project.bisect(&["--test", &test], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The good end, step 1, already fails"), "{out}");
+    let (code, out, _) = project.bisect(&["--test", &test, "--with", ".cargo/config.toml"], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("Step 8 broke the tests"), "{out}");
+    project.assert_nothing_copied_left(&["config.toml"], "yalper-probe");
+}
+
 /// A fake GitHub token, built at run time so that no token-shaped literal is in the repository.
 fn fake_token() -> String {
     let body: String = "q7W2e9R4t1Y6u3I8o5P0".chars().cycle().take(36).collect();
