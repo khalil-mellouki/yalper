@@ -47,8 +47,15 @@ const LOCK_FILE: &str = "lock";
 /// A marker larger than this was not written by Yalper (it holds a digest, an id and a path).
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 
-/// How many times an empty marker is read, 10 ms apart, before it counts as never written.
+/// How many times an empty marker is read, 10 ms apart, while another open may be writing it.
 const MARKER_READS: usize = 20;
+
+/// An empty marker older than this was left by an interrupted creation; a newer one is being written by
+/// another bisect that is starting.
+const STALE_EMPTY_MARKER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many times a first open tries to create the marker while other opens create or remove it.
+const MARKER_ATTEMPTS: usize = 3;
 
 /// The most characters of the project folder's name in the name of its cache folder: paths stay short for
 /// tools that do not handle long Windows paths.
@@ -344,30 +351,60 @@ fn check_place(folder: &Path, name: &str, project: &Path) -> io::Result<PathBuf>
     Ok(resolved)
 }
 
-/// Unix: refuses Yalper's cache folder `folder` when the folder holding it exists and other users can create,
-/// rename or delete entries in it (group or world writable, without the sticky bit, as OpenSSH's StrictModes
-/// checks): they could put their own folder in place of Yalper's between two bisects. A missing one is created
-/// with mode 0700.
+/// Unix: refuses Yalper's cache folder `folder` when another user could replace it, or a folder above it,
+/// between two bisects, as OpenSSH's `safe_path` checks: every folder from the first existing one above `folder`
+/// (resolved) up to `/` must pass [`unsafe_folder`]. Missing folders are created with mode 0700.
 #[cfg(unix)]
 fn check_parent(folder: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::MetadataExt;
     let Some(parent) = folder.parent() else {
         return Ok(());
     };
-    let mode = match fs::metadata(parent) {
-        Ok(metadata) => metadata.permissions().mode(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+    let Some(existing) = parent
+        .ancestors()
+        .find_map(|dir| fs::canonicalize(dir).ok())
+    else {
+        return Ok(());
     };
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
-        return Err(refusal(format!(
-            "cannot keep the bisect data in {}: other users can change the folder that holds it (it is group \
-             or world writable, without the sticky bit). Set {CACHE_DIR_VAR} to the absolute path of a folder \
-             that only you can change",
-            folder.display()
-        )));
+    let me = rustix::process::geteuid().as_raw();
+    let my_group = rustix::process::getegid().as_raw();
+    for dir in existing.ancestors() {
+        let metadata = fs::metadata(dir)?;
+        let why = unsafe_folder(
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            me,
+            my_group,
+        );
+        if let Some(why) = why {
+            return Err(refusal(format!(
+                "cannot keep the bisect data in {}: {} is {why}, so another user could replace the bisect \
+                 data. Set {CACHE_DIR_VAR} to the absolute path of a folder that only you can change",
+                folder.display(),
+                dir.display()
+            )));
+        }
     }
     Ok(())
+}
+
+/// Why a folder with permission bits `mode`, owner `uid` and group `gid` lets another user than `me` (whose
+/// own group is `my_group`) replace what it holds, if it does: it is owned by someone other than `me` or root,
+/// or, without the sticky bit (which lets only owners rename or delete entries), writable by every user or by a
+/// group other than `my_group` (a user-private group, as `~/.cache` gets with umask 002, is fine).
+#[cfg(unix)]
+fn unsafe_folder(mode: u32, uid: u32, gid: u32, me: u32, my_group: u32) -> Option<&'static str> {
+    let sticky = mode & 0o1000 != 0;
+    if uid != me && uid != 0 {
+        Some("owned by another user")
+    } else if mode & 0o002 != 0 && !sticky {
+        Some("writable by every user")
+    } else if mode & 0o020 != 0 && gid != my_group && !sticky {
+        Some("writable by a group other than your own")
+    } else {
+        None
+    }
 }
 
 /// The warning for Yalper's cache folder `folder` (resolved) on Windows, where Yalper does not check access
@@ -461,13 +498,20 @@ fn slug(name: &str) -> String {
 }
 
 /// Checks the marker of the project's cache folder `dir`, or writes it if the folder is empty (its creation was
-/// interrupted: nothing in it, or only an empty marker), and returns the instance id it holds. The marker is
-/// created exclusively: when two first opens of the folder race, the one that loses reads the winner's marker.
+/// interrupted: nothing in it, or only an empty marker older than [`STALE_EMPTY_MARKER`]), and returns the
+/// instance id it holds. The marker is created exclusively: when two first opens of the folder race, the one
+/// that loses reads the winner's marker.
 fn bind(dir: &OwnedDir, digest: &str, project: &Path) -> io::Result<String> {
     let marker = dir.path().join(MARKER_FILE);
     let not_ours = || {
         io::Error::other(format!(
             "{} was not created by Yalper for this project; delete it by hand",
+            dir.path().display()
+        ))
+    };
+    let busy = || {
+        io::Error::other(format!(
+            "another bisect is starting in this project (its folder {} is being created); try again",
             dir.path().display()
         ))
     };
@@ -479,15 +523,22 @@ fn bind(dir: &OwnedDir, digest: &str, project: &Path) -> io::Result<String> {
         }
         Ok(true)
     };
-    for _ in 0..2 {
+    for _ in 0..MARKER_ATTEMPTS {
         match read_marker(&marker)? {
             Marker::Valid { digest: found, .. } if found != digest => return Err(not_ours()),
             Marker::Valid { instance, .. } => return Ok(instance),
             Marker::Other => return Err(not_ours()),
-            Marker::Empty if only_marker()? => {
-                remove_entry(&marker, &fs::symlink_metadata(&marker)?)?
+            Marker::Empty { .. } if !only_marker()? => return Err(not_ours()),
+            Marker::Empty { stale: false } => return Err(busy()),
+            Marker::Empty { stale: true } => {
+                // Another open may have removed it first: then it is created again below, or read.
+                match fs::symlink_metadata(&marker)
+                    .and_then(|metadata| remove_entry(&marker, &metadata))
+                {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
             }
-            Marker::Empty => return Err(not_ours()),
             Marker::Missing if !only_marker()? => return Err(not_ours()),
             Marker::Missing => {}
         }
@@ -510,14 +561,17 @@ fn bind(dir: &OwnedDir, digest: &str, project: &Path) -> io::Result<String> {
         file.write_all(text.as_bytes())?;
         return Ok(instance);
     }
-    Err(not_ours())
+    Err(busy())
 }
 
 /// What is at the marker's place.
 enum Marker {
     Missing,
-    /// An empty regular file: a marker created but not written yet, or never (an interrupted creation).
-    Empty,
+    /// An empty regular file: a marker another open has just created and not written yet, or one whose creation
+    /// was interrupted (`stale`: older than [`STALE_EMPTY_MARKER`]).
+    Empty {
+        stale: bool,
+    },
     Valid {
         digest: String,
         instance: String,
@@ -529,9 +583,10 @@ enum Marker {
 /// Reads the marker at `path`. An empty one is read again for a moment, since another first open of the folder
 /// may be writing it.
 fn read_marker(path: &Path) -> io::Result<Marker> {
+    let mut modified = None;
     for _ in 0..MARKER_READS {
         match fs::symlink_metadata(path) {
-            Ok(_) => {}
+            Ok(metadata) => modified = metadata.modified().ok(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Marker::Missing),
             Err(error) => return Err(error),
         }
@@ -549,7 +604,11 @@ fn read_marker(path: &Path) -> io::Result<Marker> {
             }
         }
     }
-    Ok(Marker::Empty)
+    // An mtime in the future, or none, does not keep the folder from being adopted forever.
+    let fresh = modified
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < STALE_EMPTY_MARKER);
+    Ok(Marker::Empty { stale: !fresh })
 }
 
 /// The digest and the instance id of a marker: the first lines starting with `digest ` and `instance `.
@@ -795,7 +854,18 @@ mod tests {
         let marker = path.join(MARKER_FILE);
         fs::remove_file(&marker).unwrap();
         let instance = open().unwrap().instance().to_owned();
+        // An empty marker just created: another bisect is starting.
         fs::write(&marker, "").unwrap();
+        let error = open().unwrap_err();
+        assert!(error.to_string().contains("another bisect"), "{error}");
+        // Left empty for longer: an interrupted creation.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         let adopted = open().unwrap();
         assert_ne!(adopted.instance(), instance);
         assert_eq!(open().unwrap().instance(), adopted.instance());
@@ -858,12 +928,77 @@ mod tests {
         let project = Project::new();
         let (base, folder) = base();
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        let error = CacheDir::open_in(&folder, project.path(), &token('a')).unwrap_err();
-        assert!(error.to_string().contains("other users"), "{error}");
-        assert!(error.to_string().contains(CACHE_DIR_VAR), "{error}");
+        // Right above Yalper's folder, or above folders still to be created.
+        let deeper = base.path().join("a").join("b").join("yalper");
+        for folder in [&folder, &deeper] {
+            let error = CacheDir::open_in(folder, project.path(), &token('a')).unwrap_err();
+            assert!(error.to_string().contains("every user"), "{error}");
+            assert!(error.to_string().contains(CACHE_DIR_VAR), "{error}");
+        }
+        assert!(!base.path().join("a").exists());
         // With the sticky bit, as `/tmp`: others cannot rename or delete what they do not own.
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o1777)).unwrap();
         CacheDir::open_in(&folder, project.path(), &token('a')).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_writable_by_the_users_own_group_above_the_cache_folder_is_accepted() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let project = Project::new();
+        let (base, folder) = base();
+        // `~/.cache` with umask 002 and a user-private group (Ubuntu, Fedora).
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let own_group =
+            fs::metadata(base.path()).unwrap().gid() == rustix::process::getegid().as_raw();
+        let opened = CacheDir::open_in(&folder, project.path(), &token('a'));
+        if own_group {
+            opened.unwrap();
+        } else {
+            // The folder took the group of the folder above it (BSD rule, macOS): another group.
+            assert!(
+                opened
+                    .unwrap_err()
+                    .to_string()
+                    .contains("group other than your own")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folders_that_let_another_user_replace_what_they_hold_are_unsafe() {
+        let (me, group, other) = (1000, 1000, 1001);
+        assert_eq!(unsafe_folder(0o40700, me, group, me, group), None);
+        assert_eq!(unsafe_folder(0o40755, 0, 0, me, group), None);
+        assert_eq!(unsafe_folder(0o41777, 0, 0, me, group), None);
+        assert_eq!(unsafe_folder(0o40775, me, group, me, group), None);
+        assert_eq!(unsafe_folder(0o41775, me, other, me, group), None);
+        assert!(
+            unsafe_folder(0o40700, other, group, me, group)
+                .unwrap()
+                .contains("another user")
+        );
+        assert!(
+            unsafe_folder(0o41777, other, other, me, group)
+                .unwrap()
+                .contains("another user")
+        );
+        assert!(
+            unsafe_folder(0o40777, me, group, me, group)
+                .unwrap()
+                .contains("every user")
+        );
+        assert!(
+            unsafe_folder(0o40775, me, other, me, group)
+                .unwrap()
+                .contains("group")
+        );
+        assert!(
+            unsafe_folder(0o40775, 0, other, me, group)
+                .unwrap()
+                .contains("group")
+        );
     }
 
     #[test]

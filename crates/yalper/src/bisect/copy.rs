@@ -52,7 +52,7 @@ use crate::repo;
 use crate::safe_fs::{self, OwnedDir};
 use crate::snapshot::{
     CASE_INSENSITIVE, Error, Excludes, FileChange, FileKind, MAX_FILE_BYTES, Result, ShadowStore,
-    TreeFile, file_system_clock, is_racy, nanos_since_epoch, over_budget_reason, validate_path,
+    TreeFile, is_racy, nanos_since_epoch, over_budget_reason, validate_path,
 };
 
 /// The file in the project's cache folder whose mtime gives the time a switch ended, on the file system's
@@ -319,12 +319,9 @@ impl TestCopy {
         }
         switched.deleted = sweep(root, &placed, &self.extra, self.info_exclude.as_deref())?;
 
-        // Removed first, so that the clock is always a file Yalper creates: on Windows, a hard link a test put
-        // at its name (which `open_file` cannot tell there) would have Yalper write into a project file. The
-        // local clock if the file system's cannot be read.
-        clear(&self.cache.path().join(CLOCK_FILE))?;
-        self.clean_at = file_system_clock(self.cache.dir(), CLOCK_FILE)
-            .unwrap_or_else(|_| nanos_since_epoch(SystemTime::now()));
+        // The local clock if the file system's cannot be read.
+        self.clean_at =
+            switch_clock(self.cache.dir()).unwrap_or_else(|_| nanos_since_epoch(SystemTime::now()));
         self.placed = placed;
         self.tree = Some(to);
         Ok(switched)
@@ -962,6 +959,28 @@ fn write_link(path: &Path, target: &[u8]) -> io::Result<()> {
     write_file(path, FileKind::Regular, target)
 }
 
+/// The time on the clock of the file system that holds the project's cache folder `cache`, in nanoseconds
+/// since the Unix epoch: the mtime of [`CLOCK_FILE`] right after it is written. Whatever is at its name is
+/// removed first and the file is created exclusively, never opened in place: on Windows a hard link a test put
+/// there cannot be told from a plain file, and writing through it would change the file it links to.
+fn switch_clock(cache: &OwnedDir) -> io::Result<i64> {
+    cache.check_still_at_path()?;
+    let path = cache.path().join(CLOCK_FILE);
+    clear(&path)?;
+    let mut options = fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        safe_fs::windows::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let mut file = options.open(&path)?;
+    file.write_all(b"x")?;
+    Ok(nanos_since_epoch(file.metadata()?.modified()?))
+}
+
 /// Removes whatever is at `path`, if anything.
 fn clear(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
@@ -989,7 +1008,9 @@ pub(super) fn remove_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<(
     }
     // On Windows the standard library removes a read-only file without clearing its attribute (since Rust
     // 1.86). The attribute is never cleared here: it belongs to the file, not to this name, so with a second
-    // hard link outside the copy (a project file) clearing it would change that file too.
+    // hard link outside the copy (a project file) clearing it would change that file too. Known limit: on file
+    // systems without POSIX delete semantics (FAT32, exFAT), a file a test made read-only cannot be removed,
+    // and the switch fails.
     fs::remove_file(path)
 }
 

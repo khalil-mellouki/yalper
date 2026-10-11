@@ -360,7 +360,7 @@ fn hard_link_count(_metadata: &std::fs::Metadata) -> u64 {
 
 /// Win32 constants, defined here instead of adding a crate for four numbers.
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     pub const FILE_SHARE_READ: u32 = 0x0000_0001;
     pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     /// Needed to open a directory.
