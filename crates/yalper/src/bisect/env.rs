@@ -156,19 +156,19 @@ fn make_real_dir(path: &Path) -> io::Result<()> {
 /// The complete environment of a test run in `copy` of the project at `project`, for [`run`](super::run):
 /// the user's environment `user` (usually `std::env::vars_os()`) with
 ///
-/// - the git variables of [`GIT_REPOSITORY_VARS`] removed, and `GIT_CEILING_DIRECTORIES` set to the project's
+/// - the git variables of `GIT_REPOSITORY_VARS` removed, and `GIT_CEILING_DIRECTORIES` set to the project's
 ///   cache folder and Yalper's cache folder above it, and to the project, each as computed and as resolved: git
 ///   always looks for a repository in the folder it starts in but never moves up into a listed one, so neither
 ///   a run in the copy nor one at the top of the project's cache folder finds a repository above (a home folder
 ///   kept in git), and neither does one that enters the project through a link of the copy;
-/// - the entries of the path lists of [`PATH_LISTS`] and `PYTHONPATH`, and the value of any other variable that
+/// - the entries of the path lists of `PATH_LISTS` and `PYTHONPATH`, and the value of any other variable that
 ///   is as a whole one path, pointing to the same place in the copy when they point into the project (see
-///   [`Redirect`]); on Windows, the hidden variables holding the current folder of each drive (`=C:`) are left
+///   `Redirect`); on Windows, the hidden variables holding the current folder of each drive (`=C:`) are left
 ///   out when they point into the project;
 /// - `PYTHONPATH` starting with the folders of `additions`, and the variables of `additions` in place of the
 ///   user's.
 ///
-/// Fails if `PYTHONPATH` would be longer than [`MAX_PYTHONPATH`]; if the path of the project or of the cache
+/// Fails if `PYTHONPATH` would be longer than `MAX_PYTHONPATH`; if the path of the project or of the cache
 /// folder holds the separator of path lists (`;` on Windows, `:` elsewhere), since git would then read a wrong
 /// `GIT_CEILING_DIRECTORIES` and a variable holding such a path could not be redirected; and if the project is
 /// the user's home folder or holds it, since tools keep their settings and caches there.

@@ -128,7 +128,7 @@ pub enum Outcome {
     TimedOut,
     /// The stop flag was set (Ctrl-C); the processes were killed.
     Stopped,
-    /// The run wrote more than [`MAX_LOG_BYTES`] of output; the processes were killed. It tells nothing about
+    /// The run wrote more than `MAX_LOG_BYTES` of output; the processes were killed. It tells nothing about
     /// the code: count it as "cannot test".
     OutputTooLarge,
 }
@@ -186,7 +186,7 @@ pub struct Run {
 /// Runs `command` through the system shell in the folder `cwd`, with exactly the environment variables `env`,
 /// its output in `log` (opened for reading and writing, as [`Logs::create`] does), and kills its whole
 /// process tree when it ends, when `limit` is reached, when `stop` is set, or when the log grows over
-/// [`MAX_LOG_BYTES`].
+/// `MAX_LOG_BYTES`.
 ///
 /// Fails only when the command cannot be started, waited for or killed; whatever was started is then killed.
 pub fn run(

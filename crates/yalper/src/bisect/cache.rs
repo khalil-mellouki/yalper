@@ -158,7 +158,7 @@ fn yalper_folder(system: System, vars: &Vars) -> io::Result<PathBuf> {
 /// the user and, on Unix, with mode 0700 and not writable by its group or others (Windows access lists are not
 /// inspected). So is Yalper's cache folder above it.
 ///
-/// `<slug>` is the project folder's name made safe (see [`slug`]); `<id>` the first 12 hex digits of the SHA-1
+/// `<slug>` is the project folder's name made safe (see `slug`); `<id>` the first 12 hex digits of the SHA-1
 /// of the project's init token and canonical path. The token gives a re-initialized project a new folder and
 /// the path gives a copy of the project (same token) its own; the token itself never appears in a path.
 ///
@@ -239,7 +239,7 @@ impl CacheDir {
     }
 
     /// A warning for the user, to be printed when a bisect starts: on Windows, when the folder is outside the
-    /// user's profile folder, where other local users may be able to read it (see [`access_warning`]).
+    /// user's profile folder, where other local users may be able to read it (see `access_warning`).
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
     }
@@ -521,7 +521,7 @@ impl ProjectFolder {
         Ok(())
     }
 
-    /// Deletes the folder and everything in it, never following a link (see [`delete_folder`]), after taking its
+    /// Deletes the folder and everything in it, never following a link (see `delete_folder`), after taking its
     /// bisect lock if [`lock`](Self::lock) did not.
     pub fn delete(mut self) -> io::Result<()> {
         self.lock()?;

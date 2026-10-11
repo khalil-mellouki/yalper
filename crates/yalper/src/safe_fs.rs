@@ -173,10 +173,24 @@ impl OwnedDir {
                 Err(error) => return Err(error.into()),
             };
         #[cfg(windows)]
-        let is_file = match std::fs::symlink_metadata(self.path.join(name)) {
-            Ok(metadata) => metadata.is_file(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+        let is_file = {
+            // Windows reports a file that is being deleted at this moment (SQLite deletes its rollback journal
+            // while another process checks it) as access denied, until the delete completes a few microseconds
+            // later. Asking again then gives missing, or the file created after it.
+            let mut retries = 0;
+            loop {
+                match std::fs::symlink_metadata(self.path.join(name)) {
+                    Ok(metadata) => break metadata.is_file(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::PermissionDenied && retries < 10 =>
+                    {
+                        retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         };
         if is_file {
             Ok(())
@@ -613,6 +627,37 @@ mod tests {
         let owned = OwnedDir::open(dir.path()).unwrap();
         owned.check_regular_or_missing("file").unwrap();
         owned.check_regular_or_missing("missing").unwrap();
+    }
+
+    /// The race behind a failure of `store::tests::many_processes_can_create_the_database_at_once` on Windows:
+    /// SQLite creates and deletes its rollback journal while other processes check it.
+    #[test]
+    fn a_file_being_created_and_deleted_passes_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        let owned = OwnedDir::open(dir.path()).unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let checkers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                            owned.check_regular_or_missing("journal")?;
+                        }
+                        io::Result::Ok(())
+                    })
+                })
+                .collect();
+            // Errors are ignored: on Windows these can fail in the same way while a checker looks at the file.
+            for _ in 0..300 {
+                let _ = fs::write(&journal, "x");
+                let _ = fs::remove_file(&journal);
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            for checker in checkers {
+                checker.join().unwrap().unwrap();
+            }
+        });
     }
 
     #[test]

@@ -277,7 +277,7 @@ impl ShadowStore {
     /// produce: a real directory (on Unix owned by the current user), Yalper's own `config` with `token` in it,
     /// a small `HEAD`, no refs, packs, alternates or `commondir`, and no link in `objects/`. Links, alternates
     /// and `commondir` could send writes or reads to another repository, such as the user's own `.git`; refs
-    /// could replace objects. Every object read is also checked against its id, see [`Verified`]. Remaining
+    /// could replace objects. Every object read is also checked against its id, see `Verified`. Remaining
     /// gap, outside the threat model: another process of the same user could change the store after these
     /// checks.
     pub fn open(yalper_dir: &OwnedDir, token: &Token) -> Result<Self> {
@@ -638,7 +638,7 @@ impl ShadowStore {
         Ok(FileChanges { files, complete })
     }
 
-    /// The content of the blob `id`, read through [`Verified`], or `None` if the store does not have it.
+    /// The content of the blob `id`, read through `Verified`, or `None` if the store does not have it.
     pub fn read_blob(&self, id: ObjectId) -> Result<Option<Vec<u8>>> {
         let mut buffer = Vec::new();
         let Some(data) = self
@@ -764,7 +764,7 @@ impl Find for Verified<'_> {
 
 /// Checks that `path` can be stored in a tree as a file of `kind`: relative, `/`-separated, with no NUL byte,
 /// no empty, `.`, `..` or `.git` component and no name the platform's file system treats specially (see
-/// [`PATH_RULES`]).
+/// `PATH_RULES`).
 pub fn validate_path(path: &str, kind: FileKind) -> Result<()> {
     let invalid = |reason: String| Error::InvalidPath {
         path: path.to_owned(),

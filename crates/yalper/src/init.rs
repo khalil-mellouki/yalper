@@ -779,7 +779,7 @@ fn other_commands(settings: &Value, exe: &str) -> Vec<(String, String)> {
 }
 
 /// `text` with every control character (line breaks, terminal escape sequences) replaced by a space, and every
-/// invisible formatting character (see [`is_hidden_format`]) shown as `<U+XXXX>`, so text from a repository or
+/// invisible formatting character (see `is_hidden_format`) shown as `<U+XXXX>`, so text from a repository or
 /// a recording cannot change what the terminal shows or hide what it says.
 pub fn printable(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());

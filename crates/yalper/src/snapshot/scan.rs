@@ -149,7 +149,7 @@ pub enum SkipReason {
     /// An ignore file (`.gitignore` or `info/exclude`) whose rules are not used, so the files it would ignore
     /// are snapshotted. The file itself is snapshotted like any other.
     IgnoreFileNotUsed(String),
-    /// A directory [`MAX_DEPTH`] levels down: what is inside it is not in the snapshot.
+    /// A directory `MAX_DEPTH` levels down: what is inside it is not in the snapshot.
     TooDeep,
 }
 
@@ -181,7 +181,7 @@ impl fmt::Display for Skipped {
 }
 
 /// Takes a snapshot of the project that contains `yalper_dir`: every file that `.gitignore`, `.git/info/exclude`
-/// and the user's global excludes do not ignore (see [`Excludes`]), except anything named `.git` or `.yalper`.
+/// and the user's global excludes do not ignore (see `Excludes`), except anything named `.git` or `.yalper`.
 /// Symlinks are stored as symlinks (their target is never read), and on Unix the executable bit is kept.
 ///
 /// [`take`] followed by [`Pending::save`], under `lock`. A failure because of the ignore rules budget is

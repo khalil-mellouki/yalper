@@ -122,7 +122,7 @@ pub struct Chosen {
 /// Applies `choice`, given in the folder `start`, to the choice remembered in `events` for the project at
 /// `project`, and remembers the result. Every `--with` path must be an ignored file or folder inside the
 /// project, reached and made of real folders and regular files only, or a file over the snapshot size limit
-/// (see [`check_with`]). Returns the message to show when one is refused: nothing is remembered then. A
+/// (see `check_with`). Returns the message to show when one is refused: nothing is remembered then. A
 /// remembered path that no longer exists is skipped with a warning, and stays remembered.
 pub fn choose(
     events: &Store,
