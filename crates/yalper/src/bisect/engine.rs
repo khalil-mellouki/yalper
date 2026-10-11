@@ -68,13 +68,14 @@ pub enum Reason {
 }
 
 /// What the `test` callback returns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tested {
     /// The test command ran.
     Ran(Run),
     /// The entry cannot be tested at all, for example because its dependencies failed to install. The entry
-    /// is skipped and not asked for again.
-    CannotTest,
+    /// is skipped and not asked for again. The reason is short, printable text built by the caller, shown
+    /// as [`Skip::CannotTest`].
+    CannotTest(String),
     /// The bisect was stopped (Ctrl-C) before the test command ran.
     Stopped,
 }
@@ -100,14 +101,14 @@ impl fmt::Display for Failure {
 }
 
 /// Why an entry could not be tested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Skip {
     /// The test command exited with 125.
     ExitCode,
     /// The test command printed more than [`MAX_LOG_BYTES`].
     OutputTooLarge,
-    /// The `test` callback returned [`Tested::CannotTest`].
-    CannotTest,
+    /// The `test` callback returned [`Tested::CannotTest`] with this reason.
+    CannotTest(String),
     /// Every run failed because the linker could not write a file held by Windows (see [`LINKER_RERUNS`]).
     LinkerFileHeld,
 }
@@ -121,7 +122,7 @@ impl fmt::Display for Skip {
                 "the test command printed more than {} GiB",
                 MAX_LOG_BYTES >> 30
             ),
-            Self::CannotTest => write!(f, "its dependencies could not be installed"),
+            Self::CannotTest(reason) => f.write_str(reason),
             Self::LinkerFileHeld => {
                 write!(f, "the linker could not write a file still held by Windows")
             }
@@ -142,8 +143,11 @@ pub enum Answer {
     /// The first failing entry: the one before it passes.
     Found { entry: usize, failure: Failure },
     /// Skipped entries hide the answer: the first failing entry is one of these, in order. All are skipped
-    /// except the last, which failed.
-    Range(Vec<usize>),
+    /// except the last, which failed with `failure`.
+    Range {
+        entries: Vec<usize>,
+        failure: Failure,
+    },
     /// The good end already fails.
     GoodEndFails(Failure),
     /// The bad end passes.
@@ -172,7 +176,9 @@ pub struct Report {
 /// three times as long, and at least 30 s more. Room for a step that adds tests or recompiles, while a step
 /// that makes the tests hang costs at most a few normal runs.
 pub fn automatic_limit(longest: Duration) -> Duration {
-    (longest * 3).max(longest + MIN_HEADROOM)
+    longest
+        .saturating_mul(3)
+        .max(longest.saturating_add(MIN_HEADROOM))
 }
 
 /// Finds the first failing entry of `trees` (see the module documentation). `test` runs the tests on the
@@ -241,7 +247,10 @@ impl<F: FnMut(&Trial) -> io::Result<Tested>> Engine<F> {
                         failure: bad_failure,
                     }
                 } else {
-                    Answer::Range((good + 1..=bad).collect())
+                    Answer::Range {
+                        entries: (good + 1..=bad).collect(),
+                        failure: bad_failure,
+                    }
                 });
             };
             match self.verdict(entry, estimate_steps(bad - good), false)? {
@@ -271,12 +280,12 @@ impl<F: FnMut(&Trial) -> io::Result<Tested>> Engine<F> {
             };
             let run = match (self.test)(&trial)? {
                 Tested::Ran(run) => run,
-                Tested::CannotTest => {
-                    return Ok(self.cannot_test(entry, failure, Skip::CannotTest));
+                Tested::CannotTest(reason) => {
+                    return Ok(self.cannot_test(entry, failure, Skip::CannotTest(reason)));
                 }
                 Tested::Stopped => return Ok(Verdict::Stopped),
             };
-            self.report.runs += 1;
+            self.report.runs = self.report.runs.saturating_add(1);
             if end && !matches!(run.outcome, Outcome::TimedOut | Outcome::OutputTooLarge) {
                 self.longest_end_run = self.longest_end_run.max(Some(run.elapsed));
             }
@@ -318,7 +327,7 @@ impl<F: FnMut(&Trial) -> io::Result<Tested>> Engine<F> {
         match failure {
             Some(failure) => Verdict::Failed(failure),
             None => {
-                self.report.skipped.push((entry, skip));
+                self.report.skipped.push((entry, skip.clone()));
                 Verdict::Skipped(skip)
             }
         }
@@ -462,8 +471,23 @@ mod tests {
                 failure: Failure::Exit(Exit::Code(1)),
             }
         } else {
-            Answer::Range((good + 1..=bad).collect())
+            Answer::Range {
+                entries: (good + 1..=bad).collect(),
+                failure: Failure::Exit(Exit::Code(1)),
+            }
         }
+    }
+
+    /// The answer when entry 1 of 3 cannot be tested and entry 2 failed with exit code 1.
+    fn range_1_2() -> Answer {
+        Answer::Range {
+            entries: vec![1, 2],
+            failure: Failure::Exit(Exit::Code(1)),
+        }
+    }
+
+    fn cannot_test() -> Tested {
+        Tested::CannotTest("dependencies could not be installed".into())
     }
 
     #[test]
@@ -516,14 +540,17 @@ mod tests {
         let cases = [
             (ran(Outcome::Skipped), Skip::ExitCode),
             (ran(Outcome::OutputTooLarge), Skip::OutputTooLarge),
-            (Tested::CannotTest, Skip::CannotTest),
+            (
+                cannot_test(),
+                Skip::CannotTest("dependencies could not be installed".into()),
+            ),
             (linker_file_held(), Skip::LinkerFileHeld),
         ];
         for (tested, skip) in cases {
             let (report, _) = bisect_with(3, 2, Settings::default(), |trial| {
-                (trial.entry == 1).then_some(tested)
+                (trial.entry == 1).then(|| tested.clone())
             });
-            assert_eq!(report.answer, Answer::Range(vec![1, 2]));
+            assert_eq!(report.answer, range_1_2());
             assert_eq!(report.skipped, [(1, skip)]);
         }
     }
@@ -536,12 +563,15 @@ mod tests {
         assert_eq!(report.answer, Answer::EndSkipped(End::Good, Skip::ExitCode));
         assert_eq!(entries(&trials), [0]);
         let (report, trials) = bisect_with(5, 2, Settings::default(), |trial| {
-            (trial.entry == 4).then_some(Tested::CannotTest)
+            (trial.entry == 0).then(cannot_test)
         });
-        assert_eq!(
-            report.answer,
-            Answer::EndSkipped(End::Bad, Skip::CannotTest)
-        );
+        let skip = Skip::CannotTest("dependencies could not be installed".into());
+        assert_eq!(report.answer, Answer::EndSkipped(End::Good, skip.clone()));
+        assert_eq!(entries(&trials), [0]);
+        let (report, trials) = bisect_with(5, 2, Settings::default(), |trial| {
+            (trial.entry == 4).then(cannot_test)
+        });
+        assert_eq!(report.answer, Answer::EndSkipped(End::Bad, skip));
         assert_eq!(entries(&trials), [0, 4]);
     }
 
@@ -650,7 +680,7 @@ mod tests {
         let (report, trials) = bisect_with(3, 2, settings, |trial| {
             (trial.entry == 1).then(linker_file_held)
         });
-        assert_eq!(report.answer, Answer::Range(vec![1, 2]));
+        assert_eq!(report.answer, range_1_2());
         assert_eq!(report.skipped, [(1, Skip::LinkerFileHeld)]);
         let runs = trials.iter().filter(|trial| trial.entry == 1).count();
         assert_eq!(runs as u32, 1 + LINKER_RERUNS);
@@ -671,20 +701,23 @@ mod tests {
             retries: 1,
             ..Settings::default()
         };
-        let (report, _) = bisect_with(3, 2, settings, |trial| {
-            (trial.entry == 1).then(|| match trial.reason {
-                Reason::First => ran(FAILED),
-                _ => ran(Outcome::Skipped),
-            })
-        });
-        assert!(matches!(report.answer, Answer::Found { entry: 1, .. }));
+        for skip in [ran(Outcome::Skipped), cannot_test()] {
+            let (report, _) = bisect_with(3, 2, settings, |trial| {
+                (trial.entry == 1).then(|| match trial.reason {
+                    Reason::First => ran(FAILED),
+                    _ => skip.clone(),
+                })
+            });
+            assert!(matches!(report.answer, Answer::Found { entry: 1, .. }));
+            assert!(report.skipped.is_empty());
+        }
     }
 
     #[test]
     fn a_stop_ends_the_bisect() {
         for stopped in [Tested::Stopped, ran(Outcome::Stopped)] {
             let (report, trials) = bisect_with(9, 4, Settings::default(), |trial| {
-                (trial.entry == 4).then_some(stopped)
+                (trial.entry == 4).then(|| stopped.clone())
             });
             assert_eq!(report.answer, Answer::Stopped);
             assert_eq!(trials.last().unwrap().entry, 4);
@@ -699,6 +732,8 @@ mod tests {
         assert_eq!(automatic_limit(secs(15)), secs(45));
         assert_eq!(automatic_limit(secs(20)), secs(60));
         assert_eq!(automatic_limit(secs(100)), secs(300));
+        assert_eq!(automatic_limit(Duration::MAX), Duration::MAX);
+        assert_eq!(automatic_limit(Duration::MAX / 2), Duration::MAX);
     }
 
     #[test]
@@ -735,6 +770,29 @@ mod tests {
             trials[1..]
                 .iter()
                 .all(|trial| trial.limit == Some(secs(40)))
+        );
+
+        // Nor does an end run stopped for too much output: its earlier failure stands, and the limit comes
+        // from the runs that finished.
+        let settings = Settings {
+            retries: 1,
+            ..Settings::default()
+        };
+        let (report, trials) = bisect_with(9, 3, settings, |trial| {
+            let tested = match (trial.entry, trial.reason) {
+                (0, _) => ran_in(Outcome::Passed, secs(10)),
+                (8, Reason::First) => ran_in(FAILED, secs(20)),
+                (8, _) => ran_in(Outcome::OutputTooLarge, secs(500)),
+                _ => return None,
+            };
+            Some(tested)
+        });
+        assert!(matches!(report.answer, Answer::Found { entry: 3, .. }));
+        assert_eq!(entries(&trials[..3]), [0, 8, 8]);
+        assert!(
+            trials[3..]
+                .iter()
+                .all(|trial| trial.limit == Some(secs(60)))
         );
     }
 
@@ -809,6 +867,10 @@ mod tests {
         assert_eq!(
             Skip::OutputTooLarge.to_string(),
             "the test command printed more than 1 GiB"
+        );
+        assert_eq!(
+            Skip::CannotTest("the install failed".into()).to_string(),
+            "the install failed"
         );
     }
 }
