@@ -31,6 +31,7 @@ use super::{
 };
 use crate::init::{printable, say};
 use crate::log::{NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars};
+use crate::redact::{redact_str, strip_escapes};
 use crate::repo::Token;
 use crate::show::{self, Changes, Format, StepView};
 use crate::snapshot::ShadowStore;
@@ -67,8 +68,6 @@ pub struct Screen {
     /// The output is a terminal: the time of a run going on is shown, updated every second, on standard output
     /// (which must then be the output given to [`command`]).
     pub live: bool,
-    /// Color the diff of the result.
-    pub color: bool,
     pub time_zone: TimeZone,
 }
 
@@ -150,24 +149,9 @@ fn command_in(
         missing,
     } = session_entries(&events, &shadow, options.good, options.bad)
         .map_err(|why| format!("cannot bisect session {short}: {why}"))?;
-    if !missing.is_empty() {
-        let steps: Vec<String> = missing.iter().map(u32::to_string).collect();
-        say(
-            out,
-            &format!(
-                "Note: the snapshot of step{} {} is no longer in the snapshot store, so {} not tested.",
-                plural(missing.len()),
-                steps.join(", "),
-                if missing.len() == 1 {
-                    "it is"
-                } else {
-                    "they are"
-                }
-            ),
-        );
-    }
     let (good_end, bad_end) = (entries[0], entries[entries.len() - 1]);
     if entries.len() < 2 || good_end.tree == bad_end.tree {
+        write_missing(out, &missing);
         say(
             out,
             &format!(
@@ -202,6 +186,7 @@ fn command_in(
     if let Some(warning) = cache.warning() {
         say(out, &printable(&format!("warning: {warning}")));
     }
+    write_missing(out, &missing);
     store
         .set_meta(CACHE_DIR_KEY, Some(&cache.meta_value()))
         .map_err(|error| format!("cannot record where the bisect data is: {error}"))?;
@@ -244,7 +229,6 @@ fn command_in(
         runs: 0,
         existed,
         seen: HashSet::new(),
-        fresh: HashSet::new(),
         history: History::default(),
     };
     let trees: Vec<_> = entries.iter().map(|entry| entry.tree).collect();
@@ -319,11 +303,20 @@ fn write_breaking_step(
         from: good.tree,
         to: breaking.tree,
     };
+    // Without color: the output is redacted as a whole, and escape sequences are removed first.
     let format = Format {
         full: false,
-        color: screen.color,
+        color: false,
     };
-    show::write_step(out, &view, changes, format)
+    let mut shown = Vec::new();
+    let result = show::write_step(&mut shown, &view, changes, format);
+    // The prompt and the tool call were redacted when they were recorded, but the diff shows the step's files
+    // as they are, so a secret the agent wrote into a file is masked here.
+    let text = String::from_utf8_lossy(&shown);
+    let text = strip_escapes(&text);
+    let text = redact_str(&text).unwrap_or_else(|| text.into_owned());
+    let _ = out.write_all(text.as_bytes());
+    result
 }
 
 /// What the runs left behind that the answer shows.
@@ -388,10 +381,10 @@ fn write_answer(
                 ),
             );
             for &entry in range {
+                // Every entry of the range was skipped, except the last, which failed.
                 let what = match report.skipped.iter().find(|(skipped, _)| *skipped == entry) {
                     Some((_, skip)) => format!("could not be tested: {skip}"),
-                    None if entry == end => format!("fails ({failure})"),
-                    None => "not tested".to_owned(),
+                    None => format!("fails ({failure})"),
                 };
                 say(out, &format!("  {}: {what}", label(entry)));
             }
@@ -492,6 +485,28 @@ fn write_answer(
     }
     ended
 }
+
+/// Writes a note naming the steps between the ends whose snapshot is no longer in the snapshot store.
+fn write_missing(out: &mut dyn Write, missing: &[u32]) {
+    if missing.is_empty() {
+        return;
+    }
+    let steps: Vec<String> = missing.iter().map(u32::to_string).collect();
+    say(
+        out,
+        &format!(
+            "Note: the snapshot of step{} {} is no longer in the snapshot store, so {} not tested.",
+            plural(missing.len()),
+            steps.join(", "),
+            if missing.len() == 1 {
+                "it is"
+            } else {
+                "they are"
+            }
+        ),
+    );
+}
+
 /// The names of the test copies (`copy-<n>`) in the project's cache folder `cache`.
 fn copies_in(cache: &CacheDir) -> io::Result<HashSet<OsString>> {
     let mut copies = HashSet::new();
@@ -568,8 +583,6 @@ struct Tester<'a> {
     existed: HashSet<OsString>,
     /// The copies used in this bisect.
     seen: HashSet<OsString>,
-    /// The copies just created or filled, whose next run builds everything: it runs without a time limit.
-    fresh: HashSet<OsString>,
     history: History,
 }
 
@@ -660,34 +673,83 @@ impl Tester<'_> {
             return Ok((Tested::Stopped, "stopped".to_owned()));
         }
 
-        // A copy just created or filled holds no build yet: its first run may compile the whole project (Rust
-        // especially), so a time limit picked from warm runs would name the wrong step.
         let name = copy.file_name().unwrap_or_default().to_owned();
         let first_use = self.seen.insert(name.clone());
-        if installed.is_some() || (first_use && !self.existed.contains(&name)) {
-            self.fresh.insert(name.clone());
-        }
-        let cold = self.fresh.remove(&name);
-        let limit = match self.options.settings.timeout {
-            None if cold => None,
-            _ => trial.limit,
+        let cold = CopyUse {
+            installed: installed.is_some(),
+            first_use,
+            existed: self.existed.contains(&name),
         };
+        let limit = run_limit(trial.limit, self.options.settings.timeout.is_some(), cold);
 
         self.runs += 1;
         let log_name = format!("run-{}.log", self.runs);
         let log = self.logs.create(&log_name)?;
-        let ran = run(&self.options.test, &copy, &env, &log, limit, self.stop)?;
+        let ran = run(
+            &self.options.test,
+            &copy,
+            &env,
+            &log,
+            limit.limit,
+            self.stop,
+        )?;
         self.history
             .last_log
             .insert(trial.entry, (self.logs.path().join(log_name), Output::Test));
         if ran.outcome == Outcome::TimedOut && !self.history.timed_out.contains(&trial.entry) {
             self.history.timed_out.push(trial.entry);
         }
-        let mut text = outcome_text(&ran, limit);
+        let mut text = outcome_text(&ran, limit.limit);
         if let Some(took) = installed {
             text = format!("installed its dependencies in {}, {text}", seconds(took));
         }
+        if let (true, Some(raised)) = (limit.raised, limit.limit) {
+            text = format!(
+                "{text} (first run in a new test copy: time limit raised to {} s)",
+                raised.as_secs()
+            );
+        }
         Ok((Tested::Ran(ran), text))
+    }
+}
+
+/// The least time limit of a cold run (see [`run_limit`]).
+const COLD_MIN_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+/// What a run needs to know about its copy to pick its time limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyUse {
+    /// Its dependencies were just installed (the copy was deleted and filled anew).
+    installed: bool,
+    /// It is used for the first time in this bisect.
+    first_use: bool,
+    /// It was in the cache folder when the bisect started.
+    existed: bool,
+}
+
+/// The time limit of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Limit {
+    limit: Option<Duration>,
+    /// Raised because the run is cold.
+    raised: bool,
+}
+
+/// The time limit of a run in `copy`, whose limit from the engine is `limit`. A cold run, the first in a copy
+/// just installed or created in this bisect, holds no build yet: it may compile the whole project (Rust
+/// especially), so a limit picked from warm runs would time it out and name the wrong step. Its automatic limit
+/// is raised to 10 times as long, and at least 10 minutes. A `--timeout` (`explicit`) applies as it is.
+fn run_limit(limit: Option<Duration>, explicit: bool, copy: CopyUse) -> Limit {
+    let cold = copy.installed || (copy.first_use && !copy.existed);
+    match limit {
+        Some(limit) if cold && !explicit => Limit {
+            limit: Some(limit.saturating_mul(10).max(COLD_MIN_LIMIT)),
+            raised: true,
+        },
+        limit => Limit {
+            limit,
+            raised: false,
+        },
     }
 }
 
@@ -783,6 +845,55 @@ mod tests {
     }
 
     #[test]
+    fn the_first_run_in_a_new_or_just_installed_copy_gets_a_raised_limit() {
+        let warm = Duration::from_secs(40);
+        let raised = |limit| Limit {
+            limit: Some(limit),
+            raised: true,
+        };
+        let copy = |installed, first_use, existed| CopyUse {
+            installed,
+            first_use,
+            existed,
+        };
+        // copy-0 created by this bisect (the project's first): its first run, then the next ones.
+        assert_eq!(
+            run_limit(Some(warm), false, copy(false, true, false)),
+            raised(Duration::from_secs(600))
+        );
+        assert_eq!(
+            run_limit(
+                Some(Duration::from_secs(90)),
+                false,
+                copy(false, true, false)
+            ),
+            raised(Duration::from_secs(900))
+        );
+        let as_is = Limit {
+            limit: Some(warm),
+            raised: false,
+        };
+        assert_eq!(
+            run_limit(Some(warm), false, copy(false, false, false)),
+            as_is
+        );
+        // copy-0 kept from an earlier bisect: its build is there.
+        assert_eq!(run_limit(Some(warm), false, copy(false, true, true)), as_is);
+        // A copy just installed, used before in this bisect or not.
+        assert_eq!(
+            run_limit(Some(warm), false, copy(true, false, true)),
+            raised(Duration::from_secs(600))
+        );
+        // `--timeout` applies as it is, and the good end has no limit to raise.
+        assert_eq!(run_limit(Some(warm), true, copy(true, true, false)), as_is);
+        let none = Limit {
+            limit: None,
+            raised: false,
+        };
+        assert_eq!(run_limit(None, false, copy(true, true, false)), none);
+    }
+
+    #[test]
     fn exit_codes_follow_git_bisect_and_the_shell() {
         assert_eq!(Ended::Named.exit_code(), 0);
         assert_eq!(Ended::NotNamed.exit_code(), 1);
@@ -872,7 +983,6 @@ mod tests {
         };
         let screen = Screen {
             live: false,
-            color: false,
             time_zone: TimeZone::UTC,
         };
         let stop = AtomicBool::new(false);
@@ -880,33 +990,41 @@ mod tests {
         let open_cache = |project: &Path, token: &Token| CacheDir::open_in(&folder, project, token);
         let mut out = Vec::new();
         let begun = Instant::now();
-        let ended = thread::scope(|scope| {
-            scope.spawn(|| {
+        let (ended, started_at, returned_at) = thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
                 while !started.exists() && begun.elapsed() < Duration::from_secs(30) {
                     thread::sleep(Duration::from_millis(10));
                 }
+                let started_at = Instant::now();
                 stop.store(true, Ordering::SeqCst);
+                started_at
             });
-            command_in(
+            let ended = command_in(
                 project.path(),
                 &options,
                 &screen,
                 &mut out,
                 &stop,
                 &open_cache,
-            )
-        })
-        .unwrap();
+            );
+            let returned_at = Instant::now();
+            (ended, watcher.join().unwrap(), returned_at)
+        });
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(ended, Ended::Stopped, "{out}");
-        assert!(begun.elapsed() < Duration::from_secs(4), "{out}");
+        assert_eq!(ended, Ok(Ended::Stopped), "{out}");
+        assert!(
+            returned_at.duration_since(started_at) < Duration::from_secs(3),
+            "{out}"
+        );
         assert!(
             out.ends_with("Stopped. Your project was not changed.\n"),
             "{out}"
         );
         assert!(out.contains("Testing step 1, the good end"), "{out}");
-        // The whole tree was killed: the command never got to its last part.
-        thread::sleep(Duration::from_secs(6) - begun.elapsed().min(Duration::from_secs(6)));
+        // The whole tree was killed: the command never got to its last part, 5 s after its first.
+        thread::sleep(
+            (started_at + Duration::from_secs(6)).saturating_duration_since(Instant::now()),
+        );
         assert!(started.exists() && !late.exists(), "{out}");
         assert_eq!(state(project.path()), before);
     }

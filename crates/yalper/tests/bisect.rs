@@ -305,7 +305,14 @@ fn runs(text: &str) -> usize {
 #[test]
 fn names_the_step_that_broke_the_tests_with_its_prompt_and_diff() {
     let project = Project::new("good");
-    record(&project, SESSION, &notes_steps(8));
+    // The breaking step also writes a secret into a file: the diff shows it masked.
+    let token = fake_token();
+    let mut steps = notes_steps(8);
+    steps[8 - 3].push((
+        "settings.txt".to_owned(),
+        Some(format!("github_token = \"{token}\"\n")),
+    ));
+    record(&project, SESSION, &steps);
     let (code, out, err) = project.bisect(&["--test", TEST], &[]);
     assert_eq!(code, Some(0), "{out}{err}");
     assert!(err.is_empty(), "{err}");
@@ -343,10 +350,14 @@ fn names_the_step_that_broke_the_tests_with_its_prompt_and_diff() {
     );
     assert!(out.contains("Command:\n  ./edit.sh 8"), "{out}");
     assert!(
-        out.contains("2 files changed:\n  modified  notes.txt\n  modified  status.txt"),
+        out.contains(
+            "3 files changed:\n  modified  notes.txt\n  added     settings.txt\n  modified  status.txt"
+        ),
         "{out}"
     );
     assert!(out.contains("-good\n+bad"), "{out}");
+    assert!(!out.contains(&token), "{out}");
+    assert!(out.contains("+github_token = \"[REDACTED:"), "{out}");
     // The cache folder holds the bisect data; the project's event log says where it is.
     assert!(cache.join("copy-0").join("status.txt").is_file());
     assert!(cache.join("logs").join("run-1.log").is_file());
@@ -356,14 +367,7 @@ fn names_the_step_that_broke_the_tests_with_its_prompt_and_diff() {
 fn a_good_end_that_fails_shows_the_end_of_its_output_masked_and_prefixed() {
     let project = Project::new("bad");
     record(&project, SESSION, &notes_steps(0));
-    let token = format!(
-        "ghp_{}",
-        "q7W2e9R4t1Y6u3I8o5P0"
-            .chars()
-            .cycle()
-            .take(36)
-            .collect::<String>()
-    );
+    let token = fake_token();
     let printed = project.outside("printed.txt");
     fs::write(
         &printed,
@@ -620,4 +624,10 @@ fn a_second_bisect_and_a_purge_wait_for_the_running_one() {
     assert!(purge.status.success(), "{purge:?}");
     assert!(!cache.exists());
     assert!(!project.root.join(".yalper").exists());
+}
+
+/// A fake GitHub token, built at run time so that no token-shaped literal is in the repository.
+fn fake_token() -> String {
+    let body: String = "q7W2e9R4t1Y6u3I8o5P0".chars().cycle().take(36).collect();
+    format!("ghp_{body}")
 }

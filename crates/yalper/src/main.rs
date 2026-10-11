@@ -186,14 +186,8 @@ fn bisect(args: BisectArgs) -> ExitCode {
         };
         // Not locked: on a terminal, the time of a run going on is written to it from another thread.
         let mut stdout = io::stdout();
-        let terminal = stdout.is_terminal();
         let screen = yalper::bisect::Screen {
-            live: terminal,
-            color: color_wanted(
-                terminal,
-                env::var_os("TERM").as_deref(),
-                env::var_os("NO_COLOR").as_deref(),
-            ),
+            live: stdout.is_terminal(),
             time_zone: TimeZone::system(),
         };
         let ended = yalper::bisect::command(

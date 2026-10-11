@@ -77,7 +77,8 @@ pub fn session_entries(
     });
     let good_step = good.unwrap_or(u32::from(starts_the_session));
     let bad_step = bad.unwrap_or(last);
-    if good_step >= bad_step {
+    // With the default ends, a session of one step has nothing to test (one entry, below).
+    if good_step >= bad_step && (good.is_some() || bad.is_some()) {
         return Err(format!(
             "the good end (step {good_step}) must come before the bad end (step {bad_step})."
         ));
@@ -281,5 +282,23 @@ mod tests {
         ];
         let found = session_entries(&events, &project.store, None, None).unwrap();
         assert_eq!(steps(&found), [(1, false)]);
+    }
+
+    #[test]
+    fn a_session_of_only_its_start_has_one_entry_unless_ends_were_asked_for() {
+        let project = Project::new();
+        let events = vec![event(
+            1,
+            "SessionStart",
+            Some(project.tree(&[("f", "a")])),
+            None,
+        )];
+        let found = session_entries(&events, &project.store, None, None).unwrap();
+        assert_eq!(steps(&found), [(1, false)]);
+        assert_eq!(found.bad_step, 1);
+        for (good, bad) in [(Some(1), None), (None, Some(1))] {
+            let error = session_entries(&events, &project.store, good, bad).unwrap_err();
+            assert!(error.contains("must come before the bad end"), "{error}");
+        }
     }
 }
