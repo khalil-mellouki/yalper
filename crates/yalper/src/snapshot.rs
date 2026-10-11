@@ -29,7 +29,7 @@ use gix::{ObjectId, oid};
 use crate::repo::Token;
 use crate::safe_fs::OwnedDir;
 
-pub(crate) use excludes::{Excludes, over_budget_reason};
+pub(crate) use excludes::{CASE_INSENSITIVE, Excludes, over_budget_reason};
 pub use scan::{
     Base, MAX_FILE_BYTES, Pending, SkipReason, Skipped, Snapshot, remember_failure, snapshot, take,
 };

@@ -8,7 +8,7 @@ mod copy;
 mod node_modules;
 
 pub use copy::{Switched, TestCopy};
-pub use node_modules::{Linked, NodeModules};
+pub use node_modules::{CANNOT_LINK, Linked, NodeModules};
 
 /// The folder inside `.yalper/` that holds the test copies.
 pub const BISECT_DIR: &str = "bisect";

@@ -58,7 +58,7 @@ pub const MAX_IGNORE_WEIGHT: u64 = 4000;
 
 /// Patterns match without regard to case where git does by default (`core.ignoreCase`, set by `git init` on
 /// case-insensitive file systems).
-const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+pub(crate) const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 
 /// Long patterns cost more to compile: one more unit of weight per this many bytes.
 const BYTES_PER_WEIGHT: u64 = 8;
