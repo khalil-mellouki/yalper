@@ -32,13 +32,14 @@
 //!   Developer Mode or administrator rights);
 //! - a read-only attribute (or, on Unix, a folder without write permission) left by a test is cleared before
 //!   an entry is replaced or deleted;
-//! - the cached bytecode of every Python file written or removed is deleted (see [`remove_bytecode`]).
+//! - the cached bytecode of every Python file written or removed is deleted, next to the file and in the
+//!   copy's `PYTHONPYCACHEPREFIX` folder (see [`Bytecode`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::SystemTime;
@@ -46,16 +47,22 @@ use std::time::SystemTime;
 use gix::ObjectId;
 
 use super::BISECT_DIR;
+use super::link::{is_real_dir_no_follow, normalize, plain};
 use crate::repo;
 use crate::safe_fs::{self, OwnedDir};
 use crate::snapshot::{
-    Error, Excludes, FileChange, FileKind, MAX_FILE_BYTES, Result, ShadowStore, TreeFile,
-    file_system_clock, is_racy, nanos_since_epoch, over_budget_reason, validate_path,
+    CASE_INSENSITIVE, Error, Excludes, FileChange, FileKind, MAX_FILE_BYTES, Result, ShadowStore,
+    TreeFile, file_system_clock, is_racy, nanos_since_epoch, over_budget_reason, validate_path,
 };
 
 /// The file in `.yalper/bisect/` whose mtime gives the time a switch ended, on the file system's clock (see
 /// [`is_racy`]).
 const CLOCK_FILE: &str = "clock";
+
+/// The folder in `.yalper/bisect/` that holds the `PYTHONPYCACHEPREFIX` folder of each copy,
+/// `pycache/copy-<n>/`: Python writes the bytecode of the files a test run imports there, never next to them,
+/// so nothing is written into the project's virtual environment through a link of the copy.
+const PYCACHE_DIR: &str = "pycache";
 
 /// The most entries (files and folders) of a tree diff one switch takes. Over it the switch is refused: no
 /// project has that many files, but a crafted store could repeat a large subtree many times.
@@ -89,6 +96,10 @@ pub struct TestCopy {
     clean_at: i64,
     /// See [`set_extra_paths`](Self::set_extra_paths).
     extra: HashSet<String>,
+    /// See [`pycache_path`](Self::pycache_path).
+    pycache: PathBuf,
+    /// The paths of the copy's folder inside `pycache` (see [`prefix_mirrors`]).
+    mirrors: Vec<PathBuf>,
 }
 
 /// A file of the tree a copy holds, with the size and mtime the copy gave it.
@@ -120,7 +131,9 @@ impl TestCopy {
     /// path is refused, and so is a folder other users can change.
     pub fn open(yalper_dir: &OwnedDir, number: usize) -> io::Result<Self> {
         let bisect = open_private_dir(&yalper_dir.path().join(BISECT_DIR))?;
-        let dir = open_private_dir(&bisect.path().join(format!("copy-{number}")))?;
+        let name = format!("copy-{number}");
+        let dir = open_private_dir(&bisect.path().join(&name))?;
+        let pycache = bisect.path().join(PYCACHE_DIR).join(name);
         let info_exclude = yalper_dir
             .path()
             .parent()
@@ -128,17 +141,30 @@ impl TestCopy {
             .map(|git_dir| git_dir.join("info").join("exclude"));
         Ok(Self {
             bisect,
-            dir,
             info_exclude,
             tree: None,
             placed: HashMap::new(),
             clean_at: 0,
             extra: HashSet::new(),
+            mirrors: prefix_mirrors(dir.path()),
+            dir,
+            pycache,
         })
     }
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The copy's `PYTHONPYCACHEPREFIX` folder, `.yalper/bisect/pycache/copy-<n>/`, which may not exist yet
+    /// (see [`env_additions`](super::env_additions)).
+    pub fn pycache_path(&self) -> &Path {
+        &self.pycache
+    }
+
+    /// `.yalper/bisect/`.
+    pub(super) fn bisect_dir(&self) -> &OwnedDir {
+        &self.bisect
     }
 
     /// Sets the paths of the copy, relative and `/`-separated, that Yalper puts there besides the files of
@@ -219,10 +245,12 @@ impl TestCopy {
             changes.sort_unstable_by(|a, b| a.0.cmp(b.0));
         }
 
+        let mut bytecode = Bytecode::new(&self.pycache, &self.mirrors);
         let mut kept = HashMap::new();
         for &(path, new) in &changes {
             if new.is_none()
-                && remove(root, path, &mut kept).map_err(|error| in_copy(error, path))?
+                && remove(root, path, &mut kept, &mut bytecode)
+                    .map_err(|error| in_copy(error, path))?
             {
                 switched.removed += 1;
             }
@@ -239,7 +267,7 @@ impl TestCopy {
                 links.push((path, new));
                 continue;
             }
-            if prepare(root, path, new, first, &kept, &mut ready)
+            if prepare(root, path, new, first, &kept, &mut ready, &mut bytecode)
                 .map_err(|error| in_copy(error, path))?
             {
                 files.push((path, new));
@@ -250,7 +278,7 @@ impl TestCopy {
 
         ready.clear();
         for (path, new) in links {
-            if prepare(root, path, new, first, &kept, &mut ready)
+            if prepare(root, path, new, first, &kept, &mut ready, &mut bytecode)
                 .map_err(|error| in_copy(error, path))?
             {
                 let target = read(store, path, new)?;
@@ -582,7 +610,12 @@ fn in_copy(error: io::Error, path: &str) -> io::Error {
 ///
 /// The folders that still hold something (files the tree does not have) are added to `kept`, keyed by their
 /// lowercase path, for [`fix_case`].
-fn remove(root: &Path, path: &str, kept: &mut HashMap<String, String>) -> io::Result<bool> {
+fn remove(
+    root: &Path,
+    path: &str,
+    kept: &mut HashMap<String, String>,
+    bytecode: &mut Bytecode,
+) -> io::Result<bool> {
     for parent in parents(path) {
         if !is_real_dir(&native(root, parent))? {
             return Ok(false);
@@ -599,7 +632,7 @@ fn remove(root: &Path, path: &str, kept: &mut HashMap<String, String>) -> io::Re
         Err(error) => return Err(error),
     };
     if path.ends_with(".py") {
-        remove_bytecode(&full)?;
+        bytecode.remove(root, path)?;
     }
     let mut left = parents(path).collect::<Vec<_>>();
     while let Some(parent) = left.last() {
@@ -652,6 +685,7 @@ fn prepare(
     first: bool,
     kept: &HashMap<String, String>,
     ready: &mut HashSet<String>,
+    bytecode: &mut Bytecode,
 ) -> io::Result<bool> {
     for parent in parents(path) {
         if ready.contains(parent) {
@@ -681,7 +715,7 @@ fn prepare(
         return Ok(false);
     }
     if path.ends_with(".py") {
-        remove_bytecode(&full)?;
+        bytecode.remove(root, path)?;
     }
     Ok(true)
 }
@@ -978,24 +1012,93 @@ fn remove_dir_forcing(dir: &Path) -> io::Result<()> {
     listed.iter().rev().try_for_each(fs::remove_dir)
 }
 
-/// Removes the cached bytecode of the Python file at `path`: the `__pycache__/<name>.*.pyc` files next to it,
-/// then `__pycache__` if it is left empty.
+/// Removes the cached bytecode of the Python files a switch writes or removes.
 ///
 /// Python takes its bytecode as current while the source keeps its size and its mtime in whole seconds, so a
 /// same-size change written in the same second as the previous version would otherwise run the old code.
-fn remove_bytecode(path: &Path) -> io::Result<()> {
-    let (Some(dir), Some(name)) = (
-        path.parent(),
-        path.file_stem().and_then(|name| name.to_str()),
-    ) else {
-        return Ok(());
-    };
-    let cache = dir.join("__pycache__");
-    if !is_real_dir(&cache)? {
-        return Ok(());
+/// Python keeps the bytecode in a `__pycache__` folder next to each file or, when a test run has
+/// `PYTHONPYCACHEPREFIX` (see [`env_additions`](super::env_additions)), in the prefix folder, under the path of
+/// the source's folder (see [`prefix_mirrors`]). A test run can write in the prefix folder, so only real
+/// folders are entered there, never a link.
+struct Bytecode {
+    /// The copy's folders inside the prefix folder that are real folders reached through real folders, checked
+    /// once per switch.
+    roots: Vec<PathBuf>,
+    /// Whether each folder below them is a real folder, checked once per switch.
+    real: HashMap<PathBuf, bool>,
+}
+
+impl Bytecode {
+    /// For a switch of the copy whose prefix folder is `pycache`, with `mirrors` (see [`prefix_mirrors`]).
+    fn new(pycache: &Path, mirrors: &[PathBuf]) -> Self {
+        let roots = mirrors
+            .iter()
+            .filter_map(|mirror| {
+                let mut dir = pycache.to_owned();
+                if !is_real_dir_no_follow(&dir) {
+                    return None;
+                }
+                for component in mirror.components() {
+                    dir.push(component);
+                    if !is_real_dir_no_follow(&dir) {
+                        return None;
+                    }
+                }
+                Some(dir)
+            })
+            .collect();
+        Self {
+            roots,
+            real: HashMap::new(),
+        }
     }
+
+    /// Removes the bytecode of the Python file `path` of the copy at `root`, whose parent folders are real
+    /// folders: the `__pycache__/<name>.*.pyc` files next to it (then `__pycache__` if it is left empty), and
+    /// the `<name>.*.pyc` files of its folder in the prefix folder.
+    fn remove(&mut self, root: &Path, path: &str) -> io::Result<()> {
+        let full = native(root, path);
+        let (Some(dir), Some(name)) = (full.parent(), full.file_stem().and_then(OsStr::to_str))
+        else {
+            return Ok(());
+        };
+        let cache = dir.join("__pycache__");
+        if is_real_dir(&cache)? {
+            remove_pyc(&cache, name)?;
+            // Fails if something is left, which is fine.
+            let _ = fs::remove_dir(&cache);
+        }
+
+        let folder = path.rsplit_once('/').map_or("", |(folder, _)| folder);
+        for mirror_root in &self.roots {
+            let mut dir = mirror_root.clone();
+            let mut real = true;
+            for component in folder.split('/').filter(|component| !component.is_empty()) {
+                dir.push(component);
+                real = match self.real.get(&dir) {
+                    Some(&real) => real,
+                    None => {
+                        let real = is_real_dir(&dir)?;
+                        self.real.insert(dir.clone(), real);
+                        real
+                    }
+                };
+                if !real {
+                    break;
+                }
+            }
+            if real {
+                remove_pyc(&dir, name)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Removes the files `<name>.*.pyc` of the folder `dir`. A link is removed itself, never followed.
+fn remove_pyc(dir: &Path, name: &str) -> io::Result<()> {
     let prefix = format!("{name}.");
-    for entry in fs::read_dir(&cache)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let is_bytecode = entry
             .file_name()
@@ -1008,9 +1111,56 @@ fn remove_bytecode(path: &Path) -> io::Result<()> {
             }
         }
     }
-    // Fails if something is left, which is fine.
-    let _ = fs::remove_dir(&cache);
     Ok(())
+}
+
+/// The paths, relative to a `PYTHONPYCACHEPREFIX` folder, of the folder where Python puts the bytecode of the
+/// files at the top of the copy at `copy`. Python's `importlib` takes the absolute path of a source's folder,
+/// drops its drive and root, and appends what is left to the prefix: `C:\p\copy-0\pkg` gives
+/// `p\copy-0\pkg`, and a network path `\\server\share\p` gives `server\share\p`. Two spellings of the copy's
+/// path are kept: the one Yalper gives tests, and the canonical one, which a test's current folder may resolve
+/// to (on Windows, a short `RUNNER~1` name becomes the long one).
+fn prefix_mirrors(copy: &Path) -> Vec<PathBuf> {
+    let mut mirrors: Vec<PathBuf> = Vec::new();
+    let spellings = [std::path::absolute(copy).ok(), fs::canonicalize(copy).ok()];
+    for path in spellings.into_iter().flatten() {
+        let Some(mirror) = mirror(&normalize(&plain(&path))) else {
+            continue;
+        };
+        let same = |known: &PathBuf| {
+            if CASE_INSENSITIVE {
+                known.to_string_lossy().to_lowercase() == mirror.to_string_lossy().to_lowercase()
+            } else {
+                *known == mirror
+            }
+        };
+        if !mirrors.iter().any(same) {
+            mirrors.push(mirror);
+        }
+    }
+    mirrors
+}
+
+/// `path`, absolute, without its drive or root (see [`prefix_mirrors`]). `None` for a device path, which a
+/// copy never has.
+fn mirror(path: &Path) -> Option<PathBuf> {
+    let mut mirror = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    mirror.push(server);
+                    mirror.push(share);
+                }
+                _ => return None,
+            },
+            Component::RootDir => {}
+            Component::Normal(name) => mirror.push(name),
+            Component::CurDir | Component::ParentDir => return None,
+        }
+    }
+    Some(mirror)
 }
 
 #[cfg(test)]
@@ -2270,38 +2420,68 @@ mod tests {
         found
     }
 
-    #[test]
-    fn python_runs_a_same_size_change_made_in_the_same_second() {
+    /// Python runs a same-size change of `pkg/mod.py` written in the same second as the version it compiled,
+    /// with its bytecode next to the file or, if `prefix`, in the copy's `PYTHONPYCACHEPREFIX` folder.
+    fn python_runs_a_same_size_change(prefix: bool) {
         let Some(python) = python() else { return };
         let project = Project::new();
-        let a = [("mod.py", Regular, "VALUE = 1\n")];
-        let b = [("mod.py", Regular, "VALUE = 2\n")];
+        let a = [
+            ("pkg/__init__.py", Regular, ""),
+            ("pkg/mod.py", Regular, "VALUE = 1\n"),
+        ];
+        let b = [
+            ("pkg/__init__.py", Regular, ""),
+            ("pkg/mod.py", Regular, "VALUE = 2\n"),
+        ];
         let (tree_a, tree_b) = (project.tree(&a), project.tree(&b));
         let mut copy = project.copy();
         let value = |copy: &TestCopy| {
-            let output = Command::new(python)
-                .args(["-c", "import mod, sys; sys.stdout.write(str(mod.VALUE))"])
+            let mut command = Command::new(python);
+            command
+                .args([
+                    "-c",
+                    "import pkg.mod, sys; sys.stdout.write(str(pkg.mod.VALUE))",
+                ])
                 .current_dir(copy.path())
                 .env_remove("PYTHONDONTWRITEBYTECODE")
-                .env_remove("PYTHONPYCACHEPREFIX")
-                .output()
-                .unwrap();
+                .env_remove("PYTHONPYCACHEPREFIX");
+            if prefix {
+                command.env("PYTHONPYCACHEPREFIX", copy.pycache_path());
+            }
+            let output = command.output().unwrap();
             assert!(output.status.success(), "{output:?}");
             String::from_utf8(output.stdout).unwrap()
+        };
+        let bytecode_of_mod = |copy: &TestCopy| {
+            let cache = if prefix {
+                copy.pycache_path().to_owned()
+            } else {
+                copy.path().join("pkg").join("__pycache__")
+            };
+            if !cache.exists() {
+                return 0;
+            }
+            contents(&cache)
+                .into_keys()
+                .filter(|path| {
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    name.starts_with("mod.") && name.ends_with(".pyc")
+                })
+                .count()
         };
 
         copy.switch(&project.store, tree_a).unwrap();
         assert_eq!(value(&copy), "1");
-        let cache = copy.path().join("__pycache__");
+        assert_eq!(bytecode_of_mod(&copy), 1, "no bytecode written");
         assert_eq!(
-            fs::read_dir(&cache).unwrap().count(),
-            1,
-            "no bytecode written"
+            copy.path().join("pkg").join("__pycache__").exists(),
+            !prefix
         );
-        let source = copy.path().join("mod.py");
+        let source = copy.path().join("pkg").join("mod.py");
         let mtime = fs::metadata(&source).unwrap().modified().unwrap();
 
         copy.switch(&project.store, tree_b).unwrap();
+        assert_eq!(bytecode_of_mod(&copy), 0);
         // Same size and same mtime as the version Python compiled: only removing its bytecode makes Python
         // read the new source.
         fs::File::options()
@@ -2311,5 +2491,84 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
         assert_eq!(value(&copy), "2");
+    }
+
+    #[test]
+    fn python_runs_a_same_size_change_made_in_the_same_second() {
+        python_runs_a_same_size_change(false);
+    }
+
+    #[test]
+    fn python_runs_a_same_size_change_with_a_bytecode_prefix_folder() {
+        python_runs_a_same_size_change(true);
+    }
+
+    #[test]
+    fn bytecode_in_the_prefix_folder_is_removed_never_through_a_link() {
+        let project = Project::new();
+        let a = [
+            ("pkg/mod.py", Regular, "VALUE = 1\n"),
+            ("pkg/other.py", Regular, ""),
+            ("linked/x.py", Regular, ""),
+            ("top.py", Regular, ""),
+        ];
+        let b = [
+            ("pkg/mod.py", Regular, "VALUE = 2\n"),
+            ("pkg/other.py", Regular, ""),
+            ("linked/x.py", Regular, "changed"),
+        ];
+        let mut copy = project.copy();
+        copy.switch(&project.store, project.tree(&a)).unwrap();
+
+        // Where Python puts the bytecode with `PYTHONPYCACHEPREFIX`: under the copy's absolute path without its
+        // drive or root.
+        let text = copy.path().to_string_lossy().into_owned();
+        let without_root = if cfg!(windows) {
+            &text[3..]
+        } else {
+            &text[1..]
+        };
+        assert_eq!(copy.mirrors[0], PathBuf::from(without_root));
+        let mirror = copy.pycache_path().join(without_root);
+        for path in [
+            "pkg/mod.cpython-312.pyc",
+            "pkg/mod.cpython-312.opt-1.pyc",
+            "pkg/other.cpython-312.pyc",
+            "top.cpython-312.pyc",
+        ] {
+            create(&mirror, path, "bytecode");
+        }
+        // A link a test put in the prefix folder, to a canary.
+        let canary = tempfile::tempdir().unwrap();
+        create(canary.path(), "x.cpython-312.pyc", "keep me");
+        link_dir(canary.path(), &mirror.join("linked"));
+
+        copy.switch(&project.store, project.tree(&b)).unwrap();
+        assert_eq!(
+            contents(&mirror).into_keys().collect::<Vec<_>>(),
+            ["linked", "pkg/other.cpython-312.pyc"]
+        );
+        assert_eq!(
+            fs::read(canary.path().join("x.cpython-312.pyc")).unwrap(),
+            b"keep me"
+        );
+    }
+
+    #[test]
+    fn the_prefix_folder_mirrors_the_path_without_its_drive_or_root() {
+        let path = |text: &str| PathBuf::from(text);
+        assert_eq!(
+            mirror(&path("/home/me/p/copy-0")),
+            Some(path("home/me/p/copy-0"))
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(mirror(&path(r"C:\p\copy-0")), Some(path(r"p\copy-0")));
+            assert_eq!(
+                mirror(&path(r"\\server\share\p")),
+                Some(path(r"server\share\p"))
+            );
+            assert_eq!(mirror(&path(r"\\.\pipe\x")), None);
+        }
     }
 }
