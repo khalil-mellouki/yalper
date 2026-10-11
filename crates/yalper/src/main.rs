@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
@@ -51,6 +52,38 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Find the step of a session that broke the tests: run the test command against the code of its steps, in a
+    /// test copy outside the project, and name the first step where they fail.
+    Bisect(BisectArgs),
+}
+
+#[derive(clap::Args)]
+struct BisectArgs {
+    /// The command that runs the tests. Exit code 0 means they pass, 125 that this step cannot be tested,
+    /// anything else that they fail.
+    #[arg(long, value_name = "COMMAND")]
+    test: String,
+    /// Bisect the session whose id starts with this, instead of the most recent one.
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
+    /// A step where the tests pass (default: the start of the session).
+    #[arg(long, value_name = "STEP")]
+    good: Option<u32>,
+    /// A step where the tests fail (default: the last step of the session).
+    #[arg(long, value_name = "STEP")]
+    bad: Option<u32>,
+    /// The command that installs the dependencies in a test copy, instead of the one Yalper picks from the
+    /// lockfiles.
+    #[arg(long, value_name = "COMMAND")]
+    setup: Option<String>,
+    /// The time limit of each test run: seconds, or a number followed by s or m (30s, 5m). By default it is
+    /// picked from the runs of the two ends.
+    #[arg(long, value_name = "TIME", value_parser = yalper::bisect::parse_timeout)]
+    timeout: Option<Duration>,
+    /// How many times a failing run is repeated to rule out flaky tests (at most 10).
+    #[arg(long, value_name = "N", default_value_t = 0,
+          value_parser = clap::value_parser!(u32).range(0..=i64::from(yalper::bisect::MAX_RETRIES)))]
+    retries: u32,
 }
 
 fn main() -> ExitCode {
@@ -72,6 +105,7 @@ fn main() -> ExitCode {
             session,
             full,
         } => show(step, session, full),
+        Command::Bisect(args) => return bisect(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -132,6 +166,53 @@ fn show(step: u32, session: Option<String>, full: bool) -> Result<(), String> {
     // A closed output (`yalper show 3 | head`) is not an error.
     let _ = out.flush();
     Ok(())
+}
+
+fn bisect(args: BisectArgs) -> ExitCode {
+    let ended = (|| {
+        let start = env::current_dir()
+            .map_err(|error| format!("cannot read the current directory: {error}"))?;
+        yalper::bisect::handle_ctrl_c().map_err(|error| error.to_string())?;
+        let options = yalper::bisect::Options {
+            test: args.test,
+            session: args.session,
+            good: args.good,
+            bad: args.bad,
+            setup: args.setup,
+            settings: yalper::bisect::Settings {
+                timeout: args.timeout,
+                retries: args.retries,
+            },
+        };
+        // Not locked: on a terminal, the time of a run going on is written to it from another thread.
+        let mut stdout = io::stdout();
+        let terminal = stdout.is_terminal();
+        let screen = yalper::bisect::Screen {
+            live: terminal,
+            color: color_wanted(
+                terminal,
+                env::var_os("TERM").as_deref(),
+                env::var_os("NO_COLOR").as_deref(),
+            ),
+            time_zone: TimeZone::system(),
+        };
+        let ended = yalper::bisect::command(
+            &start,
+            &options,
+            &screen,
+            &mut stdout,
+            &yalper::bisect::STOP,
+        );
+        let _ = stdout.flush();
+        ended
+    })();
+    match ended {
+        Ok(ended) => ExitCode::from(ended.exit_code()),
+        Err(message) => {
+            eprintln!("error: {}", yalper::init::printable(&message));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Whether to color the output: only on a terminal that shows colors (`TERM` is not `dumb`), unless

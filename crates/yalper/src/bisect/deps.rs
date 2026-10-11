@@ -900,6 +900,8 @@ pub struct DependencySets {
     failed: HashMap<String, InstallFailure>,
     /// Installs run in this bisect, which numbers their logs.
     installs: usize,
+    /// Copies deleted and filled anew for a set in this bisect (see [`copies_filled`](Self::copies_filled)).
+    filled: usize,
 }
 
 impl DependencySets {
@@ -924,7 +926,15 @@ impl DependencySets {
             no_links: false,
             failed: HashMap::new(),
             installs: 0,
+            filled: 0,
         })
+    }
+
+    /// How many times a copy was deleted and filled anew for a dependency set (installed) in this bisect. When
+    /// it grows during a [`prepare`](Self::prepare), the copy it gives was just filled: nothing is built in it
+    /// yet (a Rust project compiles everything in its first test run).
+    pub fn copies_filled(&self) -> usize {
+        self.filled
     }
 
     /// Makes a copy hold the step whose tree in `store` is `tree`, with its dependencies: `copy-0` linked to the
@@ -1137,6 +1147,7 @@ impl DependencySets {
         // Closed before it is deleted: on Windows a folder held open cannot be deleted.
         self.copies.remove(&number);
         delete_copy(&self.cache, number)?;
+        self.filled += 1;
         self.book.copies.push(Recorded {
             number,
             key: set.clone(),
