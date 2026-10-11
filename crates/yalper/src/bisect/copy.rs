@@ -558,7 +558,7 @@ pub(super) fn join(dir: &str, name: &str) -> String {
 
 /// Creates the folder `path` if it is missing (on Unix with mode 0700) and opens it, refusing a link and, on
 /// Unix, a folder its group or other users can write to.
-fn open_private_dir(path: &Path) -> io::Result<OwnedDir> {
+pub(super) fn open_private_dir(path: &Path) -> io::Result<OwnedDir> {
     #[cfg_attr(windows, allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]

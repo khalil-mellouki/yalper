@@ -14,11 +14,13 @@ rust-version.workspace = true
 [dependencies]
 aho-corasick.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 getrandom.workspace = true
 gix.workspace = true
 gix-imara-diff.workspace = true
 ignore.workspace = true
 jiff.workspace = true
+process-wrap.workspace = true
 regex-automata.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
@@ -31,6 +33,9 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # test copy of a bisect, which links to the project's installed `node_modules` packages.
 [target.'cfg(windows)'.dependencies]
 junction = { version = "2.1", default-features = false }
+# The type of the process creation flags given to `process-wrap`, for `CREATE_NEW_PROCESS_GROUP`. Already built,
+# with this feature, for `process-wrap`.
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Threading"] }
 
 [build-dependencies]
 toml.workspace = true
