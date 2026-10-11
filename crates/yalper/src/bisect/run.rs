@@ -328,6 +328,18 @@ impl Tree {
         Ok(waitid(WaitId::Pid(self.pid), options)?.is_some())
     }
 
+    /// [`main_exited`](Self::main_exited) for [`kill`](Self::kill): if the check itself fails, the main process
+    /// is killed directly and reaped before the error is returned, so a live main process is never left
+    /// running.
+    fn main_exited_or_reap(&mut self) -> io::Result<bool> {
+        let result = self.main_exited();
+        if result.is_err() {
+            let _ = self.main.kill();
+            let _ = self.main.wait();
+        }
+        result
+    }
+
     /// Kills every process of the group, and the main process, then reaps the main process: its exit status.
     fn kill(&mut self) -> io::Result<ExitStatus> {
         use rustix::io::Errno;
@@ -336,18 +348,20 @@ impl Tree {
             // Nothing is left in the group.
             Err(Errno::SRCH) => Ok(()),
             // macOS refuses to signal a group holding a zombie, as the exited main process is until it is
-            // reaped.
+            // reaped. The same error can also mean that live members remain which Yalper may not signal (for
+            // example processes protected by a sandbox or a MAC policy): those survive silently, as they
+            // would on any other path.
             #[cfg(target_vendor = "apple")]
-            Err(Errno::PERM) if self.main_exited()? => Ok(()),
+            Err(Errno::PERM) if self.main_exited_or_reap()? => Ok(()),
             result => result,
         };
         // The main process may have moved itself to another group (`setpgid`). It is not reaped yet, so its
         // process id is still its own.
-        if !self.main_exited()? {
+        if !self.main_exited_or_reap()? {
             match kill_process(self.pid, Signal::KILL) {
                 Ok(()) => {}
                 // It exited in the meantime (macOS refuses to signal a zombie).
-                Err(_) if self.main_exited()? => {}
+                Err(_) if self.main_exited_or_reap()? => {}
                 // Waiting for it would never end.
                 Err(error) => return Err(error.into()),
             }
@@ -795,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_ctrl_c_exits_at_once() {
+    fn only_the_second_press_is_seen_as_repeated() {
         let flag = AtomicBool::new(false);
         assert!(!pressed_before(&flag));
         assert!(flag.load(Ordering::SeqCst));
@@ -811,6 +825,8 @@ mod tests {
 
         // A run that ends after 100 ms.
         let running = Arc::new(AtomicUsize::new(1));
+        // Taken before the ender starts its sleep, so the wait can never look shorter than 100 ms.
+        let started = Instant::now();
         let ender = {
             let running = Arc::clone(&running);
             thread::spawn(move || {
@@ -818,7 +834,6 @@ mod tests {
                 running.store(0, Ordering::SeqCst);
             })
         };
-        let started = Instant::now();
         wait_for_runs(&running, Duration::from_secs(10));
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_secs(5));
