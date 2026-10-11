@@ -1,10 +1,11 @@
 //! `yalper bisect`: names the step of a recorded session that broke the tests.
 //!
-//! It reads the session's snapshots ([`session_entries`]), opens the project's cache folder, and lets the engine
-//! ([`bisect`]) pick the entries to test. Each run goes through the same protections: the step's copy and
-//! dependencies from [`DependencySets::prepare`], the cache folder's root cleaned and its boundary files written,
-//! the environment of [`SetCopy::run_env`](super::SetCopy::run_env), and [`run`] with the stop flag of Ctrl-C.
-//! Nothing is written into the project: only the `meta` table of its event log records where the bisect data is.
+//! It reads the session's snapshots ([`session_entries`]), opens the project's cache folder and takes its
+//! [`BisectLock`], and lets the engine ([`bisect`]) pick the entries to test. Each run goes through the same
+//! protections: the step's copy and dependencies from [`DependencySets::prepare`], the cache folder's root cleaned
+//! and its boundary files written, the environment of [`SetCopy::run_env`](super::SetCopy::run_env), and [`run`]
+//! with the stop flag of Ctrl-C. Nothing is written into the project: only the `meta` table of its event log
+//! records where the bisect data is.
 //!
 //! What a test prints is never shown as is: the end of a log is shown through [`log_tail`] (secrets masked,
 //! escape sequences removed), each line prefixed, and every verdict comes from how the run ended, never from
@@ -24,9 +25,9 @@ use jiff::tz::TimeZone;
 
 use super::entries::{Entries, Entry, session_entries};
 use super::{
-    Answer, CACHE_DIR_KEY, CacheDir, DependencySets, End, Exit, Failure, InstallFailure, Logs,
-    Outcome, Prepared, Reason, Report, Run, SKIP_EXIT_CODE, Settings, Skip, Tested, Trial, bisect,
-    clean_root, log_tail, remove_stale, run, write_boundaries,
+    Answer, BisectLock, CACHE_DIR_KEY, CacheDir, DependencySets, End, Exit, Failure,
+    InstallFailure, Logs, Outcome, Prepared, Reason, Report, Run, SKIP_EXIT_CODE, Settings, Skip,
+    Tested, Trial, bisect, clean_root, log_tail, remove_stale, run, write_boundaries,
 };
 use crate::init::{printable, say};
 use crate::log::{NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars};
@@ -168,6 +169,13 @@ fn command_in(
         .parent()
         .ok_or("cannot find the project folder above .yalper")?;
     let cache = open_cache(project, &yalper.token).map_err(|error| error.to_string())?;
+    let _lock = BisectLock::acquire(&cache).map_err(|error| {
+        if error.kind() == io::ErrorKind::ResourceBusy {
+            format!("{error}. Only one bisect of a project runs at a time: wait for it to end, or stop it.")
+        } else {
+            error.to_string()
+        }
+    })?;
     say(
         out,
         &printable(&format!(

@@ -10,12 +10,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use common::{EXE, files, git};
 use serde_json::{Value, json};
 
 const SESSION: &str = "5f3c2a1e-8b4d-4e6f-9a7b-1c2d3e4f5a6b";
+const EARLIER_SESSION: &str = "0a9b8c7d-6e5f-4a3b-2c1d-0e9f8a7b6c5d";
 
 /// The tests pass while `status.txt` says `good` (and the matching line is printed).
 const TEST: &str = if cfg!(windows) {
@@ -452,6 +454,202 @@ fn steps_that_cannot_be_tested_give_a_range() {
         ),
         "{out}"
     );
+}
+
+#[test]
+fn a_run_over_the_time_limit_counts_as_a_failure() {
+    let project = Project::new("good");
+    let mut steps = notes_steps(0);
+    steps[8 - 3].push(("hang.txt".to_owned(), Some("x\n".to_owned())));
+    record(&project, SESSION, &steps);
+    let started = Instant::now();
+    let (code, out, _) = project.bisect(&["--test", SCRIPT_TEST, "--timeout", "2s"], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("Testing step 12, the bad end (about 3 runs left)... timed out after 2 s"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "Step 8 broke the tests: they pass at step 7 and fail at step 8 (timed out after 2 s)."
+        ),
+        "{out}"
+    );
+    assert!(out.contains("reached the time limit. A run over the time limit counts as a failure"));
+    // Each hanging run was stopped at its limit, not after the 30 s of the command.
+    assert!(started.elapsed() < Duration::from_secs(25), "{out}");
+}
+
+#[test]
+fn retries_rule_out_a_flaky_step() {
+    let project = Project::new("good");
+    let mut steps = notes_steps(8);
+    steps[5 - 3].push(("flaky.txt".to_owned(), Some("x\n".to_owned())));
+    steps[8 - 3].push(("flaky.txt".to_owned(), None));
+    record(&project, SESSION, &steps);
+    let marker = project.outside("failed-once");
+
+    // Without retries, the first run of a flaky step fails and that step is named.
+    let (code, out, _) = project.bisect(&["--test", SCRIPT_TEST], &[("FLAKY_MARKER", &marker)]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("Step 7 broke the tests"), "{out}");
+
+    fs::remove_file(&marker).unwrap();
+    let (code, out, _) = project.bisect(
+        &["--test", SCRIPT_TEST, "--retries", "2"],
+        &[("FLAKY_MARKER", &marker)],
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("Testing step 7 again (retry 1 of 2)... passed in "),
+        "{out}"
+    );
+    assert!(out.contains("Step 8 broke the tests"), "{out}");
+    assert!(
+        out.contains("Flaky: step 7 failed, then passed when run again, so it counts as passing."),
+        "{out}"
+    );
+
+    let output = project.yalper(&["bisect", "--test", TEST, "--retries", "11"], &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("11 is not in 0..=10"), "{stderr}");
+    let output = project.yalper(&["bisect", "--test", TEST, "--timeout", "5h"], &[]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn good_bad_and_session_choose_what_is_bisected() {
+    let project = Project::new("good");
+    // The earlier session breaks the tests at step 6 and fixes them at step 9.
+    let mut earlier = notes_steps(6);
+    earlier[9 - 3].push(("status.txt".to_owned(), Some("good\n".to_owned())));
+    record(&project, EARLIER_SESSION, &earlier);
+    record(&project, SESSION, &notes_steps(5));
+
+    let (code, out, _) = project.bisect(&["--test", TEST], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("Bisecting session 5f3c2a1e"), "{out}");
+    assert!(out.contains("Step 5 broke the tests"), "{out}");
+
+    let (code, out, _) = project.bisect(&["--test", TEST, "--session", "0a9b"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The bad end, step 12, passes"), "{out}");
+
+    let (code, out, _) = project.bisect(&["--test", TEST, "--session", "0a9b", "--bad", "8"], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("up to step 8 (the bad end)"), "{out}");
+    assert!(out.contains("Step 6 broke the tests"), "{out}");
+    assert!(out.contains("Session 0a9b8c7d, step 6 of 13"), "{out}");
+
+    let (code, out, _) = project.bisect(
+        &[
+            "--test",
+            TEST,
+            "--session",
+            "0a9b",
+            "--good",
+            "7",
+            "--bad",
+            "13",
+        ],
+        &[],
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("Testing step 7, the good end"), "{out}");
+    assert!(out.contains("The good end, step 7, already fails"), "{out}");
+
+    let (code, _, err) = project.bisect(&["--test", TEST, "--good", "9", "--bad", "4"], &[]);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains("the good end (step 9) must come before the bad end (step 4)"),
+        "{err}"
+    );
+}
+
+/// Waits until `path` exists, for at most 60 s.
+fn wait_for(path: &Path, child: &mut Child) {
+    let started = Instant::now();
+    while !path.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the bisect ended early"
+        );
+        assert!(started.elapsed() < Duration::from_secs(60), "never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A bisect running in the background, held by its test command until released. Dropping it releases and stops
+/// it, so a failed assertion never leaves processes running.
+struct Held {
+    child: Child,
+    release: PathBuf,
+}
+
+impl Held {
+    /// Releases the test command and waits for the bisect to end.
+    fn finish(&mut self) -> ExitStatus {
+        fs::write(&self.release, "").unwrap();
+        self.child.wait().unwrap()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn a_second_bisect_and_a_purge_are_refused_while_one_runs() {
+    let project = Project::new("good");
+    record(&project, SESSION, &notes_steps(8));
+    let hold = project.outside.path();
+    let child = project
+        .command(&["bisect", "--test", SCRIPT_TEST], &[("HOLD", hold)])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut running = Held {
+        child,
+        release: hold.join("release"),
+    };
+    wait_for(&hold.join("started"), &mut running.child);
+
+    let second = project.yalper(&["bisect", "--test", TEST], &[]);
+    assert_eq!(second.status.code(), Some(1));
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    assert!(
+        stderr.starts_with("error: a bisect of this project is running: it holds "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Only one bisect of a project runs at a time"),
+        "{stderr}"
+    );
+
+    let before = files(&project.root);
+    let purge = project.yalper(&["uninstall", "--purge"], &[]);
+    assert_eq!(purge.status.code(), Some(1));
+    let stderr = String::from_utf8(purge.stderr).unwrap();
+    assert!(stderr.contains("Wait for that bisect to end"), "{stderr}");
+    assert!(stderr.contains("Nothing was changed."), "{stderr}");
+    assert_eq!(files(&project.root), before);
+    let cache = project.cache_folder();
+    assert!(cache.join("copy-0").is_dir());
+
+    let status = running.finish();
+    // Once released, the runs go on to the status check and the bisect ends as usual.
+    assert_eq!(status.code(), Some(0));
+
+    let purge = project.yalper(&["uninstall", "--purge"], &[]);
+    assert!(purge.status.success(), "{purge:?}");
+    assert!(!cache.exists());
+    assert!(!project.root.join(".yalper").exists());
 }
 
 /// A fake GitHub token, built at run time so that no token-shaped literal is in the repository.
