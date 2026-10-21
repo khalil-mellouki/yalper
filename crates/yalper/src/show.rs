@@ -104,6 +104,7 @@ impl Options {
         Format {
             full: self.full,
             color: self.color,
+            file_tools_by_path: false,
         }
     }
 }
@@ -115,6 +116,9 @@ pub struct Format {
     pub full: bool,
     /// Color the diff with terminal escape sequences.
     pub color: bool,
+    /// Show a file tool call (Write, Edit, MultiEdit, NotebookEdit) by the path of its file, with its error if it
+    /// failed, and leave its input and output to `yalper show`: the diff below already shows what it changed.
+    pub file_tools_by_path: bool,
 }
 
 /// Shows step `step` of a session of the project around `start` (see [`Options`]), with times in
@@ -222,7 +226,8 @@ fn is_tool_call(event: &Event) -> bool {
 
 /// Writes a step as `yalper show` does: a header line, the prompt that led to it (if given, for a tool step),
 /// what the step was (a prompt, a reply, the start or end of the session, or a tool call with its input and
-/// output), then the file changes `changes`, listed with a unified diff of each changed or added text file.
+/// output, unless [`Format::file_tools_by_path`] says otherwise), then the file changes `changes`, listed with a
+/// unified diff of each changed or added text file.
 /// Returns the message to show when the snapshots cannot be read, after writing what could be shown.
 pub fn write_step(
     out: &mut dyn Write,
@@ -277,7 +282,12 @@ pub fn write_step(
         );
         say(out, "");
     }
-    write_event(out, event, format.full, shown_by_diff);
+    let by_path =
+        file_tool_path(event).filter(|_| format.file_tools_by_path && is_tool_call(event));
+    match by_path {
+        Some(path) => write_file_tool(out, view, path, format.full),
+        None => write_event(out, event, format.full, shown_by_diff),
+    }
     let Some(diffed) = diffed else {
         return Ok(());
     };
@@ -296,12 +306,38 @@ const FILE_TOOLS: [(&str, &str); 4] = [
 
 /// The path of the file a successful file tool call (see [`FILE_TOOLS`]) edited, as the agent gave it.
 fn edited_file(event: &Event) -> Option<&str> {
-    if event.success != Some(true) {
-        return None;
-    }
+    file_tool_path(event).filter(|_| event.success == Some(true))
+}
+
+/// The path of the file a file tool call (see [`FILE_TOOLS`]) was given, whether it succeeded or not.
+fn file_tool_path(event: &Event) -> Option<&str> {
     let tool = event.tool_name.as_deref()?;
     let (_, key) = FILE_TOOLS.iter().find(|(name, _)| *name == tool)?;
     event.payload.get("tool_input")?.get(key)?.as_str()
+}
+
+/// Writes a file tool call by the path of its file (relative to the project when inside it), its error if it
+/// failed, and the command that shows its full input and output.
+fn write_file_tool(out: &mut dyn Write, view: &StepView<'_>, path: &str, full: bool) {
+    let event = view.event;
+    let path = cut_end(
+        &printable(&relative_path(path, view.roots)),
+        MAX_LINE_CHARS,
+        false,
+    );
+    let label = format!("{} {path}", field(&action(event)));
+    say(out, &printable(&tool_line(event, label)));
+    say(
+        out,
+        &printable(&format!(
+            "`yalper show {} --session {}` shows its full input and output.",
+            event.step, view.session
+        )),
+    );
+    if event.success == Some(false) {
+        let error = event.payload.get("error").and_then(Value::as_str);
+        text_block(out, "Error", error, full);
+    }
 }
 
 /// Writes what the step was: a prompt, a reply, the start or end of the session, or a tool call with its
@@ -335,13 +371,14 @@ fn write_event(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bo
     }
 }
 
-fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bool) {
+/// `label` followed by how the tool call ended and, for a subagent's, which subagent made it: `Edit, succeeded
+/// in 12 ms`.
+fn tool_line(event: &Event, mut line: String) -> String {
     let payload = &event.payload;
     let duration = payload
         .get("duration_ms")
         .and_then(Value::as_u64)
         .map(duration);
-    let mut line = field(&action(event));
     match (event.success, &duration) {
         (Some(false), _) => {
             line.push_str(", FAILED");
@@ -358,7 +395,12 @@ fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff
     if let Some(agent) = &event.agent_id {
         line.push_str(&format!(", subagent {}", field(agent)));
     }
-    say(out, &printable(&line));
+    line
+}
+
+fn write_tool_call(out: &mut dyn Write, event: &Event, full: bool, shown_by_diff: bool) {
+    let payload = &event.payload;
+    say(out, &printable(&tool_line(event, field(&action(event)))));
 
     let input = payload.get("tool_input");
     let command = input
@@ -1210,5 +1252,114 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+x\n+y\n"
         );
+    }
+
+    #[test]
+    fn file_tools_can_be_shown_by_their_path_with_only_their_error() {
+        let (_dir, shadow) = shadow();
+        let file = |content: &[u8]| crate::snapshot::Change::Upsert {
+            path: "src/a.js".to_owned(),
+            kind: FileKind::Regular,
+            blob: shadow.write_blob(content).unwrap(),
+        };
+        let from = shadow
+            .edit_tree(shadow.empty_tree(), &[file(b"old\n")])
+            .unwrap();
+        let to = shadow.edit_tree(from, &[file(b"new\n")]).unwrap();
+        let tool = |tool: &str, success: bool, payload: Value| Event {
+            session_id: "s1".to_owned(),
+            step: 12,
+            ts_ms: 0,
+            kind: if success {
+                "PostToolUse"
+            } else {
+                "PostToolUseFailure"
+            }
+            .to_owned(),
+            tool_name: Some(tool.to_owned()),
+            tool_use_id: None,
+            agent_id: None,
+            success: Some(success),
+            tree_id: Some(to.to_string()),
+            base_tree_id: Some(from.to_string()),
+            files_changed: Some(1),
+            payload,
+        };
+        let input = serde_json::json!({"file_path": "/p/src/a.js", "old_string": "old", "new_string": "new"});
+        let edit = tool(
+            "Edit",
+            true,
+            serde_json::json!({"tool_input": input, "duration_ms": 30,
+                "tool_response": {"filePath": "/p/src/a.js", "userModified": false}}),
+        );
+        let failed = tool(
+            "Edit",
+            false,
+            serde_json::json!({"tool_input": input, "duration_ms": 5, "error": "String not found"}),
+        );
+        let bash = tool(
+            "Bash",
+            true,
+            serde_json::json!({"tool_input": {"command": "sed -i s/old/new/ src/a.js"},
+                "tool_response": {"stdout": "done", "stderr": ""}}),
+        );
+        let roots = ["/p".to_owned()];
+        let render = |event: &Event, file_tools_by_path: bool| {
+            let view = StepView {
+                event,
+                session: "s1",
+                steps: 20,
+                prompt: None,
+                roots: &roots,
+                time_zone: &TimeZone::UTC,
+            };
+            let changes = Changes::Between {
+                shadow: &shadow,
+                from,
+                to,
+            };
+            let format = Format {
+                file_tools_by_path,
+                ..Format::default()
+            };
+            let mut out = Vec::new();
+            write_step(&mut out, &view, changes, format).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let hint = "`yalper show 12 --session s1` shows its full input and output.\n";
+
+        let shown = render(&edit, true);
+        assert!(
+            shown.contains(&format!(
+                "\nEdit src/a.js, succeeded in 30 ms\n{hint}\n1 file changed:"
+            )),
+            "{shown}"
+        );
+        assert!(shown.contains("-old\n+new\n"), "{shown}");
+        for left_out in ["Input:", "Output:", "old_string", "userModified"] {
+            assert!(!shown.contains(left_out), "{shown}");
+        }
+        let shown = render(&failed, true);
+        assert!(
+            shown.contains(&format!(
+                "\nEdit src/a.js, FAILED after 5 ms\n{hint}\nError:\n  String not found\n"
+            )),
+            "{shown}"
+        );
+        assert!(!shown.contains("Input:"), "{shown}");
+        // Other tools, and file tools without the option, keep their input and output.
+        let shown = render(&bash, true);
+        assert!(
+            shown.contains("Command:\n  sed -i s/old/new/ src/a.js\n\nOutput:\n  done\n"),
+            "{shown}"
+        );
+        assert!(!shown.contains("yalper show"), "{shown}");
+        let shown = render(&edit, false);
+        assert!(
+            shown.contains("\nEdit, succeeded in 30 ms\n\nInput:\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("\"userModified\": false"), "{shown}");
+        assert!(!shown.contains("yalper show"), "{shown}");
     }
 }

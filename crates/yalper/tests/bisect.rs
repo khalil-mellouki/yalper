@@ -410,6 +410,56 @@ fn names_the_step_that_broke_the_tests_with_its_prompt_and_diff() {
     assert!(cache.join("logs").join("run-1.log").is_file());
 }
 
+#[test]
+fn a_breaking_file_tool_step_is_shown_by_its_path_and_show_keeps_its_input_and_output() {
+    let project = Project::new("good");
+    project.start(SESSION);
+    project.prompt(SESSION, "Make the status honest.");
+    project.tool(SESSION, 3, &[("notes.txt", Some("note 3\n"))]);
+    project.edit(&[("status.txt", Some("bad\n"))]);
+    let path = project.root.join("status.txt");
+    project.hook(
+        SESSION,
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": path, "old_string": "good", "new_string": "bad"},
+            "tool_response": {"filePath": path, "oldString": "good", "newString": "bad", "userModified": false},
+            "tool_use_id": "toolu_4",
+            "duration_ms": 30
+        }),
+    );
+    project.tool(SESSION, 5, &[("notes.txt", Some("note 5\n"))]);
+    project.stop(SESSION);
+
+    let (code, out, _) = project.bisect(&["--test", TEST], &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("Step 4 broke the tests"), "{out}");
+    assert!(
+        out.contains(
+            "\nEdit status.txt, succeeded in 30 ms\n`yalper show 4 --session 5f3c2a1e` shows its full input \
+             and output.\n\n1 file changed:\n  modified  status.txt\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("-good\n+bad"), "{out}");
+    for left_out in ["Input:", "Output:", "old_string", "userModified"] {
+        assert!(!out.contains(left_out), "{out}");
+    }
+
+    // `yalper show` still shows the whole call.
+    let output = project.yalper(&["show", "4"], &[]);
+    let shown = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        shown.contains("\nEdit, succeeded in 30 ms\n\nInput:\n"),
+        "{shown}"
+    );
+    assert!(shown.contains("\"old_string\": \"good\""), "{shown}");
+    assert!(shown.contains("\"userModified\": false"), "{shown}");
+    assert!(!shown.contains("yalper show"), "{shown}");
+}
+
 /// Every link (symlink or junction) under `dir`, found without following any.
 fn links_under(dir: &Path) -> Vec<PathBuf> {
     let mut links = Vec::new();
@@ -501,6 +551,8 @@ fn a_good_end_that_fails_shows_the_end_of_its_output_masked_and_prefixed() {
         tail[4].starts_with("The good end, step 1, already fails (exit code 1)"),
         "{out}"
     );
+    // The project has no env file: no hint about --with-env.
+    assert!(!out.contains("--with-env"), "{out}");
 }
 
 #[test]
@@ -834,6 +886,17 @@ fn env_files_are_copied_only_when_asked_remembered_and_never_recorded() {
     assert_eq!(code, Some(1), "{out}");
     assert!(out.contains("The good end, step 1, already fails"), "{out}");
     assert!(!out.contains("Note: the tests used"), "{out}");
+    let hint = "\nYour project has an env file (.env), but it was not copied into the test copies: if the tests \
+                need it, run again with --with-env.\n";
+    assert!(out.contains(hint), "{out}");
+    assert!(!out.contains(&secret), "{out}");
+
+    // With --with-env on, a good end that fails gives no hint.
+    let fails = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
+    let (code, out, _) = project.bisect(&["--test", fails, "--with-env"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("The good end, step 1, already fails"), "{out}");
+    assert!(!out.contains("Your project has"), "{out}");
 
     let (code, out, _) = project.bisect(&["--test", ENV_TEST, "--with-env"], &[]);
     assert_eq!(code, Some(0), "{out}");
@@ -862,6 +925,7 @@ fn env_files_are_copied_only_when_asked_remembered_and_never_recorded() {
     let (code, out, _) = project.bisect(&["--test", ENV_TEST, "--no-env"], &[]);
     assert_eq!(code, Some(1), "{out}");
     assert!(out.contains("The good end, step 1, already fails"), "{out}");
+    assert!(out.contains(hint), "{out}");
     let (code, _, _) = project.bisect(&["--test", ENV_TEST], &[]);
     assert_eq!(code, Some(1));
     project.assert_nothing_copied_left(&[".env"], &secret);
@@ -1289,8 +1353,7 @@ fn since_leaves_out_the_older_sessions() {
     assert_eq!(code, Some(0), "{out}");
     assert!(
         out.contains(
-            "Bisecting 1 session since 2001-01-01 00:00, in the order their snapshots were taken: 10 steps \
-             changed files after the code before step 1 of session 5f3c2a1e (the good end), up to step 12 of \
+            "Bisecting 1 session since 2001-01-01 00:00: 10 steps changed files after the code before step 1 of session 5f3c2a1e (the good end), up to step 12 of \
              session 5f3c2a1e (the bad end)."
         ),
         "{out}"

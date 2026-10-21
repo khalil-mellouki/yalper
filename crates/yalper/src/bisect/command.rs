@@ -58,6 +58,9 @@ const TAIL_PREFIX: &str = "  | ";
 /// The "other sessions changed files" note names at most this many sessions.
 const MAX_OTHER_SESSIONS: usize = 5;
 
+/// The hint on env files not copied names at most this many.
+const MAX_ENV_FILES_NAMED: usize = 3;
+
 /// How `--since` is shown.
 const SINCE_FORMAT: &str = "%Y-%m-%d %H:%M";
 
@@ -374,10 +377,10 @@ fn command_in(
         let since = since
             .map(|since| format!(" since {since}"))
             .unwrap_or_default();
-        format!(
-            "{count} session{}{since}, in the order their snapshots were taken",
-            plural(count)
-        )
+        match count {
+            1 => format!("1 session{since}"),
+            count => format!("{count} sessions{since}, in the order their snapshots were taken"),
+        }
     } else {
         format!("session {short}")
     };
@@ -426,11 +429,19 @@ fn command_in(
     };
     // Deleted before the result is shown, so they stay no longer than the runs need them.
     let used = tester.sets.local_files().map(LocalFiles::used);
+    let env_not_copied = tester
+        .sets
+        .local_files()
+        .map(|files| files.env_not_copied().to_vec())
+        .unwrap_or_default();
     let mut not_deleted = tester.sets.remove_local_files();
     not_deleted.extend(tester.sets.remove_project_links());
     let history = tester.history;
     say(out, "");
     let ended = write_answer(out, &report, &entries, &history, &names);
+    if matches!(report.answer, Answer::GoodEndFails(_)) {
+        write_env_hint(out, &env_not_copied);
+    }
     for message in not_deleted {
         say(out, &printable(&format!("warning: {message}")));
     }
@@ -669,6 +680,7 @@ fn write_breaking_step(
     let format = Format {
         full: false,
         color: false,
+        file_tools_by_path: true,
     };
     let mut shown = Vec::new();
     let result = show::write_step(&mut shown, &view, changes, format);
@@ -955,6 +967,37 @@ fn write_used(out: &mut dyn Write, used: Used) {
     );
 }
 
+/// Writes a hint naming the project's env files that were not copied (`env`, see
+/// [`LocalFiles::env_not_copied`]), if any: a good end that fails may need them.
+fn write_env_hint(out: &mut dyn Write, env: &[String]) {
+    let mut named: Vec<&str> = env
+        .iter()
+        .take(MAX_ENV_FILES_NAMED)
+        .map(String::as_str)
+        .collect();
+    if env.len() > MAX_ENV_FILES_NAMED {
+        named.push(ELLIPSIS);
+    }
+    let (files, them) = match env.len() {
+        0 => return,
+        1 => (
+            "an env file",
+            "it was not copied into the test copies: if the tests need it",
+        ),
+        _ => (
+            "env files",
+            "they were not copied into the test copies: if the tests need them",
+        ),
+    };
+    say(
+        out,
+        &printable(&format!(
+            "Your project has {files} ({}), but {them}, run again with --with-env.",
+            named.join(", ")
+        )),
+    );
+}
+
 /// The names of the test copies (`copy-<n>`) in the project's cache folder `cache`.
 fn copies_in(cache: &CacheDir) -> io::Result<HashSet<OsString>> {
     let mut copies = HashSet::new();
@@ -1091,7 +1134,7 @@ impl Tester<'_> {
     /// the text that ends the entry's line.
     fn attempt(&mut self, trial: &Trial) -> io::Result<(Tested, String)> {
         let entry = self.entries[trial.entry];
-        let filled = self.sets.copies_filled();
+        let (filled, installs) = (self.sets.copies_filled(), self.sets.installs_run());
         let started = Instant::now();
         let names = self.names;
         let prepared = self
@@ -1122,7 +1165,9 @@ impl Tester<'_> {
             }
             Prepared::Stopped => return Ok((Tested::Stopped, "stopped".to_owned())),
         };
-        let installed = (self.sets.copies_filled() != filled).then(|| started.elapsed());
+        let filled_anew = self.sets.copies_filled() != filled;
+        // A copy filled with nothing to install (no lockfile and no `--setup`) says nothing about installing.
+        let installed = (self.sets.installs_run() != installs).then(|| started.elapsed());
         if self.stop.load(Ordering::SeqCst) {
             return Ok((Tested::Stopped, "stopped".to_owned()));
         }
@@ -1130,7 +1175,7 @@ impl Tester<'_> {
         let name = copy.file_name().unwrap_or_default().to_owned();
         let first_use = self.seen.insert(name.clone());
         let cold = CopyUse {
-            installed: installed.is_some(),
+            installed: filled_anew,
             first_use,
             existed: self.existed.contains(&name),
         };
@@ -1768,5 +1813,91 @@ mod tests {
         assert!(copy_0.with_file_name("copy-1").is_dir());
         assert_eq!(links_under(&copy_0), Vec::<PathBuf>::new());
         assert_eq!(state(project.path()), before);
+    }
+
+    #[test]
+    fn the_install_line_shows_only_when_an_install_ran() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_base = tempfile::tempdir().unwrap();
+        // The step's `package.json` differs from the project's, which has none, and no lockfile says what to
+        // install: the step gets a copy of its own with nothing installed in it.
+        recorded(
+            project.path(),
+            &[
+                &[("package.json", r#"{"dependencies": {"ms": "2.1.3"}}"#)],
+                &[("b.txt", "b")],
+                &[("c.txt", "c")],
+            ],
+        );
+        let folder = cache_base.path().join("yalper");
+        let open_cache = |project: &Path, token: &Token| CacheDir::open_in(&folder, project, token);
+        let bisect = |setup: Option<&str>| {
+            let options = Options {
+                test: "exit 0".to_owned(),
+                good: Some(StepRef {
+                    session: None,
+                    step: 2,
+                }),
+                setup: setup.map(str::to_owned),
+                ..Options::default()
+            };
+            let screen = Screen {
+                live: false,
+                time_zone: TimeZone::UTC,
+            };
+            let mut out = Vec::new();
+            let ended = command_in(
+                project.path(),
+                &options,
+                &screen,
+                &mut out,
+                &AtomicBool::new(false),
+                &open_cache,
+            );
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(ended, Ok(Ended::NotNamed), "{out}");
+            out
+        };
+        let out = bisect(None);
+        assert!(
+            out.contains("Testing step 2, the good end (about 2 runs left)... passed in "),
+            "{out}"
+        );
+        assert!(!out.contains("install"), "{out}");
+        let out = bisect(Some("exit 0"));
+        assert!(
+            out.contains(
+                "Testing step 2, the good end (about 2 runs left)... installed its dependencies in "
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_env_hint_names_a_few_files_safely() {
+        let hint = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+            let mut out = Vec::new();
+            write_env_hint(&mut out, &names);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(hint(&[]), "");
+        assert_eq!(
+            hint(&[".env"]),
+            "Your project has an env file (.env), but it was not copied into the test copies: if the tests \
+             need it, run again with --with-env.\n"
+        );
+        assert_eq!(
+            hint(&[
+                ".env",
+                ".env.local",
+                "api/.env",
+                "web/.env",
+                "web/.env.\u{1b}[31m"
+            ]),
+            "Your project has env files (.env, .env.local, api/.env, ...), but they were not copied into the \
+             test copies: if the tests need them, run again with --with-env.\n"
+        );
+        assert!(!hint(&[".env.\u{1b}[31m"]).contains('\u{1b}'));
     }
 }

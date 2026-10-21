@@ -336,7 +336,7 @@ fn files_of(project: &Path, with: &[String]) -> Result<Vec<String>, String> {
 /// What a walk of the project found.
 #[derive(Debug, Default)]
 struct Found {
-    /// Env files to copy, sorted.
+    /// Env files that can be copied, sorted.
     env: Vec<String>,
     /// Files the snapshots skip because they are too large, with their size, sorted.
     large: Vec<(String, u64)>,
@@ -356,7 +356,8 @@ fn mib(size: u64) -> u64 {
 
 /// Walks the project at `project` like a snapshot does (the files its ignore rules do not ignore, without
 /// `.git` and `.yalper`, never following links, in several threads), listing the files over the snapshot size
-/// limit and, if `env`, the env files the rules ignore in the folders it enters.
+/// limit and the env files the rules ignore in the folders it enters. With `env`, the env files are copied: the
+/// warnings name those that cannot be.
 fn walk_project(project: &Path, env: bool) -> Found {
     let excludes = Arc::new(Excludes::new(project));
     let filter = Arc::clone(&excludes);
@@ -434,19 +435,18 @@ fn visit(
     };
     let found = || found.lock().unwrap_or_else(PoisonError::into_inner);
     if is_env_name(entry.file_name()) && excludes.is_ignored(entry.path(), false) {
-        if !env {
-            return WalkState::Continue;
-        }
         if kind.is_symlink() {
-            found().notes.push(format!(
-                "{path} is a link, so it is not copied: Yalper never follows links in the project"
-            ));
+            if env {
+                found().notes.push(format!(
+                    "{path} is a link, so it is not copied: Yalper never follows links in the project"
+                ));
+            }
         } else if kind.is_file()
             && let Ok(metadata) = entry.metadata()
         {
             if metadata.len() <= MAX_ENV_FILE_BYTES {
                 found().env.push(path);
-            } else {
+            } else if env {
                 found().notes.push(format!(
                     "{path} is not copied: it holds {} bytes, more than an env file ({} MiB at most)",
                     metadata.len(),
@@ -581,6 +581,8 @@ pub struct LocalFiles {
     chosen: Chosen,
     /// The env files found, each copied for a step whose tree has files in its folder.
     env: Vec<String>,
+    /// Without `--with-env`, the env files found that it would copy, for a hint.
+    env_not_copied: Vec<String>,
     /// What each copy holds, by the copy's path.
     copies: HashMap<PathBuf, Held>,
     /// The files listed in the event log: copy name and path.
@@ -633,12 +635,18 @@ impl LocalFiles {
             ));
         }
         let listed = read_listed(&events, cache.instance()).unwrap_or_default();
+        let (env, env_not_copied) = if chosen.env {
+            (found.env, Vec::new())
+        } else {
+            (Vec::new(), found.env)
+        };
         let files = Self {
             project,
             events,
             instance: cache.instance().to_owned(),
             chosen: chosen.clone(),
-            env: found.env,
+            env,
+            env_not_copied,
             copies: HashMap::new(),
             listed,
             used: Used::default(),
@@ -677,6 +685,11 @@ impl LocalFiles {
         self.used
     }
 
+    /// Without `--with-env`, the project's env files that it would copy (paths, sorted); empty with it.
+    pub fn env_not_copied(&self) -> &[String] {
+        &self.env_not_copied
+    }
+
     /// Makes `copy`, which holds a step, hold the env files and `--with` files that step gets: those whose path
     /// the step's tree and the other extra paths of the copy leave free and, for env files, whose folder holds
     /// files of the tree. Each one is listed in the event log before it is first written, and written only if
@@ -700,6 +713,7 @@ impl LocalFiles {
             listed,
             used,
             saves,
+            env_not_copied: _,
         } = self;
         let held = match copies.entry(root.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
