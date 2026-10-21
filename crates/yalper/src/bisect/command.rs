@@ -38,7 +38,7 @@ use super::{
 };
 use crate::init::{printable, say};
 use crate::log::{
-    ELLIPSIS, NOTHING_RECORDED, find, find_session, plural, short_id, short_id_chars,
+    ELLIPSIS, NOTHING_RECORDED, cut_start, find, find_session, plural, short_id, short_id_chars,
 };
 use crate::redact::{redact_str, strip_escapes};
 use crate::repo::Token;
@@ -60,6 +60,9 @@ const MAX_OTHER_SESSIONS: usize = 5;
 
 /// The hint on env files not copied names at most this many.
 const MAX_ENV_FILES_NAMED: usize = 3;
+
+/// Each env file named in that hint is cut to this many characters, keeping its end.
+const MAX_ENV_NAME_CHARS: usize = 60;
 
 /// How `--since` is shown.
 const SINCE_FORMAT: &str = "%Y-%m-%d %H:%M";
@@ -819,14 +822,10 @@ fn write_answer(
                     &format!("  {}: {what}", names.described(&entries[entry])),
                 );
             }
-            let session = if names.across {
-                "<session>".to_owned()
-            } else {
-                names.short(entries[end].order)
-            };
+            let session = (!names.across).then(|| names.short(entries[end].order));
             say(
                 out,
-                &format!("`yalper show <step> --session {session}` shows each step."),
+                &show::show_command("<step>", session.as_deref(), "shows each step"),
             );
             Ended::Named
         }
@@ -970,16 +969,18 @@ fn write_used(out: &mut dyn Write, used: Used) {
 /// Writes a hint naming the project's env files that were not copied (`env`, see
 /// [`LocalFiles::env_not_copied`]), if any: a good end that fails may need them.
 fn write_env_hint(out: &mut dyn Write, env: &[String]) {
-    let mut named: Vec<&str> = env
+    if env.is_empty() {
+        return;
+    }
+    let mut named: Vec<String> = env
         .iter()
         .take(MAX_ENV_FILES_NAMED)
-        .map(String::as_str)
+        .map(|name| cut_start(&printable(name), MAX_ENV_NAME_CHARS))
         .collect();
     if env.len() > MAX_ENV_FILES_NAMED {
-        named.push(ELLIPSIS);
+        named.push(ELLIPSIS.to_owned());
     }
     let (files, them) = match env.len() {
-        0 => return,
         1 => (
             "an env file",
             "it was not copied into the test copies: if the tests need it",
@@ -1175,7 +1176,7 @@ impl Tester<'_> {
         let name = copy.file_name().unwrap_or_default().to_owned();
         let first_use = self.seen.insert(name.clone());
         let cold = CopyUse {
-            installed: filled_anew,
+            filled_anew,
             first_use,
             existed: self.existed.contains(&name),
         };
@@ -1218,8 +1219,8 @@ const COLD_MIN_LIMIT: Duration = Duration::from_secs(10 * 60);
 /// What a run needs to know about its copy to pick its time limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyUse {
-    /// Its dependencies were just installed (the copy was deleted and filled anew).
-    installed: bool,
+    /// It was just deleted and filled anew for its dependency set, installed or with nothing to install.
+    filled_anew: bool,
     /// It is used for the first time in this bisect.
     first_use: bool,
     /// It was in the cache folder when the bisect started.
@@ -1235,11 +1236,11 @@ struct Limit {
 }
 
 /// The time limit of a run in `copy`, whose limit from the engine is `limit`. A cold run, the first in a copy
-/// just installed or created in this bisect, holds no build yet: it may compile the whole project (Rust
+/// just filled anew or created in this bisect, holds no build yet: it may compile the whole project (Rust
 /// especially), so a limit picked from warm runs would time it out and name the wrong step. Its automatic limit
 /// is raised to 10 times as long, and at least 10 minutes. A `--timeout` (`explicit`) applies as it is.
 fn run_limit(limit: Option<Duration>, explicit: bool, copy: CopyUse) -> Limit {
-    let cold = copy.installed || (copy.first_use && !copy.existed);
+    let cold = copy.filled_anew || (copy.first_use && !copy.existed);
     match limit {
         Some(limit) if cold && !explicit => Limit {
             limit: Some(limit.saturating_mul(10).max(COLD_MIN_LIMIT)),
@@ -1430,8 +1431,8 @@ mod tests {
             limit: Some(limit),
             raised: true,
         };
-        let copy = |installed, first_use, existed| CopyUse {
-            installed,
+        let copy = |filled_anew, first_use, existed| CopyUse {
+            filled_anew,
             first_use,
             existed,
         };
@@ -1458,7 +1459,7 @@ mod tests {
         );
         // copy-0 kept from an earlier bisect: its build is there.
         assert_eq!(run_limit(Some(warm), false, copy(false, true, true)), as_is);
-        // A copy just installed, used before in this bisect or not.
+        // A copy just filled anew, used before in this bisect or not.
         assert_eq!(
             run_limit(Some(warm), false, copy(true, false, true)),
             raised(Duration::from_secs(600))
@@ -1899,5 +1900,13 @@ mod tests {
              test copies: if the tests need them, run again with --with-env.\n"
         );
         assert!(!hint(&[".env.\u{1b}[31m"]).contains('\u{1b}'));
+        // A long name keeps its end, cut to a fixed width.
+        let long = format!("{}/.env", "deep".repeat(30));
+        let shown = hint(&[long.as_str()]);
+        let kept = &long[long.len() - (MAX_ENV_NAME_CHARS - ELLIPSIS.len())..];
+        assert!(
+            shown.contains(&format!("an env file ({ELLIPSIS}{kept}), but")),
+            "{shown}"
+        );
     }
 }

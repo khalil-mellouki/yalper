@@ -450,7 +450,7 @@ pub(crate) fn cut_end(text: &str, max: usize, more: bool) -> String {
 
 /// `text` cut to its last `max` characters, starting with an ellipsis when something was left out, so the
 /// end of a long path, its file name, stays visible.
-fn cut_start(text: &str, max: usize) -> String {
+pub(crate) fn cut_start(text: &str, max: usize) -> String {
     let chars = text.chars().count();
     if chars <= max {
         return text.to_owned();

@@ -1353,8 +1353,8 @@ fn since_leaves_out_the_older_sessions() {
     assert_eq!(code, Some(0), "{out}");
     assert!(
         out.contains(
-            "Bisecting 1 session since 2001-01-01 00:00: 10 steps changed files after the code before step 1 of session 5f3c2a1e (the good end), up to step 12 of \
-             session 5f3c2a1e (the bad end)."
+            "Bisecting 1 session since 2001-01-01 00:00: 10 steps changed files after the code before step 1 \
+             of session 5f3c2a1e (the good end), up to step 12 of session 5f3c2a1e (the bad end)."
         ),
         "{out}"
     );
