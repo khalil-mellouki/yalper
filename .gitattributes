@@ -4,3 +4,5 @@
 *.jpg binary
 *.gif binary
 *.ico binary
+# The built viewer, written by `npm run build` in `web/`: folded in pull request diffs.
+crates/yalper/viewer/** linguist-generated=true

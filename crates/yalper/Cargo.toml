@@ -22,6 +22,7 @@ ignore.workspace = true
 jiff.workspace = true
 regex-automata.workspace = true
 rusqlite.workspace = true
+rust-embed.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 

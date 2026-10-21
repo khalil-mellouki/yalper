@@ -6,6 +6,7 @@ pub mod init;
 pub mod log;
 pub mod record;
 pub mod redact;
+pub mod replay;
 pub mod repo;
 pub mod safe_fs;
 pub mod show;
