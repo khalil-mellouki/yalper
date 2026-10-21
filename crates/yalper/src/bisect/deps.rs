@@ -1108,6 +1108,12 @@ impl DependencySets {
         self.filled
     }
 
+    /// How many installs ran in this bisect. A copy can be filled with nothing to install (a `package.json`
+    /// without a lockfile), so it grows less often than [`copies_filled`](Self::copies_filled).
+    pub fn installs_run(&self) -> usize {
+        self.installs
+    }
+
     /// Makes a copy hold the step whose tree in `store` is `tree`, with its dependencies: `copy-0` linked to the
     /// project's installed dependencies when the step's are the same, otherwise the copy of the step's set,
     /// installed first if no copy holds the set yet (the output in a new log of `logs`, stopped when `stop` is

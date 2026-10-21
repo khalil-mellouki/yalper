@@ -69,7 +69,7 @@ like `git bisect`, until it finds the first step where the tests fail. It shows 
 it, and the diff of what it changed. As with `git bisect run`, exit code 0 from your command means the tests
 pass, 125 means this step cannot be tested, anything else means they fail.
 
-A real run on a small Node project (paths shortened, the tool call's input and output left out):
+A real run on a small Node project (paths shortened):
 
 ```text
 $ yalper bisect --test "node --test"
@@ -90,7 +90,8 @@ Session 5f3c2a1e, step 8 of 23, 2026-10-11 18:13:06
 Prompt (step 2):
   Add notes and keep the duration helper up to date.
 
-Write, succeeded in 3 ms
+Write src/duration.js, succeeded in 3 ms
+`yalper show 8 --session 5f3c2a1e` shows its full input and output.
 
 1 file changed:
   modified  src/duration.js
